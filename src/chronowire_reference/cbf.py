@@ -9,7 +9,7 @@ from math import isfinite
 
 import chronowire as cw
 
-from ._cython_cbf import run_fixed_cbf
+from ._cython_cbf import run_fixed_cbf, run_fixed_cbf_batch
 
 Sample = tuple[float, ...]
 BeamFrame = tuple[tuple[float, ...], ...]
@@ -98,6 +98,35 @@ class _CythonCbfSession:
             len(self.weights),
         )
 
+    def run_batch(
+        self,
+        values: memoryview[float],
+        *,
+        item_count: int,
+        item_shape: tuple[int, ...],
+    ) -> cw.NativeValueBatch:
+        """複数frameを一回のCython呼出しでCBF変換する。"""
+
+        if len(item_shape) != 2:
+            raise ValueError("fixed CBF batch requires frame_size x channel_count shape")
+        sample_count, channel_count = item_shape
+        if channel_count != len(self.weights[0]):
+            raise ValueError("fixed CBF batch channel count does not match weights")
+        weight_buffer = array("d", (item for beam in self.weights for item in beam))
+        output = run_fixed_cbf_batch(
+            values,
+            item_count,
+            sample_count,
+            channel_count,
+            memoryview(weight_buffer),
+            len(self.weights),
+        )
+        return cw.NativeValueBatch(
+            output,
+            item_count,
+            (len(self.weights), sample_count),
+        )
+
 
 @dataclass(frozen=True)
 class _CompiledCythonCbf:
@@ -109,11 +138,19 @@ class _CompiledCythonCbf:
     supports_flush: bool = False
     session_local: bool = True
     native_compatible: bool = True
+    output_dtype: str = "float64"
 
     def create_session(self) -> _CythonCbfSession:
         """run-local Cython CBF sessionを生成する。"""
 
         return _CythonCbfSession(self.weights)
+
+    def resolve_output_shape(self, input_shape: tuple[int, ...]) -> tuple[int, ...]:
+        """`frame_size x channels`を`beams x frame_size`へ解決する。"""
+
+        if len(input_shape) != 2 or input_shape[1] != len(self.weights[0]):
+            raise ValueError("fixed CBF input schema must be frame_size x channels")
+        return (len(self.weights), input_shape[0])
 
 
 @dataclass(frozen=True)
@@ -175,6 +212,8 @@ class CbfRun:
     trace: tuple[CbfTraceItem, ...]
     stage_domains: tuple[str, ...]
     kernel_abi: str
+    native_buffer_count: int
+    opaque_port_count: int
 
 
 def _source() -> tuple[cw.Emission[Sample], ...]:
@@ -249,14 +288,49 @@ def _run(
         ),
         tuple(stage.execution_domain for stage in plan.portable_ir.stages),
         kernel_abi,
+        len(plan.portable_ir.native_buffers),
+        sum(item.value_schema_id == "python:opaque" for item in plan.portable_ir.ports),
     )
 
 
-def run_cbf_conformance() -> tuple[CbfRun, CbfRun, CbfRun]:
-    """Python、Cython、Python/Cython混在の三構成を実行する。"""
+def _run_cython_executor() -> CbfRun:
+    """固定shape SourceからCBFまでをCython Executorでbatch実行する。"""
+
+    source = cw.Flow(cw.f64_vector_source(_source(), width=2))
+    frames = source.rate(4).frame(4)
+    beams = frames.map(FixedCbfKernel(((0.5, 0.5),)))
+    plan = cw.compile(
+        [cw.output(beams, collector=cw.Bounded(2))],
+        backend=CythonCbfBackend(),
+    )
+    result = plan.run(executor=cw.CythonExecutor())
+    abi = next(item for item in plan.portable_ir.kernel_abis if item.native_compatible)
+    return CbfRun(
+        "cython_executor_cbf",
+        tuple(
+            CbfTraceItem(
+                item.value,
+                item.interval.start.as_fraction(),
+                item.interval.end.as_fraction(),
+                item.sequence,
+                item.status,
+                tuple(diagnostic.code for diagnostic in item.diagnostics),
+            )
+            for item in result.outputs[0].emissions
+        ),
+        tuple(stage.execution_domain for stage in plan.portable_ir.stages),
+        abi.abi_version,
+        len(plan.portable_ir.native_buffers),
+        sum(item.value_schema_id == "python:opaque" for item in plan.portable_ir.ports),
+    )
+
+
+def run_cbf_conformance() -> tuple[CbfRun, CbfRun, CbfRun, CbfRun]:
+    """Python、Cython Kernel、混在、Cython Executorの四構成を実行する。"""
 
     return (
         _run("python_cbf", backend="python", mixed=False),
         _run("cython_cbf", backend=CythonCbfBackend(), mixed=False),
         _run("mixed_python_cython", backend=CythonCbfBackend(), mixed=True),
+        _run_cython_executor(),
     )

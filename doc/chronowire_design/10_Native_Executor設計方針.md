@@ -227,11 +227,15 @@ SourceからExecutorへの物理入力はchannel-first blockとする。block内
 v0.3のBackend交換conformanceとして、固定CBF宣言をPython実装とCython `nogil`実装で
 個別にcompileし、さらにPython前処理、Cython CBF、Python後処理を一つのPlanへ配置する。
 参照DSPコードは`chronowire_reference` packageへ分離し、Chronowire本体の公開Flow APIへ
-CBFを追加しない。三構成は同じ値、interval、sequence、status、Diagnostic traceを要求する。
+CBFを追加しない。これらにCython Executor + Cython CBFを加えた四構成は、同じ値、interval、
+sequence、status、Diagnostic traceを要求する。
 
-この段階でCython化されるのはKernel loopであり、Source、FRAME、Stage間配送はPython
-Executorが担当する。固定shape多channel bufferをCython Executorへ直接渡す構成は、
-Python/Cython混在境界のcopy規則を測定した後に追加する。
+`f64_vector_source`経路ではSource値を固定channel shapeとして宣言し、Cython Executorが
+RATE/FRAMEをnative batch化する。frame batchはread-only contiguous f64 memoryviewとして
+`NativeBatchKernelSession.run_batch()`へ一回だけ渡し、CBF出力もnative bytes batchで返す。
+Python tupleへの復元はcollector境界だけで行う。現実装にはCython Schedulerからbatch Kernelを
+起動するStage単位のPython method callとbuffer copyが一回残るため、copy回数とlatencyを測定して
+C ABI pointer呼出しへ進むか判断する。
 
 ## 9. 実装段階
 

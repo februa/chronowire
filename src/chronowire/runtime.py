@@ -54,6 +54,7 @@ from .kernel import (
     GapPolicy,
     Kernel,
     NativeCompiledKernel,
+    NativeValueSchemaProvider,
     PythonBackend,
     PythonCallableKernel,
     RunContext,
@@ -69,7 +70,7 @@ from .model import (
     Severity,
     Skip,
 )
-from .native import F64SourceValues, IdentityF64Kernel
+from .native import F64SourceValues, F64VectorSourceValues, IdentityF64Kernel
 from .plan_ir import (
     BindingDescriptor,
     BufferDescriptor,
@@ -686,6 +687,7 @@ def _shape_product(shape: tuple[int, ...]) -> int:
 
 def _value_schema_descriptors(
     nodes: tuple[NodeSpec, ...],
+    compiled_kernels: dict[int, CompiledKernel[object]],
 ) -> tuple[tuple[ValueSchemaDescriptor, ...], dict[int, str]]:
     """明示native契約だけをPort value schemaへ伝播する。"""
 
@@ -698,10 +700,47 @@ def _value_schema_descriptors(
             schema = ValueSchemaDescriptor(
                 "native:f64:scalar", "contiguous_f64", "float64", (), (), "cpu", True
             )
+        elif node.kind is NodeKind.SOURCE and isinstance(node.source, F64VectorSourceValues):
+            schema = ValueSchemaDescriptor(
+                f"native:f64:{node.source.width}",
+                "contiguous_f64",
+                "float64",
+                (node.source.width,),
+                (8,),
+                "cpu",
+                True,
+            )
         elif node.kind in {NodeKind.RATE, NodeKind.MAP}:
             input_schema = descriptors[port_schemas[node.inputs[0].source_port]]
             if node.kind is NodeKind.RATE or isinstance(node.operation, IdentityF64Kernel):
                 schema = input_schema
+            elif (
+                input_schema.representation == "contiguous_f64"
+                and input_schema.shape is not None
+                and isinstance(
+                    provider := compiled_kernels.get(node.id),
+                    NativeValueSchemaProvider,
+                )
+            ):
+                output_shape = provider.resolve_output_shape(input_schema.shape)
+                if not output_shape or any(item <= 0 for item in output_shape):
+                    raise CompileError(
+                        f"native Kernel node {node.id} port {node.output_port} returned "
+                        "an invalid fixed output shape"
+                    )
+                strides = tuple(
+                    8 * _shape_product(output_shape[index + 1 :])
+                    for index in range(len(output_shape))
+                )
+                schema = ValueSchemaDescriptor(
+                    "native:f64:" + "x".join(str(item) for item in output_shape),
+                    "contiguous_f64",
+                    provider.output_dtype,
+                    output_shape,
+                    strides,
+                    "cpu",
+                    True,
+                )
         elif node.kind is NodeKind.FRAME:
             input_schema = descriptors[port_schemas[node.inputs[0].source_port]]
             if input_schema.representation == "contiguous_f64" and node.frame_size is not None:
@@ -733,6 +772,7 @@ def _portable_plan_ir(
     backend_name: str,
     node_backend_names: dict[int, str],
     kernel_abi_descriptors: dict[int, KernelAbiDescriptor],
+    compiled_kernels: dict[int, CompiledKernel[object]],
     source_request_periods: dict[int, Fraction],
 ) -> PortablePlanIR:
     """compile済みPython実体からportable descriptorだけを抽出する。"""
@@ -795,7 +835,7 @@ def _portable_plan_ir(
         )
         for node in nodes
     )
-    value_schemas, port_schema_ids = _value_schema_descriptors(nodes)
+    value_schemas, port_schema_ids = _value_schema_descriptors(nodes, compiled_kernels)
     ports = tuple(
         PortDescriptor(
             output_port,
@@ -1275,6 +1315,7 @@ def compile(
         backend_name=backend_instance.name,
         node_backend_names=node_backend_names,
         kernel_abi_descriptors=kernel_abi_descriptors,
+        compiled_kernels=compiled_kernels,
         source_request_periods=source_request_periods,
     )
     return ExecutionPlan(

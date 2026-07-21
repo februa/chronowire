@@ -283,6 +283,11 @@ metadata境界方式を固定する。
 後者はnative化可能なPortごとにvalue schema、item ABI、SoA layout、alignment、read-only、
 session-local ownershipを結び付ける。実pointer、allocator、Diagnostic objectはIRへ入れない。
 
+固定shape native Kernelは`NativeValueSchemaProvider`で入力Port shapeから出力Port shapeを
+compile時に解決する。v0.3固定CBFでは`frame_size × channels`から`beams × frame_size`を生成し、
+SOURCE、RATE、FRAME、MAPの全Portへ`NativeBufferDescriptor`を割り当てる。Executorは実行値を
+見てshapeを推測してはならない。
+
 StageはPython Source、Python callback、Backend変更、観測Portで分割する。連続するRATE/FRAMEは`executor_opcode` Stageへまとめてよいが、観測Portを越えてまとめない。schema 0.1/0.2ではこれら三descriptorが存在しないため空tupleとして読み込む。
 
 ## 8. compile時のbuffer planning

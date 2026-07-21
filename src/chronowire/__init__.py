@@ -58,7 +58,10 @@ from .kernel import (
     CompiledKernelSession,
     GapPolicy,
     Kernel,
+    NativeBatchCompiledKernel,
+    NativeBatchKernelSession,
     NativeCompiledKernel,
+    NativeValueSchemaProvider,
     PythonBackend,
     RunContext,
     callable_kernel,
@@ -75,7 +78,15 @@ from .model import (
     kernel_outputs,
     skip,
 )
-from .native import F64SourceValues, IdentityF64Kernel, f64_source, identity_f64
+from .native import (
+    F64SourceValues,
+    F64VectorSourceValues,
+    IdentityF64Kernel,
+    NativeValueBatch,
+    f64_source,
+    f64_vector_source,
+    identity_f64,
+)
 from .plan_ir import PortablePlanIR
 from .runtime import (
     BufferProfile,
@@ -141,6 +152,7 @@ __all__ = [
     "ExtensionSession",
     "Flow",
     "F64SourceValues",
+    "F64VectorSourceValues",
     "GraphError",
     "GraphInfo",
     "GapPolicy",
@@ -155,7 +167,11 @@ __all__ = [
     "LogicalTime",
     "MissingConfigError",
     "MissingInputPolicy",
+    "NativeBatchCompiledKernel",
+    "NativeBatchKernelSession",
     "NativeCompiledKernel",
+    "NativeValueBatch",
+    "NativeValueSchemaProvider",
     "NoCollect",
     "ObservationSpec",
     "OutputEvent",
@@ -194,6 +210,7 @@ __all__ = [
     "callable_kernel",
     "emit_many",
     "f64_source",
+    "f64_vector_source",
     "identity_f64",
     "kernel_outputs",
     "observe",

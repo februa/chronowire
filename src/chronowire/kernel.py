@@ -127,6 +127,44 @@ class NativeCompiledKernel(CompiledKernel[T_co], Protocol[T_co]):
 
 
 @runtime_checkable
+class NativeBatchKernelSession(CompiledKernelSession[T_co], Protocol[T_co]):
+    """固定shape item batchを一回のnative呼出しで処理するsession。"""
+
+    def run_batch(
+        self,
+        values: memoryview[float],
+        *,
+        item_count: int,
+        item_shape: tuple[int, ...],
+    ) -> object:
+        """read-only contiguous f64 batchを処理してnative batch結果を返す。"""
+
+        ...
+
+
+@runtime_checkable
+class NativeBatchCompiledKernel(NativeCompiledKernel[T_co], Protocol[T_co]):
+    """run-local batch sessionを生成できるnative Kernel factory。"""
+
+    def create_session(self) -> NativeBatchKernelSession[T_co]:
+        """一回のrunだけが所有するbatch対応sessionを生成する。"""
+
+        ...
+
+
+@runtime_checkable
+class NativeValueSchemaProvider(Protocol):
+    """入力固定shapeからnative出力shapeをcompile時に解決するprotocol。"""
+
+    output_dtype: str
+
+    def resolve_output_shape(self, input_shape: tuple[int, ...]) -> tuple[int, ...]:
+        """一つの入力item shapeから一つの出力item shapeを返す。"""
+
+        ...
+
+
+@runtime_checkable
 class Kernel(Protocol[T_co]):
     """Config解決と作業領域準備をrunから分離するprotocol。"""
 

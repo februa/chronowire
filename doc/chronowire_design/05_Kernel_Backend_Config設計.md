@@ -154,6 +154,11 @@ PortablePlanIRへ抽出する。これによりKernel宣言へ実装言語を埋
 Python BackendまたはCython Backendでcompileできる。plain Python callableは選択Backendへ
 渡さずPython Stageとして残るため、一つのPlan内でPython callbackとCython Kernelを混在できる。
 
+固定shape batchを処理するfactoryは`NativeBatchCompiledKernel`、sessionは
+`NativeBatchKernelSession`を実装する。Executorは一つのread-only f64 memoryview、item count、
+item shapeを一回だけ渡し、Kernelは`NativeValueBatch`を返す。出力shapeが入力shapeから決まる
+Kernelは`NativeValueSchemaProvider`でcompile時に解決し、推測ではなくPort schemaへ記録する。
+
 ## 2.3 backend境界
 
 backendが異なるNode間では以下の変換が発生し得る。
