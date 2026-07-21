@@ -125,11 +125,7 @@ RuntimeSession::RuntimeSession(
     beam_count_(beam_count),
     collector_kind_(collector_kind),
     collector_capacity_(collector_capacity),
-    overflow_policy_(overflow_policy),
-    source_node_id_(source_node_id),
-    rate_node_id_(rate_node_id),
-    frame_node_id_(frame_node_id),
-    map_node_id_(map_node_id) {
+    overflow_policy_(overflow_policy) {
     if (schema_version != "0.3") {
         throw std::invalid_argument("CppExecutor contract=portable_plan_schema");
     }
@@ -157,6 +153,9 @@ RuntimeSession::RuntimeSession(
     }
     if (overflow_policy < 0 || overflow_policy > 2) {
         throw std::invalid_argument("CppExecutor contract=collector_overflow_policy");
+    }
+    if (source_node_id < 0 || rate_node_id < 0 || frame_node_id < 0 || map_node_id < 0) {
+        throw std::invalid_argument("CppExecutor contract=nonnegative_node_id");
     }
     for (std::size_t index = 0; index < source_count_; ++index) {
         if (source_ends_[index] < source_starts_[index]) {
@@ -347,4 +346,3 @@ RuntimeResult RuntimeSession::run() const {
 }
 
 }  // namespace chronowire::cpp_runtime
-

@@ -82,11 +82,6 @@ private:
     int collector_kind_;
     std::size_t collector_capacity_;
     int overflow_policy_;
-    std::int64_t source_node_id_;
-    std::int64_t rate_node_id_;
-    std::int64_t frame_node_id_;
-    std::int64_t map_node_id_;
 };
 
 }  // namespace chronowire::cpp_runtime
-

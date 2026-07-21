@@ -80,4 +80,5 @@ quote-style = "double"
 [dependency-groups]
 dev = [
     "cython>=3.0",
+    "cython-lint>=0.21.0",
 ]

@@ -32,6 +32,29 @@
 - 公開値は可能な限りfrozen dataclassまたはimmutable collectionで表す。
 - 例外messageとDiagnosticにはNode、Port、interval、違反した契約を特定できる情報を含める。
 
+## Cython実装規約
+
+- `.pyx`を正本とし、自動生成された`.c`または`.cpp`を直接編集・commitしない。
+- Python/C++境界でdtype、shape、stride、byte長、時刻分母、status値を検証してからtyped memoryviewまたはnative pointerへ変換する。
+- hot loopではPython object、動的属性アクセス、Python callbackを作らず、C型、typed memoryview、contiguous bufferを使用する。
+- `nogil`範囲を明示し、その中でPython C API、参照count操作、Python例外生成を行わない。Python処理が必要な箇所ではGILを明示的に取得する。
+- `malloc`などの手動確保を使う場合は全return・例外経路で解放する。可能ならC++ RAIIまたは所有者が明確なbufferを使用する。
+- C++例外を跨ぐ宣言には`except +`を指定し、`nogil`実行中の例外をPython境界で契約名付き例外へ変換する。
+- `.pyx`の公開・Python可視APIを変更した場合は対応する`.pyi`を同時に更新し、Pyrightで利用側の型を検証する。
+- 性能最適化で値、interval、sequence、status、Diagnostic provenanceを省略しない。
+
+## C++実装規約
+
+- C++17を基準とし、所有権はvalue、`std::vector`、RAII、smart pointerで表す。所有するraw pointerと手動`new`/`delete`を通常コードへ持ち込まない。
+- process-globalなmutable状態を持たず、cursor、buffer、Kernel状態、collector状態はrun-local sessionが所有する。
+- ABI境界ではdtype、shape、byte長、alignment、version、process modelを検証する。PortablePlanIRにpointer、Python object、実行時addressを保存しない。
+- size積、時刻scale、tick加算、capacity計算では符号、narrowing、整数overflowを検査する。未検証の`static_cast`で警告を消さない。
+- `std::span`相当の非所有viewと所有bufferを区別し、fan-out共有bufferはread-only寿命をconsumer完了まで保証する。
+- C++例外をC ABIや`nogil`境界の外へ漏らさない。Cython adapterで捕捉できる型へ変換し、Node、Port、違反契約をPython側messageへ付加する。
+- native runtime内でPython C APIを呼ばない。Python callbackはcompile済みStage境界としてのみ扱い、C++ Stageへ暗黙に混入させない。
+- warningを放置せず、警告抑制attributeやcompiler optionを追加する前に設計上の原因を解消する。
+- 最適化前後とPython/Cython/C++ Executor間で値、interval、sequence、status、Diagnosticを同値に保つ。
+
 ## テスト規約
 
 - 正常例だけでなく、空入力、fan-out、0/1/複数Emission、EOF、interval不一致、collector overflow、Extension失敗、DEGRADED/INVALID伝播を試験する。
@@ -50,9 +73,16 @@ uv run pytest
 uv run pyright
 uv run ruff check .
 uv run ruff format --check .
+uv run cython-lint --max-line-length 100 src/chronowire/*.pyx src/chronowire_reference/*.pyx
+c++ -std=c++17 -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror \
+  -fsyntax-only src/chronowire/cpp_runtime.cpp
+uv build
 ```
 
-実装完了前にpytest、Pyright、Ruffをすべて通す。依存を追加する場合は`uv add`または`uv add --dev`を使い、`pyproject.toml`と`uv.lock`を更新する。
+実装完了前にpytest、Pyright、Ruffをすべて通す。CythonまたはC++を変更した場合は、
+`cython-lint`、C++のwarnings-as-errors構文検査、sdistからのnative wheel buildも通す。
+hand-written C++ sourceを追加した場合は構文検査commandへ対象を追加する。依存を追加する場合は
+`uv add`または`uv add --dev`を使い、`pyproject.toml`と`uv.lock`を更新する。
 
 ## 文書とskill
 
@@ -66,4 +96,5 @@ uv run ruff format --check .
 - 公開APIに日本語docstringがある。
 - 安全な劣化結果が例外で失われない。
 - pytest、Pyright、Ruffが成功する。
+- Native変更ではcython-lint、C++ warnings-as-errors、`uv build`が成功する。
 - 変更した文書のリンクと索引が整合する。

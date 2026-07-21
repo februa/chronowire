@@ -152,8 +152,8 @@ cdef class CppNativeSession:
         """C++ state machineを実行して観測境界用batchと計測値を返す。"""
 
         cdef RuntimeResult result
-        cdef Py_ssize_t index
-        cdef Py_ssize_t item_index
+        cdef size_t index
+        cdef size_t item_index
         cdef list sequences = []
         cdef list starts = []
         cdef list ends = []
