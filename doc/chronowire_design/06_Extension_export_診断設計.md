@@ -16,45 +16,56 @@ Extensionは計算Nodeと分離された横断機能である。
 
 保存やログを安易に`map(write_file)`としてGraphへ入れると、計算と副作用が混ざるため、観測用途ではExtensionを優先する。
 
-## 1.2 protocol
+## 1.2 compile-time観測契約とruntime binding
 
 ```python
-class Extension(Protocol):
-    priority: int
-    trigger: Trigger
+observation = cw.observe(
+    spectrum,
+    extension_id="spectrum_snapshot",
+    trigger=cw.EveryLogicalTime(period=5),
+    priority=0,
+)
 
-    def initialize(self, context: PlanContext) -> None: ...
-    def on_plan_start(self, context: PlanContext) -> None: ...
-    def on_node_start(self, event: NodeEvent) -> None: ...
-    def on_node_end(self, event: NodeEvent) -> None: ...
-    def on_output(self, event: OutputEvent) -> None: ...
-    def on_plan_end(self, context: PlanContext) -> None: ...
-    def on_error(self, event: ErrorEvent) -> None: ...
-    def finalize(self, context: PlanContext) -> None: ...
-```
-
-初期版ではイベントを絞るが、`initialize`、`finalize`、trigger、priorityの契約は最初から固定する。同じイベントではpriority、登録順の順で決定的に呼び出す。
-
-## 1.3 Flow観測
-
-特定FlowのPortをExtension対象にできる。
-
-```python
 plan = cw.compile(
     outputs,
-    extensions=[
-        Snapshot(flow=base, path="snapshots"),
-    ],
+    extensions=[observation],
 )
+session = plan.create_session(
+    extension_bindings={
+        "spectrum_snapshot": cw.Snapshot(path="snapshots/spectrum.jsonl"),
+    }
+)
+result = session.run()
 ```
 
-Extension対象Portもrequired rootとしてPlanへ含めるが、Extension観測だけを理由に`RunResult.outputs`へは追加しない。
+`observe()`が返す`ObservationSpec`はcompile-time契約であり、`extension_id`、観測Port、trigger、priority、failure/overflow policy、要求ABIを保持する。観測Portはrequired rootかつFusion境界となる。Extension観測だけを理由に`RunResult.outputs`へは追加しない。
+
+`Extension`はprocess-local binding factoryであり、Flow、Port、triggerを知らない。`create_session()`がrun-localな`ExtensionSession`を生成する。`Snapshot`はJSONL recorder bindingであり、pathやPython objectをPortablePlanIRへ入れない。同じPlanまたはExecutionSessionを再実行しても、trigger、file、handlerの可変状態を持ち越さない。
+
+`extension_id`は利用者が必ず明示し、Plan内で一意とする。`extension_id="spectrum_snapshot"`に対してCompilerは`binding_slot="extension:spectrum_snapshot"`を生成できるが、安定した観測契約IDとprocess-local注入slotは別field、別責務として扱う。
+
+## 1.3 Trigger
+
+v0.1は`Always`、event件数に基づく`Every`、論理時間に基づく`EveryLogicalTime(period, phase=0)`を提供する。`EveryLogicalTime`の境界は半開区間`[interval.start, interval.end)`へ所属する。境界が前Emissionの`end`と次Emissionの`start`に一致する場合は次Emissionだけが発火する。overlapするEmissionが同じ境界を覆っても、一つの観測契約ではその境界を最初に処理したEmissionだけが発火する。一つのEmission内に複数境界がある場合もcallbackは一回とし、次の未処理境界まで進める。
 
 Extensionはcollectorと独立する。output collectorが`NoCollect`でもExtensionは対象PortのEmissionを観測できる。`Snapshot(include_degraded=True)`は`DEGRADED`および`INVALID`なEmission、対応Diagnostic、論理時間区間を保存する。
 
-## 1.4 実行とbackpressure
+## 1.4 Binding検証
 
-初期版のExtension callbackはScheduler threadで同期実行し、決定性を優先する。重いI/OはExtension内部のbounded queueへ渡せるが、queue policyを明示する。
+`ExecutionPlan.create_session(extension_bindings=...)`は実行前に次を検証する。
+
+- 必須`extension_id`のbinding不足
+- Planに存在しない、または未使用のbinding
+- `Extension.create_session()`を持たないbinding種別
+- `ObservationSpec`とbindingのABI version不一致
+
+違反は明示例外とし、messageへNode、Port、`extension_id`、binding slot、違反契約を含める。`extension_id`重複はbinding時まで遅延せずcompile errorとする。
+
+## 1.5 実行とbackpressure
+
+v0.1のExtension callbackはScheduler threadで同期実行し、決定性を優先する。公開failure/overflow policyは`FAIL`だけを実装する。handler例外は`ExtensionExecutionError`としてrunを停止し、ID、slot、Node、Port、callback、policyをmessageへ残す。
+
+非同期handlerを追加する場合は、重いI/OをExtension内部のbounded queueへ渡し、次のpolicyを明示する。
 
 ```text
 BLOCK
@@ -64,12 +75,14 @@ DROP_OLDEST / DROP_NEWEST
     実行を継続し、drop件数をDiagnosticへ記録する
 
 FAIL
-    ExtensionErrorとしてrunを停止する
+    ExtensionExecutionErrorとしてrunを停止する
 ```
 
 無制限queueは禁止する。Extensionが失敗した場合に計算を継続するか停止するかもExtensionごとに宣言する。
 
-## 1.5 最適化への影響
+`PortBuffer.max_items`はCompiler/Schedulerが決める計算経路のcapacityであり、Extensionの保存件数ではない。観測履歴はExtension内部のbounded window、`RunResult`の保持件数はCollectorで個別に宣言する。
+
+## 1.6 最適化への影響
 
 観測PortはFusion境界となる。
 

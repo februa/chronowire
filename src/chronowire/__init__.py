@@ -12,13 +12,29 @@ from .config import Config
 from .errors import (
     ChronowireError,
     CompileError,
+    DuplicateExtensionIdError,
     DuplicateOutputError,
+    ExtensionBindingError,
+    ExtensionExecutionError,
     GraphError,
     KernelExecutionError,
     MissingConfigError,
     SynchronizationError,
 )
-from .extension import Always, Every, Extension, OutputEvent, PlanContext, Snapshot
+from .extension import (
+    Always,
+    Every,
+    EveryLogicalTime,
+    Extension,
+    ExtensionFailurePolicy,
+    ExtensionOverflowPolicy,
+    ExtensionSession,
+    ObservationSpec,
+    OutputEvent,
+    PlanContext,
+    Snapshot,
+    observe,
+)
 from .graph import EdgeInfo, Flow, GraphInfo, RatePolicy, StateFlow
 from .kernel import (
     Backend,
@@ -40,7 +56,15 @@ from .model import (
     skip,
 )
 from .plan_ir import PortablePlanIR
-from .runtime import ExecutionPlan, OutputResult, OutputSpec, RunResult, compile, output
+from .runtime import (
+    ExecutionPlan,
+    ExecutionSession,
+    OutputResult,
+    OutputSpec,
+    RunResult,
+    compile,
+    output,
+)
 from .source import Source, SourceBatch, SourceRequest
 
 __all__ = [
@@ -55,13 +79,21 @@ __all__ = [
     "CompiledKernelSession",
     "Config",
     "Diagnostic",
+    "DuplicateExtensionIdError",
     "DuplicateOutputError",
     "EdgeInfo",
     "Emission",
     "EmissionStatus",
     "Every",
+    "EveryLogicalTime",
     "ExecutionPlan",
+    "ExecutionSession",
     "Extension",
+    "ExtensionBindingError",
+    "ExtensionExecutionError",
+    "ExtensionFailurePolicy",
+    "ExtensionOverflowPolicy",
+    "ExtensionSession",
     "Flow",
     "GraphError",
     "GraphInfo",
@@ -72,6 +104,7 @@ __all__ = [
     "LogicalTime",
     "MissingConfigError",
     "NoCollect",
+    "ObservationSpec",
     "OutputEvent",
     "OutputResult",
     "OutputSpec",
@@ -92,6 +125,7 @@ __all__ = [
     "SynchronizationError",
     "compile",
     "emit_many",
+    "observe",
     "output",
     "skip",
 ]

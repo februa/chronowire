@@ -21,6 +21,18 @@ class MissingConfigError(CompileError):
     """Kernelが宣言したConfig pathを解決できない場合の例外。"""
 
 
+class DuplicateExtensionIdError(CompileError):
+    """同じextension_idが一つのPlanへ複数指定された場合の例外。"""
+
+
+class ExtensionBindingError(ChronowireError):
+    """Extension bindingの不足、過剰、種別、ABI契約違反。"""
+
+
+class ExtensionExecutionError(ChronowireError):
+    """Extension handlerがFAIL policyで停止した場合の例外。"""
+
+
 class KernelExecutionError(ChronowireError):
     """安全なfallbackを生成できないKernel実装失敗。"""
 

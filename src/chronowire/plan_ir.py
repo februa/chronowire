@@ -351,6 +351,60 @@ class OutputDescriptor:
 
 
 @dataclass(frozen=True)
+class TriggerDescriptor:
+    """Extension発火条件のportableな固定情報を表す。"""
+
+    kind: str
+    count: int | None
+    period: RationalDescriptor | None
+    phase: RationalDescriptor | None
+
+    @classmethod
+    def from_dict(cls, value: object) -> TriggerDescriptor:
+        """JSON objectからTrigger descriptorを復元する。"""
+
+        data = _mapping(value, "trigger descriptor")
+        period = data.get("period")
+        phase = data.get("phase")
+        return cls(
+            _string(data, "kind"),
+            _optional_integer(data, "count"),
+            None if period is None else RationalDescriptor.from_dict(period),
+            None if phase is None else RationalDescriptor.from_dict(phase),
+        )
+
+
+@dataclass(frozen=True)
+class ExtensionDescriptor:
+    """compile時に固定したExtension観測契約を表す。"""
+
+    extension_id: str
+    observed_port_id: int
+    trigger: TriggerDescriptor
+    priority: int
+    failure_policy: str
+    overflow_policy: str
+    binding_slot: str
+    abi_version: str
+
+    @classmethod
+    def from_dict(cls, value: object) -> ExtensionDescriptor:
+        """JSON objectからExtension descriptorを復元する。"""
+
+        data = _mapping(value, "extension descriptor")
+        return cls(
+            _string(data, "extension_id"),
+            _integer(data, "observed_port_id"),
+            TriggerDescriptor.from_dict(data.get("trigger")),
+            _integer(data, "priority"),
+            _string(data, "failure_policy"),
+            _string(data, "overflow_policy"),
+            _string(data, "binding_slot"),
+            _string(data, "abi_version"),
+        )
+
+
+@dataclass(frozen=True)
 class PlanDiagnosticDescriptor:
     """compile Diagnosticのportableな識別情報を表す。"""
 
@@ -379,8 +433,9 @@ class PortablePlanIR:
     """Executorと言語に依存しないserialization可能なExecutionPlan。
 
     Python callable、collector instance、pointer、allocatorは含めず、安定IDと
-    descriptorだけを保持する。v0.1ではschema round-tripとexportを保証し、
-    deserialize後のprocess-local binding実行はv0.2で扱う。
+    descriptorだけを保持する。v0.1ではschema round-tripとexportを保証する。
+    Extension以外も含むdeserialize後の完全なprocess-local binding実行は
+    v0.2で扱う。
     """
 
     schema_version: str
@@ -392,6 +447,7 @@ class PortablePlanIR:
     buffers: tuple[BufferDescriptor, ...]
     times: tuple[TimeDescriptor, ...]
     sources: tuple[SourceDescriptor, ...]
+    extensions: tuple[ExtensionDescriptor, ...]
     bindings: tuple[BindingDescriptor, ...]
     outputs: tuple[OutputDescriptor, ...]
     diagnostics: tuple[PlanDiagnosticDescriptor, ...]
@@ -436,6 +492,10 @@ class PortablePlanIR:
             ),
             sources=tuple(
                 SourceDescriptor.from_dict(item) for item in _items(data.get("sources"), "sources")
+            ),
+            extensions=tuple(
+                ExtensionDescriptor.from_dict(item)
+                for item in _items(data.get("extensions"), "extensions")
             ),
             bindings=tuple(
                 BindingDescriptor.from_dict(item)

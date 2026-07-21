@@ -4,15 +4,33 @@ from __future__ import annotations
 
 import inspect
 from collections import Counter, defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
 from .collector import Bounded, Collector, CollectorSession, Latest, NoCollect, Sink
-from .errors import DuplicateOutputError, KernelExecutionError, MissingConfigError
-from .extension import Extension, OutputEvent, PlanContext
+from .errors import (
+    CompileError,
+    DuplicateExtensionIdError,
+    DuplicateOutputError,
+    ExtensionBindingError,
+    ExtensionExecutionError,
+    KernelExecutionError,
+    MissingConfigError,
+)
+from .extension import (
+    Always,
+    Every,
+    EveryLogicalTime,
+    Extension,
+    ExtensionSession,
+    ObservationSpec,
+    OutputEvent,
+    PlanContext,
+    TriggerSession,
+)
 from .graph import Flow, Graph, InputSemantics, NodeKind, NodeSpec, RatePolicy
 from .kernel import (
     Backend,
@@ -38,6 +56,7 @@ from .plan_ir import (
     BindingDescriptor,
     BufferDescriptor,
     EdgeDescriptor,
+    ExtensionDescriptor,
     NodeDescriptor,
     OutputDescriptor,
     PlanDiagnosticDescriptor,
@@ -46,6 +65,7 @@ from .plan_ir import (
     RationalDescriptor,
     SourceDescriptor,
     TimeDescriptor,
+    TriggerDescriptor,
 )
 from .runtime_buffer import CursorQueue, PortBuffer
 from .source import Source, SourceRequest
@@ -269,11 +289,32 @@ def _collector_descriptor(index: int, item: OutputSpec[Any]) -> OutputDescriptor
     )
 
 
+def _trigger_descriptor(observation: ObservationSpec) -> TriggerDescriptor:
+    """公開TriggerをPython objectを含まないdescriptorへ変換する。"""
+
+    trigger = observation.trigger
+    if isinstance(trigger, Always):
+        return TriggerDescriptor(trigger.kind, None, None, None)
+    if isinstance(trigger, Every):
+        return TriggerDescriptor(trigger.kind, trigger.count, None, None)
+    if isinstance(trigger, EveryLogicalTime):
+        return TriggerDescriptor(
+            trigger.kind,
+            None,
+            RationalDescriptor.from_fraction(trigger.period),
+            RationalDescriptor.from_fraction(trigger.phase),
+        )
+    raise TypeError(
+        f"extension_id {observation.extension_id!r} port {observation.flow.port_id} "
+        "uses an unsupported trigger contract"
+    )
+
+
 def _portable_plan_ir(
     *,
     nodes: tuple[NodeSpec, ...],
     outputs: tuple[OutputSpec[Any], ...],
-    extensions: tuple[Extension, ...],
+    extensions: tuple[ObservationSpec, ...],
     diagnostics: tuple[Diagnostic, ...],
     backend_name: str,
     node_backend_names: dict[int, str],
@@ -373,6 +414,19 @@ def _portable_plan_ir(
         for node in nodes
         if node.kind is NodeKind.SOURCE
     )
+    extension_descriptors = tuple(
+        ExtensionDescriptor(
+            extension.extension_id,
+            extension.flow.port_id,
+            _trigger_descriptor(extension),
+            extension.priority,
+            extension.failure_policy.value,
+            extension.overflow_policy.value,
+            f"extension:{extension.extension_id}",
+            extension.abi_version,
+        )
+        for extension in extensions
+    )
     bindings = tuple(
         [
             BindingDescriptor(f"source:{node.id}", "source", node.id, node.output_port, "python-v1")
@@ -395,23 +449,30 @@ def _portable_plan_ir(
             for index, item in enumerate(outputs)
         ]
         + [
-            BindingDescriptor(f"extension:{index}", "extension", None, None, "extension-v1")
-            for index, _ in enumerate(extensions)
+            BindingDescriptor(
+                extension.binding_slot,
+                "extension",
+                None,
+                extension.observed_port_id,
+                extension.abi_version,
+            )
+            for extension in extension_descriptors
         ]
     )
     return PortablePlanIR(
-        "0.1",
-        "execution_plan",
-        backend_name,
-        plan_nodes,
-        ports,
-        edges,
-        buffers,
-        times,
-        sources,
-        bindings,
-        tuple(_collector_descriptor(index, item) for index, item in enumerate(outputs)),
-        tuple(
+        schema_version="0.1",
+        kind="execution_plan",
+        backend=backend_name,
+        nodes=plan_nodes,
+        ports=ports,
+        edges=edges,
+        buffers=buffers,
+        times=times,
+        sources=sources,
+        extensions=extension_descriptors,
+        bindings=bindings,
+        outputs=tuple(_collector_descriptor(index, item) for index, item in enumerate(outputs)),
+        diagnostics=tuple(
             PlanDiagnosticDescriptor(
                 item.severity.value, item.code, item.message, item.node_id, item.port_id
             )
@@ -424,17 +485,18 @@ def compile(
     outputs: Sequence[Flow[Any] | OutputSpec[Any]],
     *,
     backend: str | Backend = "python",
-    extensions: Sequence[Extension] = (),
+    extensions: Sequence[ObservationSpec] = (),
 ) -> ExecutionPlan:
     """Flow群から不変なExecutionPlanを生成する。
 
     Args:
         outputs: 観測終端。bare FlowはNoCollectとして実行だけ行う。
-        extensions: collectorと独立してPortを観測するExtension。
+        extensions: `observe()`で固定したcompile-time観測契約。
 
     Raises:
         ValueError: outputsが空、または異なるGraphを含む場合。
         DuplicateOutputError: 同じPortが複数回指定された場合。
+        DuplicateExtensionIdError: extension_idが重複した場合。
         MissingConfigError: 宣言されたConfig pathが存在しない場合。
     """
 
@@ -451,7 +513,31 @@ def compile(
     if len(set(ports)) != len(ports):
         raise DuplicateOutputError("compile output ports must be unique")
 
-    observed_ports = [port for extension in extensions for port in extension.observed_ports()]
+    extension_ids: dict[str, ObservationSpec] = {}
+    for extension in extensions:
+        if not isinstance(extension, ObservationSpec):
+            raise CompileError(
+                "compile extensions must be ObservationSpec values returned by observe(); "
+                "bind Extension handlers with ExecutionPlan.create_session()"
+            )
+        if extension.flow._graph is not graph:
+            raise ValueError(
+                f"extension_id {extension.extension_id!r} port {extension.flow.port_id} "
+                "belongs to a different Graph"
+            )
+        previous = extension_ids.get(extension.extension_id)
+        if previous is not None:
+            previous_node = graph.node_for_port(previous.flow.port_id)
+            current_node = graph.node_for_port(extension.flow.port_id)
+            raise DuplicateExtensionIdError(
+                f"duplicate extension_id {extension.extension_id!r} "
+                f"slot 'extension:{extension.extension_id}'; nodes {previous_node.id} and "
+                f"{current_node.id}; ports {previous.flow.port_id} and "
+                f"{extension.flow.port_id}; contract=unique_extension_id"
+            )
+        extension_ids[extension.extension_id] = extension
+
+    observed_ports = [extension.flow.port_id for extension in extensions]
     roots = tuple(ports + observed_ports)
     nodes = _required_nodes(graph, roots)
     diagnostics = _compile_diagnostics(nodes)
@@ -513,7 +599,7 @@ def compile(
         graph=graph,
         nodes=nodes,
         outputs=tuple(normalized),
-        extensions=sorted_extensions,
+        observations=sorted_extensions,
         compile_diagnostics=diagnostics,
         compiled_kernels=compiled_kernels,
         backend_name=backend_instance.name,
@@ -535,7 +621,7 @@ class ExecutionPlan:
         graph: Graph,
         nodes: tuple[NodeSpec, ...],
         outputs: tuple[OutputSpec[Any], ...],
-        extensions: tuple[Extension, ...],
+        observations: tuple[ObservationSpec, ...],
         compile_diagnostics: tuple[Diagnostic, ...],
         compiled_kernels: dict[int, CompiledKernel[object]],
         backend_name: str,
@@ -546,7 +632,7 @@ class ExecutionPlan:
         self._graph = graph
         self._nodes = nodes
         self._outputs = outputs
-        self._extensions = extensions
+        self._observations = observations
         self._compile_diagnostics = compile_diagnostics
         self._compiled_kernels = compiled_kernels
         self._backend_name = backend_name
@@ -576,8 +662,62 @@ class ExecutionPlan:
             collector結果、Diagnostic、status件数を持つRunResult。
         """
 
-        runtime = _PlanRuntime(self, duration)
-        return runtime.run()
+        return self.create_session().run(duration=duration)
+
+    def create_session(
+        self,
+        *,
+        extension_bindings: Mapping[str, Extension] | None = None,
+    ) -> ExecutionSession:
+        """process-local Extension実体を検証して実行instanceを生成する。
+
+        Args:
+            extension_bindings: extension_idからExtension factoryへの完全な対応。
+
+        Returns:
+            同じPlanをrun-local状態で実行するExecutionSession。
+
+        Raises:
+            ExtensionBindingError: binding不足、未知ID、種別、ABI不整合の場合。
+        """
+
+        bindings = {} if extension_bindings is None else dict(extension_bindings)
+        required = {item.extension_id: item for item in self._observations}
+        missing = [item for key, item in required.items() if key not in bindings]
+        if missing:
+            item = missing[0]
+            node = self._graph.node_for_port(item.flow.port_id)
+            raise ExtensionBindingError(
+                f"extension_id {item.extension_id!r} slot 'extension:{item.extension_id}' "
+                f"node {node.id} port {item.flow.port_id} missing required binding; "
+                "contract=required_extension_binding"
+            )
+        unknown = sorted(set(bindings) - set(required))
+        if unknown:
+            extension_id = unknown[0]
+            raise ExtensionBindingError(
+                f"extension_id {extension_id!r} slot 'extension:{extension_id}' "
+                "node None port None is unknown or unused; contract=known_extension_binding"
+            )
+        bound: list[_BoundExtension] = []
+        for item in self._observations:
+            binding = bindings[item.extension_id]
+            node = self._graph.node_for_port(item.flow.port_id)
+            slot = f"extension:{item.extension_id}"
+            if not isinstance(binding, Extension):
+                raise ExtensionBindingError(
+                    f"extension_id {item.extension_id!r} slot {slot!r} node {node.id} "
+                    f"port {item.flow.port_id} has invalid binding type; "
+                    "contract=Extension.create_session"
+                )
+            if binding.abi_version != item.abi_version:
+                raise ExtensionBindingError(
+                    f"extension_id {item.extension_id!r} slot {slot!r} node {node.id} "
+                    f"port {item.flow.port_id} ABI {binding.abi_version!r} does not match "
+                    f"required {item.abi_version!r}; contract=extension_abi"
+                )
+            bound.append(_BoundExtension(item, binding))
+        return ExecutionSession(self, tuple(bound))
 
     def export(self, path: str | Path) -> None:
         """required Node、output、compile DiagnosticをJSONまたはDOTへ出力する。
@@ -607,8 +747,51 @@ class ExecutionPlan:
         raise ValueError("ExecutionPlan export supports only .json and .dot")
 
 
+@dataclass(frozen=True)
+class _BoundExtension:
+    observation: ObservationSpec
+    binding: Extension
+
+
+@dataclass
+class _ExtensionRuntime:
+    observation: ObservationSpec
+    session: ExtensionSession
+    trigger: TriggerSession
+
+
+class ExecutionSession:
+    """ExecutionPlanと検証済みprocess-local bindingを結ぶ実行instance。"""
+
+    def __init__(
+        self,
+        plan: ExecutionPlan,
+        extensions: tuple[_BoundExtension, ...],
+    ) -> None:
+        self._plan = plan
+        self._extensions = extensions
+
+    def run(self, *, duration: float | None = None) -> RunResult:
+        """新しいKernel、collector、Extension状態でPlanを一回実行する。
+
+        Args:
+            duration: Sourceの論理時間上限。Noneではfinite SourceのEOFまで実行。
+
+        Returns:
+            collector結果、Diagnostic、status件数を持つRunResult。
+        """
+
+        runtime = _PlanRuntime(self._plan, duration, self._extensions)
+        return runtime.run()
+
+
 class _PlanRuntime:
-    def __init__(self, plan: ExecutionPlan, duration: float | None) -> None:
+    def __init__(
+        self,
+        plan: ExecutionPlan,
+        duration: float | None,
+        extensions: tuple[_BoundExtension, ...],
+    ) -> None:
         self.plan = plan
         self.duration = None if duration is None else Fraction(str(duration))
         self.nodes_by_port = {node.output_port: node for node in plan._nodes}
@@ -649,24 +832,39 @@ class _PlanRuntime:
         self.kernel_sessions: dict[int, CompiledKernelSession[object]] = {
             node_id: kernel.create_session() for node_id, kernel in plan._compiled_kernels.items()
         }
+        self.extensions = tuple(self._create_extension_runtime(item) for item in extensions)
         self.output_ports = set(self.collectors)
         self.root_ports: set[int] = set()
 
+    def _create_extension_runtime(self, bound: _BoundExtension) -> _ExtensionRuntime:
+        """binding factoryから型検証済みのrun-local handlerを生成する。"""
+
+        session = bound.binding.create_session()
+        if not isinstance(session, ExtensionSession):
+            item = bound.observation
+            node = self.plan._graph.node_for_port(item.flow.port_id)
+            raise ExtensionBindingError(
+                f"extension_id {item.extension_id!r} slot 'extension:{item.extension_id}' "
+                f"node {node.id} port {item.flow.port_id} create_session returned an "
+                "invalid handler; contract=ExtensionSession"
+            )
+        return _ExtensionRuntime(
+            bound.observation,
+            session,
+            bound.observation.trigger.create_session(),
+        )
+
     def run(self) -> RunResult:
         context = PlanContext(required_node_count=len(self.plan._nodes))
-        initialized: list[Extension] = []
+        initialized: list[_ExtensionRuntime] = []
         try:
-            for extension in self.plan._extensions:
-                extension.initialize(context)
+            for extension in self.extensions:
+                self._initialize_extension(extension, context)
                 initialized.append(extension)
             roots = tuple(
                 dict.fromkeys(
                     [item.flow.port_id for item in self.plan._outputs]
-                    + [
-                        port
-                        for extension in self.plan._extensions
-                        for port in extension.observed_ports()
-                    ]
+                    + [extension.observation.flow.port_id for extension in self.extensions]
                 )
             )
             self.root_ports = set(roots)
@@ -697,7 +895,54 @@ class _PlanRuntime:
         finally:
             # collectorやKernelが失敗しても、Extensionが外部資源を閉じられるようにする。
             for extension in reversed(initialized):
-                extension.finalize(context)
+                self._finalize_extension(extension, context)
+
+    def _initialize_extension(
+        self,
+        extension: _ExtensionRuntime,
+        context: PlanContext,
+    ) -> None:
+        """handler初期化失敗へ観測契約の識別情報を付ける。"""
+
+        try:
+            extension.session.initialize(context)
+        except Exception as error:
+            raise self._extension_execution_error(extension, "initialize", error) from error
+
+    def _finalize_extension(
+        self,
+        extension: _ExtensionRuntime,
+        context: PlanContext,
+    ) -> None:
+        """handler終了失敗へ観測契約の識別情報を付ける。"""
+
+        try:
+            extension.session.finalize(context)
+        except Exception as error:
+            raise self._extension_execution_error(extension, "finalize", error) from error
+
+    def _extension_execution_error(
+        self,
+        extension: _ExtensionRuntime,
+        callback: str,
+        error: Exception,
+    ) -> ExtensionExecutionError:
+        item = extension.observation
+        node = self.plan._graph.node_for_port(item.flow.port_id)
+        return ExtensionExecutionError(
+            f"extension_id {item.extension_id!r} slot 'extension:{item.extension_id}' "
+            f"node {node.id} port {item.flow.port_id} callback {callback!r} failed: {error}; "
+            f"contract=failure_policy:{item.failure_policy.value}"
+        )
+
+    def _notify_diagnostic(self, diagnostic: Diagnostic) -> None:
+        """runtime Diagnosticをpriority順に全handlerへ配送する。"""
+
+        for extension in self.extensions:
+            try:
+                extension.session.on_diagnostic(diagnostic)
+            except Exception as error:
+                raise self._extension_execution_error(extension, "on_diagnostic", error) from error
 
     @staticmethod
     def _source_emission(value: object, index: int) -> Emission[object]:
@@ -739,9 +984,15 @@ class _PlanRuntime:
         self.status_counts[emission.status] += 1
         event = OutputEvent(port_id, emission)
         # 観測可能な劣化結果をcollector overflowより先に保存できる順序を正本とする。
-        for extension in self.plan._extensions:
-            if port_id in extension.observed_ports():
-                extension.on_output(event)
+        for extension in self.extensions:
+            if extension.observation.flow.port_id != port_id:
+                continue
+            if not extension.trigger.should_fire(emission):
+                continue
+            try:
+                extension.session.on_output(event)
+            except Exception as error:
+                raise self._extension_execution_error(extension, "on_output", error) from error
         if port_id in self.output_ports:
             self.collectors[port_id].add(emission)
         self.port_buffers[port_id].publish(emission)
@@ -929,8 +1180,7 @@ class _PlanRuntime:
             self.queues[(node.id, input_index)].close()
         for input_spec in node.inputs:
             self._release_if_undemanded(input_spec.source_port)
-        for extension in self.plan._extensions:
-            extension.on_diagnostic(diagnostic)
+        self._notify_diagnostic(diagnostic)
 
     def _release_if_undemanded(self, port_id: int) -> None:
         """終端にもconsumerにも到達しない経路のcursorを上流へ再帰的に解除する。"""
@@ -953,8 +1203,7 @@ class _PlanRuntime:
             details={"active_ports": sorted(active_ports)},
         )
         self.diagnostics.append(diagnostic)
-        for extension in self.plan._extensions:
-            extension.on_diagnostic(diagnostic)
+        self._notify_diagnostic(diagnostic)
 
     def _process_frame_input(self, node: NodeSpec) -> bool:
         queue = self.queues[(node.id, 0)]
@@ -1217,8 +1466,7 @@ class _PlanRuntime:
                 details={"input_index": input_index, "remaining_count": len(queue)},
             )
             self.diagnostics.append(diagnostic)
-            for extension in self.plan._extensions:
-                extension.on_diagnostic(diagnostic)
+            self._notify_diagnostic(diagnostic)
 
     def _result(self) -> RunResult:
         outputs: list[OutputResult[Any]] = []

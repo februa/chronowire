@@ -66,15 +66,22 @@ plan = cw.compile(
         cw.output(covariance, collector=cw.Bounded(max_items=64)),
     ],
     extensions=[
-        cw.Snapshot(
-            flow=covariance,
-            path="snapshots/covariance",
-            include_degraded=True,
-        ),
+        cw.observe(
+            covariance,
+            extension_id="covariance_snapshot",
+            trigger=cw.EveryLogicalTime(period=5),
+        )
     ],
 )
 
-run_result = plan.run(duration=60.0)
+run_result = plan.create_session(
+    extension_bindings={
+        "covariance_snapshot": cw.Snapshot(
+            path="snapshots/covariance.jsonl",
+            include_degraded=True,
+        )
+    }
+).run(duration=60.0)
 beam_result, covariance_result = run_result.outputs
 plan.export("execution_plan.json")
 ```

@@ -263,11 +263,14 @@ plan.run(duration=60.0)
 
 ## 14. ExecutionPlanの再利用
 
-ExecutionPlanとCompiledKernelはrun間で共有可能な不変情報を保持する。各runはCompiledKernelの`create_session()`を呼び、可変なKernelStateを持つrun-local sessionを生成する。
+ExecutionPlanとCompiledKernelはrun間で共有可能な不変情報を保持する。Extension観測も`ObservationSpec`としてPlanへ固定するが、handler実体と可変状態は保持しない。`ExecutionPlan.create_session(extension_bindings=...)`が`extension_id`とprocess-local factoryを検証し、各runはCompiledKernelとExtensionの`create_session()`を呼んでrun-local状態を生成する。
+
+観測契約がないPlanでは`plan.run()`を`plan.create_session().run()`の簡略形として使用できる。必須Extension bindingがあるPlanで`plan.run()`を呼んだ場合は、binding不足を暗黙に無視せず明示例外にする。
 
 初期版推奨:
 
 - 各`run()`開始時に新しいsessionを生成
+- 同じExecutionSessionを再実行してもExtension triggerとhandler状態をreset
 - 継続実行はv0.2の`PlanSession`として追加
 
 ## 15. 決定性

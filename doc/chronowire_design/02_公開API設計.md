@@ -263,7 +263,7 @@ def compile(
     *,
     backend: str | Backend = "python",
     optimization: OptimizationLevel = OptimizationLevel.DEFAULT,
-    extensions: Sequence[Extension] = (),
+    extensions: Sequence[ObservationSpec] = (),
 ) -> ExecutionPlan:
     ...
 ```
@@ -282,6 +282,28 @@ def compile(
 - 共通祖先は一回だけ実行する
 - 結果順はcompile指定順と一致する
 - `.named()`は要求しない
+- `extensions`にはhandler実体ではなく`cw.observe()`が返す`ObservationSpec`を渡す
+- `extension_id`重複はcompile errorとする
+- 観測Portはrequired rootおよびFusion境界とする
+
+Extension実体はcompile後にprocess-local bindingとして注入する。
+
+```python
+observation = cw.observe(
+    spectrum,
+    extension_id="spectrum_snapshot",
+    trigger=cw.EveryLogicalTime(period=5),
+)
+plan = cw.compile(outputs, extensions=[observation])
+session = plan.create_session(
+    extension_bindings={
+        "spectrum_snapshot": cw.Snapshot(path="spectrum.jsonl"),
+    }
+)
+result = session.run()
+```
+
+`extension_id`は安定した観測契約IDであり、`extension:spectrum_snapshot`のようなbinding slotとは同一fieldにしない。missing、unknown、unused、binding種別、ABI不一致は`create_session()`で明示例外にする。
 
 ### 8.2 途中Flowの指定
 

@@ -8,46 +8,44 @@ import pytest
 import chronowire as cw
 
 
-class _LifecycleExtension:
-    """例外時もfinalizeされることを観測するtest Extension。"""
+class _LifecycleSession:
+    """例外時もfinalizeされることを観測するtest session。"""
 
-    priority = 0
-    trigger = cw.Always()
-
-    def __init__(self, port_id: int) -> None:
-        self._port_id = port_id
-        self.initialized = False
-        self.finalized = False
-        self.values: list[object] = []
-
-    def observed_ports(self) -> tuple[int, ...]:
-        return (self._port_id,)
+    def __init__(self, owner: "_LifecycleExtension") -> None:
+        self._owner = owner
 
     def initialize(self, context: cw.PlanContext) -> None:
-        self.initialized = True
+        self._owner.initialized = True
 
     def on_output(self, event: cw.OutputEvent) -> None:
-        self.values.append(event.emission.value)
+        self._owner.values.append(event.emission.value)
 
     def on_diagnostic(self, diagnostic: cw.Diagnostic) -> None:
         pass
 
     def finalize(self, context: cw.PlanContext) -> None:
-        self.finalized = True
+        self._owner.finalized = True
 
 
-class _TraceExtension:
-    """一つのPortについて配送順を外部traceへ記録するExtension。"""
+class _LifecycleExtension:
+    """run-local lifecycle sessionを生成するtest Extension binding。"""
 
-    priority = 0
-    trigger = cw.Always()
+    abi_version = "chronowire.extension.v1"
 
-    def __init__(self, port_id: int, trace: list[str]) -> None:
-        self._port_id = port_id
+    def __init__(self) -> None:
+        self.initialized = False
+        self.finalized = False
+        self.values: list[object] = []
+
+    def create_session(self) -> cw.ExtensionSession:
+        return _LifecycleSession(self)
+
+
+class _TraceSession:
+    """一つのPortについて配送順を外部traceへ記録するsession。"""
+
+    def __init__(self, trace: list[str]) -> None:
         self._trace = trace
-
-    def observed_ports(self) -> tuple[int, ...]:
-        return (self._port_id,)
 
     def initialize(self, context: cw.PlanContext) -> None:
         pass
@@ -60,6 +58,18 @@ class _TraceExtension:
 
     def finalize(self, context: cw.PlanContext) -> None:
         pass
+
+
+class _TraceExtension:
+    """Trace sessionをrunごとに生成するExtension binding。"""
+
+    abi_version = "chronowire.extension.v1"
+
+    def __init__(self, trace: list[str]) -> None:
+        self._trace = trace
+
+    def create_session(self) -> cw.ExtensionSession:
+        return _TraceSession(self._trace)
 
 
 def _degraded(value: int) -> cw.Emission[int]:
@@ -122,14 +132,15 @@ def test_extension_finalizes_after_collector_failure() -> None:
     """run失敗時もExtensionが外部資源を閉じられることを確認する。"""
 
     mapped = cw.Flow([1, 2]).map(lambda value: value)
-    extension = _LifecycleExtension(mapped.port_id)
+    extension = _LifecycleExtension()
+    observation = cw.observe(mapped, extension_id="lifecycle")
     plan = cw.compile(
         [cw.output(mapped, collector=cw.Bounded(1))],
-        extensions=[extension],
+        extensions=[observation],
     )
 
     with pytest.raises(cw.BufferOverflowError):
-        plan.run()
+        plan.create_session(extension_bindings={"lifecycle": extension}).run()
 
     assert extension.initialized
     assert extension.finalized
@@ -142,16 +153,20 @@ def test_output_delivery_order_is_extension_collector_consumer() -> None:
     trace: list[str] = []
     source = cw.Flow([1])
     consumed = source.map(lambda value: trace.append("consumer") or value)
-    result = cw.compile(
-        [
-            cw.output(
-                source,
-                collector=cw.Sink(lambda emission: trace.append("collector")),
-            ),
-            consumed,
-        ],
-        extensions=[_TraceExtension(source.port_id, trace)],
-    ).run()
+    result = (
+        cw.compile(
+            [
+                cw.output(
+                    source,
+                    collector=cw.Sink(lambda emission: trace.append("collector")),
+                ),
+                consumed,
+            ],
+            extensions=[cw.observe(source, extension_id="trace")],
+        )
+        .create_session(extension_bindings={"trace": _TraceExtension(trace)})
+        .run()
+    )
 
     assert result.completed
     assert trace == ["extension", "collector", "consumer"]
@@ -194,8 +209,9 @@ def test_snapshot_records_degraded_emission(tmp_path: Path) -> None:
 
     source = cw.Flow([_degraded(4)])
     path = tmp_path / "snapshot.jsonl"
-    plan = cw.compile([source], extensions=[cw.Snapshot(flow=source, path=path)])
-    result = plan.run()
+    observation = cw.observe(source, extension_id="snapshot")
+    plan = cw.compile([source], extensions=[observation])
+    result = plan.create_session(extension_bindings={"snapshot": cw.Snapshot(path=path)}).run()
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert result.outputs[0].emissions == ()
