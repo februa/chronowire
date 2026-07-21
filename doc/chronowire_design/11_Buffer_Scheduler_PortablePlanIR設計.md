@@ -122,8 +122,10 @@ Sourceをround-robinで無条件に進める方式は意味論の基準実装に
 compile時に、各同期入力のtime descriptorからinterval列の一致を検証する。time descriptorは少なくともtimebase、duration、period、phase、時間変換を持つ。
 
 - 完全一致を証明できる場合は通常のexact mergeとする
-- 不一致を証明できる場合は`POSSIBLE_INTERVAL_MISMATCH` warningを生成する
+- 一般経路で不一致を証明できる場合は`POSSIBLE_INTERVAL_MISMATCH` warningを生成する
 - 情報不足で証明できない場合もwarningを生成し、runtime frontierで検証する
+
+RATEを含む完全同期入力についてはduration/periodの一致をcompile時に必須とし、不一致または未知格子をwarningへ落とさない。完成済みFRAMEの後段RATEも拒否する。外部resampling Kernelの明示time transformで旧格子を終了し、`rate(...).frame(...)`で新格子を確定した経路だけをportableな安定境界として扱う。
 
 warningは従来どおりcompileを停止しない。ただしruntimeは不一致を理由に一方の入力を無制限に先行させない。
 

@@ -688,6 +688,9 @@ class Flow(Generic[T]):
         境界条件:
             数値補間やアンチエイリアス処理は行わない。入力interval内にある発火時刻へ
             同じ値を割り当て、出力intervalを正確な有理周期で表す。
+            frame形成後のrate変更は完成済みframeの重複または未使用を生じ得るため、
+            compile時に拒否する。数値resamplingが必要なら`time_transform="explicit"`の
+            Kernelで旧格子を終了し、その後にrateとframeを明示する。
         """
 
         try:

@@ -45,6 +45,8 @@ final = session.close()
 
 `close()`はRealtimeSourceを停止してingressを閉じ、残件をdrainする。`cancel()`はdrainせず破棄件数をDiagnosticへ残す。包含、overlap、tolerance同期、複数output Port、StateFlow制御Source、`RuntimeOptions`、PortablePlanIRの明示`ExecutionBindings`、session profilerも公開する。数値resamplingは暗黙に行わず、必要なら外部KernelとしてFlowへ明示する。
 
+RATEとFRAMEは`rate(...).frame(...)`の順で論理格子を確定する。`frame(...).rate(...)`は完成済みframeの重複または未使用を生じ得るためcompile errorとなる。frame列を数値resamplingする場合は、`time_transform="explicit"`のKernelで旧格子を終了し、続く`rate(...).frame(...)`で新しい周期とframe境界を明示する。
+
 ```python
 left, right = source.map_outputs(split_kernel, output_count=2)
 aligned = left.map(

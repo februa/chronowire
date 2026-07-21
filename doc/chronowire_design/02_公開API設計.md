@@ -199,6 +199,10 @@ REQUEST
 
 v0.1は`HOLD`だけを実装する。入力Emissionのinterval内にある発火時刻ごとに同じ値を出力し、出力intervalを`1 / frequency_hz`の有理周期に置き換える。これは値の補間ではなく、SchedulerがNodeを起動する論理時刻の指定である。
 
+rate/frameの正規形は`flow.rate(...).frame(...)`とする。`frame(...).rate(...)`は、完成済みframeをHOLDして複製するか、一部のframeを使わない経路を作れるためcompile errorとする。preserve MAPを挟んでも旧frame格子は継続するため同じく拒否する。
+
+frame列を入力に取る数値resamplingが必要な場合は、外部Kernelを`time_transform="explicit"`としてFlowへ置き、旧格子を終了する。その出力を直接frame化せず、`rate(...).frame(...)`で新しい有理周期とframe境界を宣言する。RATEを含む完全同期入力はdurationとperiodの一致を静的に証明できなければcompile errorとし、runtimeのdropやstallで帳尻を合わせない。
+
 下流にRATE Nodeを持つgenerated Sourceについては、compileがSourceごとの最短rate周期を求め、その周期を`SourceRequest.duration`に使用する。
 
 ## 6. graph_info()

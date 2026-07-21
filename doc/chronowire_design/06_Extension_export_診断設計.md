@@ -244,14 +244,16 @@ ChronowireError
 - Sourceへ到達可能
 - Config必須値が存在
 
-未定義timebase、負のduration、Kernelの矛盾した時間変換宣言など、時間意味論自体の契約違反は`TimeSemanticsError`とする。複数入力のintervalが一致しない可能性はcompile errorにせず、`POSSIBLE_INTERVAL_MISMATCH` warningとする。
+未定義timebase、負のduration、Kernelの矛盾した時間変換宣言など、時間意味論自体の契約違反は`TimeSemanticsError`とする。一般の複数入力でintervalが一致しない可能性はcompile errorにせず、`POSSIBLE_INTERVAL_MISMATCH` warningとする。
+
+RATEを含む同期格子は例外とする。RATE入力間のduration/period不一致、未知time transformからRATEを介さないFRAME、および完成済みFRAMEの後段RATEは、端数frame、重複frame、未使用frameをruntimeで処理できてしまうため`CompileError`とする。messageにはNode、Port、`stable_rate_frame_boundary`または`rate_before_frame`契約を含める。
 
 ## 4.3 warning
 
 - fallback to Python backend
 - 観測境界によるFusion阻害
 - bounded dynamic bufferの明示上限使用
-- 非整数rate比
+- 上流pull単位に対する非整数rate比。ただし論理格子が有理数で確定している場合だけ
 - merge入力のinterval不一致可能性 (`POSSIBLE_INTERVAL_MISMATCH`)
 - frame末尾drop
 - compile対象外の大きな経路

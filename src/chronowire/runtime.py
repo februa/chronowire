@@ -234,6 +234,15 @@ class _RateState:
     next_fire: Fraction | None = None
 
 
+@dataclass(frozen=True)
+class _TimingProof:
+    """compile時のrate/frame境界証明に必要な最小情報を保持する。"""
+
+    exact: bool
+    contains_frame: bool
+    contains_rate: bool
+
+
 def _status_rank(status: EmissionStatus) -> int:
     return {
         EmissionStatus.OK: 0,
@@ -290,6 +299,89 @@ def _time_signature(nodes: Sequence[NodeSpec]) -> dict[int, tuple[Fraction, Frac
         for output_port in node.output_ports:
             signatures[output_port] = value
     return signatures
+
+
+def _validate_rate_frame_boundaries(nodes: Sequence[NodeSpec]) -> None:
+    """RATEとFRAMEの順序および同期格子を静的に検証する。
+
+    RATEはitem列の論理格子を確定する境界であり、FRAMEより前に置く。完成済み
+    frameへRATEを適用するとHOLDによる重複または未使用frameが生じ得るため拒否する。
+    また、明示time transform後の未知格子をFRAMEへ渡す場合と、RATEを含む同期入力の
+    格子不一致も、runtimeへ先送りせずcompile違反とする。
+    """
+
+    signatures = _time_signature(nodes)
+    proofs: dict[int, _TimingProof] = {}
+    for node in nodes:
+        if node.kind is NodeKind.SOURCE:
+            proof = _TimingProof(exact=True, contains_frame=False, contains_rate=False)
+        elif node.kind is NodeKind.MAP:
+            main = proofs[node.inputs[0].source_port]
+            synchronous = [
+                item for item in node.inputs if item.semantics is InputSemantics.SYNCHRONOUS
+            ]
+            synchronous_proofs = [proofs[item.source_port] for item in synchronous]
+            rate_sensitive = any(item.contains_rate for item in synchronous_proofs)
+            if rate_sensitive and any(not item.exact for item in synchronous_proofs):
+                ports = tuple(item.source_port for item in synchronous)
+                raise CompileError(
+                    f"node {node.id} port {node.output_port} cannot prove synchronous "
+                    f"rate/frame boundaries for input ports {ports}; insert an explicit "
+                    "Flow.rate(...) after the time-transforming Kernel and before Flow.frame(...); "
+                    "contract=stable_rate_frame_boundary"
+                )
+            input_signatures = {signatures[item.source_port] for item in synchronous}
+            if rate_sensitive and len(input_signatures) > 1:
+                ports = tuple(item.source_port for item in synchronous)
+                raise CompileError(
+                    f"node {node.id} port {node.output_port} has incompatible synchronous "
+                    f"rate/frame grids on input ports {ports}: "
+                    f"{tuple(str(value) for value in sorted(input_signatures))}; insert explicit "
+                    "Flow.rate(...).frame(...) stages that produce identical duration and period; "
+                    "contract=stable_rate_frame_boundary"
+                )
+            if node.time_transform == "explicit":
+                # 外部resampling Kernelは旧格子を終了する。ただし新格子は未知なので、
+                # FRAMEへ進むには直後のRATEでperiodを再宣言しなければならない。
+                proof = _TimingProof(
+                    exact=False,
+                    contains_frame=False,
+                    contains_rate=False,
+                )
+            else:
+                proof = _TimingProof(
+                    exact=main.exact,
+                    contains_frame=main.contains_frame,
+                    contains_rate=main.contains_rate,
+                )
+        elif node.kind is NodeKind.FRAME:
+            source_port = node.inputs[0].source_port
+            source = proofs[source_port]
+            if not source.exact:
+                raise CompileError(
+                    f"frame node {node.id} port {node.output_port} cannot prove the input grid "
+                    f"from port {source_port}; insert explicit Flow.rate(...) immediately before "
+                    "Flow.frame(...); contract=stable_rate_frame_boundary"
+                )
+            proof = _TimingProof(
+                exact=True,
+                contains_frame=True,
+                contains_rate=source.contains_rate,
+            )
+        elif node.kind is NodeKind.RATE:
+            source_port = node.inputs[0].source_port
+            source = proofs[source_port]
+            if source.contains_frame:
+                raise CompileError(
+                    f"rate node {node.id} port {node.output_port} consumes a completed frame "
+                    f"from port {source_port}; move Flow.rate(...) before Flow.frame(...) so HOLD "
+                    "cannot duplicate or discard frames; contract=rate_before_frame"
+                )
+            proof = _TimingProof(exact=True, contains_frame=False, contains_rate=True)
+        else:
+            raise RuntimeError(f"unsupported Node kind {node.kind!r}")
+        for output_port in node.output_ports:
+            proofs[output_port] = proof
 
 
 def _port_finiteness(nodes: Sequence[NodeSpec]) -> dict[int, bool]:
@@ -880,6 +972,7 @@ def compile(
 
     Raises:
         ValueError: outputsが空、または異なるGraphを含む場合。
+        CompileError: rate/frame格子を静的に証明できない場合。
         DuplicateOutputError: 同じPortが複数回指定された場合。
         DuplicateExtensionIdError: extension_idが重複した場合。
         MissingConfigError: 宣言されたConfig pathが存在しない場合。
@@ -925,6 +1018,7 @@ def compile(
     observed_ports = [extension.flow.port_id for extension in extensions]
     roots = tuple(ports + observed_ports)
     nodes = _required_nodes(graph, roots)
+    _validate_rate_frame_boundaries(nodes)
     diagnostics = _compile_diagnostics(nodes)
     backend_instance: Backend
     if isinstance(backend, str):
