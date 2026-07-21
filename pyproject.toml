@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chronowire"
+version = "0.1.0.dev0"
+description = "Explicitly compiled streaming graphs with logical-time diagnostics."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "februa" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pyright>=1.1.400",
+  "pytest>=8.0",
+  "ruff>=0.11.0",
+]
+docs = [
+  "latex2mathml>=3.78",
+  "python-docx>=1.1",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+chronowire = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".agents"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.ruff.format]
+quote-style = "double"

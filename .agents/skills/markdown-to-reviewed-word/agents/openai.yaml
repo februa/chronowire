@@ -1,0 +1,4 @@
+interface:
+  display_name: "Markdown to Reviewed Word"
+  short_description: "技術Markdownを検証済みWord文書へ変換する"
+  default_prompt: "Use $markdown-to-reviewed-word to convert this technical Markdown into a visually verified Word document."

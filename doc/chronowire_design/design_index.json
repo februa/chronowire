@@ -1,0 +1,19 @@
+{
+  "project": "Chronowire",
+  "document_count": 13,
+  "documents": [
+    "README.md",
+    "01_基本設計.md",
+    "02_公開API設計.md",
+    "03_内部グラフと論理時間設計.md",
+    "04_compileと実行時設計.md",
+    "05_Kernel_Backend_Config設計.md",
+    "06_Extension_export_診断設計.md",
+    "07_パッケージ構成と実装計画.md",
+    "08_試験設計.md",
+    "09_v0.1確定事項と将来検討.md",
+    "10_Native_Executor設計方針.md",
+    "11_Buffer_Scheduler_PortablePlanIR設計.md",
+    "12_v0.1_v0.2リリース方針.md"
+  ]
+}
