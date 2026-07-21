@@ -114,6 +114,19 @@ class CompiledKernel(Protocol[T_co]):
 
 
 @runtime_checkable
+class NativeCompiledKernel(CompiledKernel[T_co], Protocol[T_co]):
+    """PortablePlanIRへexport可能なnative Kernel ABI付きfactory。"""
+
+    abi_version: str
+    process_model: str
+    workspace_size_bytes: int
+    workspace_alignment_bytes: int
+    supports_flush: bool
+    session_local: bool
+    native_compatible: bool
+
+
+@runtime_checkable
 class Kernel(Protocol[T_co]):
     """Config解決と作業領域準備をrunから分離するprotocol。"""
 

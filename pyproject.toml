@@ -44,11 +44,16 @@ package-dir = { "" = "src" }
 name = "chronowire._cython_executor"
 sources = ["src/chronowire/_cython_executor.pyx"]
 
+[[tool.setuptools.ext-modules]]
+name = "chronowire_reference._cython_cbf"
+sources = ["src/chronowire_reference/_cython_cbf.pyx"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
 chronowire = ["py.typed", "_cython_executor.pyi"]
+chronowire_reference = ["_cython_cbf.pyi", "py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

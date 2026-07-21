@@ -102,6 +102,23 @@ buffer high-watermarkを測定できる。
 uv run python -m examples.native_executor_baseline
 ```
 
+CBFのPython実装とCython実装は`chronowire_reference`へ本体から分離している。同じKernel宣言を
+`PythonBackend`または`CythonCbfBackend`でcompileでき、Python callbackとCython Kernelを
+同じPlan内の別Stageとして混在させられる。
+
+```bash
+uv run python -m chronowire_reference
+```
+
+このconformanceは次の三構成で、値、interval、sequence、status、Diagnosticを比較する。
+
+- Python Executor + Python CBF Kernel
+- Python Executor + Cython CBF Kernel
+- Python前処理 + Cython CBF Kernel + Python後処理
+
+固定shape多channel bufferをCython ExecutorのScheduler loopへ直接接続する作業は次段階であり、
+現時点でCython CBF Kernelを実行するSchedulerはPython Executorである。
+
 ## 実行例
 
 chunk入力をsampleへ展開し、rate、frame、EOF padding、固定CBFへ流す例を実行できる。

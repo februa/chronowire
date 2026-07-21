@@ -148,6 +148,12 @@ Node単位でfallback可能とする。
 
 BackendはNodeのアルゴリズム実装をcompileする。ExecutionPlan全体のready判定、rate cursor、frame history、buffer寿命はExecutorの責務であり、Backendへ含めない。Native KernelをPython Executorから呼ぶ構成と、NativeExecutorから呼ぶ構成を区別する。詳細は[10_Native_Executor設計方針.md](10_Native_Executor設計方針.md)を参照する。
 
+v0.3ではBackendが返す`CompiledKernel`が任意で`NativeCompiledKernel`を実装できる。
+ABI version、process model、workspace、flush、session ownership、native互換性はこのfactoryから
+PortablePlanIRへ抽出する。これによりKernel宣言へ実装言語を埋め込まず、同じ宣言を
+Python BackendまたはCython Backendでcompileできる。plain Python callableは選択Backendへ
+渡さずPython Stageとして残るため、一つのPlan内でPython callbackとCython Kernelを混在できる。
+
 ## 2.3 backend境界
 
 backendが異なるNode間では以下の変換が発生し得る。

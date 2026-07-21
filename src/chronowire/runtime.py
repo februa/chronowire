@@ -53,6 +53,7 @@ from .kernel import (
     CompiledKernelSession,
     GapPolicy,
     Kernel,
+    NativeCompiledKernel,
     PythonBackend,
     PythonCallableKernel,
     RunContext,
@@ -731,6 +732,7 @@ def _portable_plan_ir(
     diagnostics: tuple[Diagnostic, ...],
     backend_name: str,
     node_backend_names: dict[int, str],
+    kernel_abi_descriptors: dict[int, KernelAbiDescriptor],
     source_request_periods: dict[int, Fraction],
 ) -> PortablePlanIR:
     """compile済みPython実体からportable descriptorだけを抽出する。"""
@@ -1028,11 +1030,7 @@ def _portable_plan_ir(
                 "kernel",
                 node.id,
                 node.output_port,
-                (
-                    node.operation.abi_version
-                    if isinstance(node.operation, IdentityF64Kernel)
-                    else "python-v1"
-                ),
+                kernel_abi_descriptors[node.id].abi_version,
             )
             for node in nodes
             if node.kind is NodeKind.MAP
@@ -1063,27 +1061,7 @@ def _portable_plan_ir(
     }
     stages = _stage_descriptors(nodes, node_backend_names, boundary_ports)
     kernel_abis = tuple(
-        KernelAbiDescriptor(
-            node.id,
-            f"kernel:{node.id}",
-            (
-                node.operation.abi_version
-                if isinstance(node.operation, IdentityF64Kernel)
-                else "python-v1"
-            ),
-            (
-                node.operation.process_model
-                if isinstance(node.operation, IdentityF64Kernel)
-                else "python_object"
-            ),
-            0 if isinstance(node.operation, IdentityF64Kernel) else None,
-            8 if isinstance(node.operation, IdentityF64Kernel) else None,
-            False,
-            True,
-            isinstance(node.operation, IdentityF64Kernel),
-        )
-        for node in nodes
-        if node.kind is NodeKind.MAP
+        kernel_abi_descriptors[node.id] for node in nodes if node.kind is NodeKind.MAP
     )
     native_port_ids = tuple(
         port.port_id for port in ports if port.value_schema_id != "python:opaque"
@@ -1213,6 +1191,7 @@ def compile(
     else:
         backend_instance = backend
     compiled_kernels: dict[int, CompiledKernel[object]] = {}
+    kernel_abi_descriptors: dict[int, KernelAbiDescriptor] = {}
     node_backend_names: dict[int, str] = {
         node.id: "executor" for node in nodes if node.kind is not NodeKind.MAP
     }
@@ -1247,6 +1226,42 @@ def compile(
                 f"CompiledKernel for node {node.id}"
             )
         compiled_kernels[node.id] = compiled
+        if isinstance(compiled, NativeCompiledKernel):
+            kernel_abi_descriptors[node.id] = KernelAbiDescriptor(
+                node.id,
+                f"kernel:{node.id}",
+                compiled.abi_version,
+                compiled.process_model,
+                compiled.workspace_size_bytes,
+                compiled.workspace_alignment_bytes,
+                compiled.supports_flush,
+                compiled.session_local,
+                compiled.native_compatible,
+            )
+        elif isinstance(operation, IdentityF64Kernel):
+            kernel_abi_descriptors[node.id] = KernelAbiDescriptor(
+                node.id,
+                f"kernel:{node.id}",
+                operation.abi_version,
+                operation.process_model,
+                0,
+                8,
+                False,
+                True,
+                True,
+            )
+        else:
+            kernel_abi_descriptors[node.id] = KernelAbiDescriptor(
+                node.id,
+                f"kernel:{node.id}",
+                "python-v1",
+                "python_object",
+                None,
+                None,
+                False,
+                True,
+                False,
+            )
         node_backend_names[node.id] = (
             "native_kernel" if isinstance(operation, IdentityF64Kernel) else selected_backend.name
         )
@@ -1259,6 +1274,7 @@ def compile(
         diagnostics=diagnostics,
         backend_name=backend_instance.name,
         node_backend_names=node_backend_names,
+        kernel_abi_descriptors=kernel_abi_descriptors,
         source_request_periods=source_request_periods,
     )
     return ExecutionPlan(

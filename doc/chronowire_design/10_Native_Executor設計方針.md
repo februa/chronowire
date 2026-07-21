@@ -224,6 +224,15 @@ SourceからExecutorへの物理入力はchannel-first blockとする。block内
 - block size別throughputとlatency
 - copy回数と最大buffer量
 
+v0.3のBackend交換conformanceとして、固定CBF宣言をPython実装とCython `nogil`実装で
+個別にcompileし、さらにPython前処理、Cython CBF、Python後処理を一つのPlanへ配置する。
+参照DSPコードは`chronowire_reference` packageへ分離し、Chronowire本体の公開Flow APIへ
+CBFを追加しない。三構成は同じ値、interval、sequence、status、Diagnostic traceを要求する。
+
+この段階でCython化されるのはKernel loopであり、Source、FRAME、Stage間配送はPython
+Executorが担当する。固定shape多channel bufferをCython Executorへ直接渡す構成は、
+Python/Cython混在境界のcopy規則を測定した後に追加する。
+
 ## 9. 実装段階
 
 Native Executorはv0.2の必須範囲には含めない。[12_v0.1_v0.2リリース方針.md](12_v0.1_v0.2リリース方針.md)のv0.1/v0.2 release gateを満たした後、v0.3以降で以下のPhaseを開始する。
