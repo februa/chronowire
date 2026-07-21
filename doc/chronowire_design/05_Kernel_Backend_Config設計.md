@@ -97,10 +97,12 @@ Graph内部は複数output Portを扱える設計にする。
 v0.2で公開する基本形:
 
 ```python
-a, b = flow.map(split)
+a, b = flow.map_outputs(split, output_count=2)
 ```
 
-Kernel descriptorがoutput数と各Port schemaを宣言し、`map()`は固定長の通常tupleとしてFlow handle列を返す。`FlowTuple`や`MultiFlow`という追加公開classは設けない。Graph IRとKernelResultの複数Port表現はv0.1で保持する。
+Kernelは`kernel_outputs(a, b)`を返し、`map_outputs()`は固定長の通常tupleとしてFlow handle列を返す。通常tupleは従来どおり一値であり暗黙展開しない。`FlowTuple`や`MultiFlow`という追加公開classは設けない。未観測sibling Portはruntime bufferへ保持せず、必要Portの実行を妨げない。
+
+plain callableには`callable_kernel()`で`max_items`、`accepts_invalid`、`time_transform`、`GapPolicy`を一括宣言できる。`time_transform="preserve"`は入力intervalを維持し、`"explicit"`は外部resampling Kernelが出力intervalを決定する境界を表す。Graph構築後にこれらを上書きせず、PortablePlanIRへ固定する。
 
 # 2. Backend
 

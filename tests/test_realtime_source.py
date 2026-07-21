@@ -64,6 +64,45 @@ class _BurstRealtimeSource:
         return session
 
 
+class _OpenRealtimeSource(_BurstRealtimeSource):
+    """push後もreceiverをcloseせずExecutor停止を待つtest Source。"""
+
+    def start(
+        self,
+        receiver: cw.RealtimeReceiver[int],
+        config: cw.Config,
+    ) -> _Session:
+        """有限件数をpushするが外部受付は開いたままにする。"""
+
+        del config
+        session = _Session()
+        self.sessions.append(session)
+        for index in range(self.count):
+            receiver.publish(
+                cw.Emission(
+                    index,
+                    cw.LogicalInterval(cw.LogicalTime(index), cw.LogicalTime(index + 1)),
+                    index,
+                )
+            )
+        return session
+
+
+class _FailingRealtimeSource(_OpenRealtimeSource):
+    """receiverへSource失敗を通知するtest Source。"""
+
+    def start(
+        self,
+        receiver: cw.RealtimeReceiver[int],
+        config: cw.Config,
+    ) -> _Session:
+        """一件を配送後に回復不能な入力失敗を通知する。"""
+
+        session = super().start(receiver, config)
+        receiver.fail(OSError("device disconnected"))
+        return session
+
+
 def test_realtime_drop_oldest_degrades_next_retained_emission() -> None:
     """overflow欠落をDiagnosticと次のDEGRADED Emissionへ伝播する。"""
 
@@ -108,6 +147,74 @@ def test_realtime_source_state_is_run_local() -> None:
     assert all(session.stopped for session in source_impl.sessions)
     assert [item.details["total_dropped_count"] for item in first.diagnostics] == [2]
     assert [item.details["total_dropped_count"] for item in second.diagnostics] == [2]
+
+
+def test_plan_session_close_stops_and_drains_open_realtime_source() -> None:
+    """closeは外部受付を止めてingress残件と下流をdrainする。"""
+
+    source_impl = _OpenRealtimeSource(2, max_items=2)
+    plan = cw.compile([cw.output(cw.Flow(source_impl), collector=cw.Bounded(2))])
+    session = plan.create_plan_session()
+    session.start()
+
+    result = session.close()
+
+    assert [item.value for item in result.outputs[0].emissions] == [0, 1]
+    assert result.completed
+    assert session.state is cw.PlanSessionState.CLOSED
+    assert source_impl.sessions[0].stopped
+
+
+def test_plan_session_cancel_discards_realtime_ingress_with_diagnostic() -> None:
+    """cancelはdrainせず、破棄したRealtime件数をDiagnosticへ残す。"""
+
+    source_impl = _OpenRealtimeSource(2, max_items=2)
+    plan = cw.compile([cw.output(cw.Flow(source_impl), collector=cw.Bounded(2))])
+    session = plan.create_plan_session()
+    session.start()
+
+    result = session.cancel()
+    diagnostic = next(item for item in result.diagnostics if item.code == "SESSION_CANCELLED")
+
+    assert result.outputs[0].emissions == ()
+    assert diagnostic.details["discarded_realtime_items"] == {0: 2}
+    assert source_impl.sessions[0].stopped
+
+
+def test_realtime_receiver_failure_is_source_error_and_plan_is_reusable() -> None:
+    """receiver.failをSource例外として識別し、失敗sessionだけを破棄する。"""
+
+    source_impl = _FailingRealtimeSource(1, max_items=1)
+    plan = cw.compile([cw.output(cw.Flow(source_impl), collector=cw.Latest())])
+    session = plan.create_plan_session()
+    session.start()
+
+    with pytest.raises(cw.SourceExecutionError, match="node 0 port 0.*receive failed"):
+        session.run_until(2)
+    assert session.state is cw.PlanSessionState.FAILED
+
+    replacement = plan.create_plan_session()
+    replacement.start()
+    with pytest.raises(cw.SourceExecutionError):
+        replacement.run_until(2)
+
+
+def test_long_realtime_burst_remains_bounded_and_reports_lag_drop() -> None:
+    """長時間相当burstでもingress上限を越えずdropをprofileへ残す。"""
+
+    source_impl = _BurstRealtimeSource(10_000, max_items=8)
+    plan = cw.compile([cw.output(cw.Flow(source_impl), collector=cw.Latest())])
+
+    result = plan.run(options=cw.RuntimeOptions(profiler_enabled=True))
+
+    assert result.outputs[0].received_count == 8
+    assert result.profile is not None
+    ingress = next(item for item in result.profile.buffers if item.kind == "realtime_ingress")
+    source = result.profile.sources[0]
+    assert ingress.high_watermark == 8
+    assert ingress.high_watermark <= ingress.capacity
+    assert source.dropped_count == 9_992
+    assert source.pending_items == 0
 
 
 def test_realtime_source_requires_positive_ingress_capacity() -> None:

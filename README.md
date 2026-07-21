@@ -29,9 +29,9 @@ v0.1のmergeは完全interval一致とlatest stateに限定する。不一致の
 
 同一EmissionはExtension、観測終端collector、下流consumerの順で配送する。collector overflow時も、Extensionは対象Emissionを先に保存できる。
 
-## v0.2 development
+## v0.2
 
-`0.2.0.dev0`では、同じrun-local状態を論理時間境界ごとに継続する`PlanSession`の実装を開始した。
+`0.2.0`では、v0.1の基準意味論を継続sessionと実運用streamingへ拡張した。
 
 ```python
 session = plan.create_plan_session()
@@ -43,7 +43,22 @@ final = session.close()
 
 同一`PlanSession`ではKernel session、FRAME/RATE履歴、buffer、collector、Extension triggerを保持する。別の`PlanSession`は新しいrun-local状態から開始する。`run_until()`は境界外のSource Emissionを失わず保留し、結果はsession開始時からの累積snapshotとして返す。`cancel()`はpending状態をdrainせず破棄し、`SESSION_CANCELLED` Diagnosticを残す。
 
-現在の`flush()`と`close()`によるdrainはfinite Sourceが対象である。RealtimeSource lifecycle、拡張同期、複数output Port、PortablePlanIRからの明示binding、profilerはv0.2の残件であり、`0.2.0`確定前にrelease gateを満たす。
+`close()`はRealtimeSourceを停止してingressを閉じ、残件をdrainする。`cancel()`はdrainせず破棄件数をDiagnosticへ残す。包含、overlap、tolerance同期、複数output Port、StateFlow制御Source、`RuntimeOptions`、PortablePlanIRの明示`ExecutionBindings`、session profilerも公開する。数値resamplingは暗黙に行わず、必要なら外部KernelとしてFlowへ明示する。
+
+```python
+left, right = source.map_outputs(split_kernel, output_count=2)
+aligned = left.map(
+    combine,
+    other=right.synchronize(cw.InputSemantics.TOLERANCE, tolerance=0.001),
+)
+```
+
+PortablePlanIRはprocess-local objectを含めない。別processではslotを完全指定してbindする。
+
+```python
+bound = cw.bind_plan(ir, cw.ExecutionBindings(values=slot_bindings, configs=configs))
+result = bound.run(options=cw.RuntimeOptions(profiler_enabled=True))
+```
 
 ## 実行例
 
@@ -55,17 +70,17 @@ uv run python -m examples.streaming_cbf
 
 ## Install
 
-v0.1はGit tagを指定してrevisionを固定できる。
+0.x releaseはGit tagを指定してrevisionを固定できる。
 
 ```bash
-uv add "chronowire @ git+https://github.com/februa/chronowire.git@v0.1.0"
+uv add "chronowire @ git+https://github.com/februa/chronowire.git@v0.2.0"
 ```
 
 ```bash
-python -m pip install "chronowire @ git+https://github.com/februa/chronowire.git@v0.1.0"
+python -m pip install "chronowire @ git+https://github.com/februa/chronowire.git@v0.2.0"
 ```
 
-`0.1.0`は0.x development seriesの最初の確定版であり、GitHub tagからinstallする。PyPIへは、Python/C++ Executor、継続streaming、評価例、API usabilityを確認したv1.0から正式公開する。release方針は[RELEASING.md](RELEASING.md)を参照する。
+`0.1.0`と`0.2.0`はGitHub tagからinstallする。PyPIへは、Python/C++ Executor、継続streaming、評価例、API usabilityを確認したv1.0から正式公開する。release方針は[RELEASING.md](RELEASING.md)を参照する。
 
 ## 開発環境
 
@@ -85,4 +100,4 @@ uv sync --extra dev --extra docs
 
 設計の正本は[doc/chronowire_design/README.md](doc/chronowire_design/README.md)を参照する。
 
-v0.1のrelease gateとv0.2の確定範囲は[doc/chronowire_design/12_v0.1_v0.2リリース方針.md](doc/chronowire_design/12_v0.1_v0.2リリース方針.md)に定める。v0.2は継続`PlanSession`、拡張同期、複数output Port、明示PortablePlanIR binding、長時間streaming観測を扱い、Native Executorはv0.3以降とする。
+v0.1とv0.2のrelease gateは[doc/chronowire_design/12_v0.1_v0.2リリース方針.md](doc/chronowire_design/12_v0.1_v0.2リリース方針.md)に定める。Native Executorはv0.3以降とする。

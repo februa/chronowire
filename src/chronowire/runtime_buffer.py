@@ -364,6 +364,7 @@ class RealtimeIngressBuffer(Generic[T]):
         self.overflow_policy = overflow_policy
         self._records: deque[Emission[T] | GapMarker] = deque()
         self._item_count = 0
+        self._high_watermark = 0
         self._total_dropped = 0
         self._closed = False
         self._failure: BaseException | None = None
@@ -396,6 +397,7 @@ class RealtimeIngressBuffer(Generic[T]):
                 self._record_gap(oldest_index, dropped)
                 self._records.append(emission)
                 self._item_count += 1
+            self._high_watermark = max(self._high_watermark, self._item_count)
             self._condition.notify()
 
     def close(self) -> None:
@@ -429,6 +431,38 @@ class RealtimeIngressBuffer(Generic[T]):
                     f"realtime source node {self.source_node_id} port {self.source_port_id} failed"
                 ) from self._failure
             return None
+
+    def discard(self) -> int:
+        """cancel時に未処理recordを破棄し、通常Emission件数を返す。"""
+
+        with self._condition:
+            discarded = self._item_count
+            self._records.clear()
+            self._item_count = 0
+            self._closed = True
+            self._condition.notify_all()
+            return discarded
+
+    @property
+    def is_closed(self) -> bool:
+        """外部受付が終了している場合にTrueを返す。"""
+
+        with self._condition:
+            return self._closed
+
+    @property
+    def pending_count(self) -> int:
+        """drain待ちの通常Emission件数を返す。"""
+
+        with self._condition:
+            return self._item_count
+
+    @property
+    def high_watermark(self) -> int:
+        """session中に同時保持した通常Emission最大件数を返す。"""
+
+        with self._condition:
+            return self._high_watermark
 
     @property
     def total_dropped_count(self) -> int:

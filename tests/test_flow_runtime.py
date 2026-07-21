@@ -142,6 +142,21 @@ def test_latest_state_uses_value_at_or_before_main_interval() -> None:
     assert _values(result.outputs[0]) == [11, 22, 33]
 
 
+def test_state_source_helper_records_external_control_as_latest_edge() -> None:
+    """外部制御値をConfigではなく同一GraphのSOURCE/LATEST Edgeとして扱う。"""
+
+    main = cw.Flow([1, 2, 3])
+    gain = main.state_source([10, 20, 30])
+    scaled = main.map(lambda value, *, gain: value * gain, gain=gain)
+    plan = cw.compile([cw.output(scaled, collector=cw.Bounded(3))])
+
+    result = plan.run()
+    latest_edge = next(item for item in plan.portable_ir.edges if item.semantics == "latest")
+
+    assert _values(result.outputs[0]) == [10, 40, 90]
+    assert latest_edge.source_port_id == gain.flow.port_id
+
+
 def test_exact_merge_stall_stops_unneeded_pull_before_source_eof() -> None:
     """生成不能intervalを検出した経路がfinite Sourceを末尾まで先行取得しない。"""
 

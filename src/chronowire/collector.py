@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Generic, Protocol, TypeVar
+from typing import Generic, Protocol, TypeVar, runtime_checkable
 
 from .model import Emission
 
@@ -56,6 +56,7 @@ class CollectorSession(Protocol[T]):
         ...
 
 
+@runtime_checkable
 class Collector(Protocol[T]):
     """runごとに独立したCollectorSessionを生成するprotocol。"""
 

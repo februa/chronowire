@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chronowire"
-version = "0.2.0.dev0"
+version = "0.2.0"
 description = "Explicitly compiled streaming graphs with logical-time diagnostics."
 readme = "README.md"
 requires-python = ">=3.11"

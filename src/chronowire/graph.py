@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Generic, TypeVar
 
 from .config import Config
-from .kernel import Kernel
+from .kernel import CallableAdapter, GapPolicy, Kernel
 from .source import RealtimeSource, Source
 
 T = TypeVar("T")
@@ -38,6 +38,16 @@ class InputSemantics(StrEnum):
 
     SYNCHRONOUS = "synchronous"
     LATEST = "latest"
+    CONTAINS = "contains"
+    OVERLAPS = "overlaps"
+    TOLERANCE = "tolerance"
+
+
+class MissingInputPolicy(StrEnum):
+    """同期入力が生成不能な場合のNode動作を表す。"""
+
+    STALL = "stall"
+    SKIP = "skip"
 
 
 @dataclass(frozen=True)
@@ -47,6 +57,8 @@ class InputSpec:
     source_port: int
     semantics: InputSemantics
     keyword: str | None = None
+    tolerance: Fraction | None = None
+    missing_policy: MissingInputPolicy = MissingInputPolicy.STALL
 
 
 @dataclass(frozen=True)
@@ -56,6 +68,7 @@ class NodeSpec:
     id: int
     kind: NodeKind
     output_port: int
+    output_ports: tuple[int, ...]
     inputs: tuple[InputSpec, ...]
     config: Config
     operation: Callable[..., object] | Kernel[object] | None = None
@@ -69,6 +82,8 @@ class NodeSpec:
     rate_period: Fraction | None = None
     rate_policy: RatePolicy | None = None
     max_items: int = 1
+    time_transform: str = "preserve"
+    gap_policy: GapPolicy = GapPolicy.RESET
 
 
 @dataclass(frozen=True)
@@ -78,6 +93,7 @@ class NodeInfo:
     id: int
     kind: NodeKind
     output_port: int
+    output_ports: tuple[int, ...]
     input_ports: tuple[int, ...]
     config_scope_id: str
     rate_period: Fraction | None
@@ -93,6 +109,8 @@ class EdgeInfo:
     target_input: int
     semantics: InputSemantics
     keyword: str | None
+    tolerance: Fraction | None
+    missing_policy: MissingInputPolicy
 
 
 @dataclass(frozen=True)
@@ -145,15 +163,66 @@ class Graph:
         rate_period: Fraction | None = None,
         rate_policy: RatePolicy | None = None,
         max_items: int = 1,
+        time_transform: str = "preserve",
+        gap_policy: GapPolicy = GapPolicy.RESET,
     ) -> int:
-        """Nodeを追加し、新しいoutput Port IDを返す。"""
+        """単一output Nodeを追加し、新しいPort IDを返す。"""
+
+        return self.add_node_ports(
+            kind,
+            config,
+            inputs=inputs,
+            operation=operation,
+            constants=constants,
+            config_paths=config_paths,
+            accepts_invalid=accepts_invalid,
+            source=source,
+            frame_size=frame_size,
+            frame_hop=frame_hop,
+            pad_end=pad_end,
+            rate_period=rate_period,
+            rate_policy=rate_policy,
+            max_items=max_items,
+            time_transform=time_transform,
+            gap_policy=gap_policy,
+            output_count=1,
+        )[0]
+
+    def add_node_ports(
+        self,
+        kind: NodeKind,
+        config: Config,
+        *,
+        inputs: tuple[InputSpec, ...] = (),
+        operation: Callable[..., object] | Kernel[object] | None = None,
+        constants: Mapping[str, object] | None = None,
+        config_paths: tuple[str, ...] | None = None,
+        accepts_invalid: bool = False,
+        source: Iterable[object] | Source[object] | RealtimeSource[object] | None = None,
+        frame_size: int | None = None,
+        frame_hop: int | None = None,
+        pad_end: bool = False,
+        rate_period: Fraction | None = None,
+        rate_policy: RatePolicy | None = None,
+        max_items: int = 1,
+        output_count: int,
+        time_transform: str = "preserve",
+        gap_policy: GapPolicy = GapPolicy.RESET,
+    ) -> tuple[int, ...]:
+        """固定数のoutput Portを持つNodeを追加する。"""
+
+        if output_count <= 0:
+            raise ValueError("output_count must be positive")
 
         node_id = len(self._nodes)
-        port_id = node_id
+        first_port = len(self._port_to_node)
+        output_ports = tuple(range(first_port, first_port + output_count))
+        port_id = output_ports[0]
         node = NodeSpec(
             id=node_id,
             kind=kind,
             output_port=port_id,
+            output_ports=output_ports,
             inputs=inputs,
             config=config,
             operation=operation,
@@ -167,10 +236,13 @@ class Graph:
             rate_period=rate_period,
             rate_policy=rate_policy,
             max_items=max_items,
+            time_transform=time_transform,
+            gap_policy=gap_policy,
         )
         self._nodes.append(node)
-        self._port_to_node[port_id] = node_id
-        return port_id
+        for output_port in output_ports:
+            self._port_to_node[output_port] = node_id
+        return output_ports
 
     def info(self) -> GraphInfo:
         """利用者が変更できないGraphInfoを返す。"""
@@ -180,6 +252,7 @@ class Graph:
                 id=node.id,
                 kind=node.kind,
                 output_port=node.output_port,
+                output_ports=node.output_ports,
                 input_ports=tuple(item.source_port for item in node.inputs),
                 config_scope_id=node.config.scope_id,
                 rate_period=node.rate_period,
@@ -194,6 +267,8 @@ class Graph:
                 target_input=input_index,
                 semantics=input_spec.semantics,
                 keyword=input_spec.keyword,
+                tolerance=input_spec.tolerance,
+                missing_policy=input_spec.missing_policy,
             )
             for node in self._nodes
             for input_index, input_spec in enumerate(node.inputs)
@@ -218,6 +293,7 @@ class Graph:
                         "id": node.id,
                         "kind": node.kind.value,
                         "output_port": node.output_port,
+                        "output_ports": node.output_ports,
                         "input_ports": node.input_ports,
                         "config_scope_id": node.config_scope_id,
                         "rate_period": str(node.rate_period) if node.rate_period else None,
@@ -232,6 +308,8 @@ class Graph:
                         "target_input": edge.target_input,
                         "semantics": edge.semantics.value,
                         "keyword": edge.keyword,
+                        "tolerance": str(edge.tolerance) if edge.tolerance is not None else None,
+                        "missing_policy": edge.missing_policy.value,
                     }
                     for edge in info.edges
                 ],
@@ -264,6 +342,24 @@ class StateFlow(Generic[T]):
 
     def __init__(self, flow: Flow[T]) -> None:
         self.flow = flow
+
+
+class SynchronizedFlow(Generic[T]):
+    """追加Flow入力へ明示したinterval同期契約を保持するhandle。"""
+
+    __slots__ = ("flow", "semantics", "tolerance", "missing_policy")
+
+    def __init__(
+        self,
+        flow: Flow[T],
+        semantics: InputSemantics,
+        tolerance: Fraction | None,
+        missing_policy: MissingInputPolicy,
+    ) -> None:
+        self.flow = flow
+        self.semantics = semantics
+        self.tolerance = tolerance
+        self.missing_policy = missing_policy
 
 
 class Flow(Generic[T]):
@@ -317,6 +413,71 @@ class Flow(Generic[T]):
 
         return StateFlow(self)
 
+    def state_source(
+        self,
+        source: Iterable[U] | Source[U] | RealtimeSource[U],
+        *,
+        config: Config | None = None,
+    ) -> StateFlow[U]:
+        """同じGraphへ外部制御値Sourceを追加しlatest StateFlowを返す。
+
+        Args:
+            source: iterable、pull Source、またはRealtime Source。
+            config: 制御Source固有の不変Config。Noneでは現在scopeを使用。
+
+        Returns:
+            後段MAPのkeyword引数へ渡せるlatest state handle。
+
+        境界条件:
+            制御値はConfigへ書き込まず、独立SOURCE PortとLATEST Edgeとして記録する。
+        """
+
+        state_config = self._config if config is None else config
+        port_id = self._graph.add_node(NodeKind.SOURCE, state_config, source=source)
+        return StateFlow(self._from_port(self._graph, port_id, state_config))
+
+    def synchronize(
+        self,
+        semantics: InputSemantics,
+        *,
+        tolerance: int | float | Fraction | None = None,
+        missing: MissingInputPolicy = MissingInputPolicy.STALL,
+    ) -> SynchronizedFlow[T]:
+        """このFlowを追加入力として使うinterval同期契約を返す。
+
+        Args:
+            semantics: CONTAINS、OVERLAPS、TOLERANCEのいずれか。
+            tolerance: TOLERANCEで許容する両端時刻差。非負値。
+            missing: 適合入力が生成不能な場合のSTALLまたはSKIP。
+
+        Returns:
+            主入力をreferenceとする同期handle。
+
+        Raises:
+            ValueError: semantics、tolerance、missingの組合せが不正な場合。
+        """
+
+        if semantics not in {
+            InputSemantics.CONTAINS,
+            InputSemantics.OVERLAPS,
+            InputSemantics.TOLERANCE,
+        }:
+            raise ValueError("synchronize requires contains, overlaps, or tolerance semantics")
+        resolved: Fraction | None = None
+        if tolerance is not None:
+            resolved = (
+                Fraction(str(tolerance)) if isinstance(tolerance, float) else Fraction(tolerance)
+            )
+            if resolved < 0:
+                raise ValueError("synchronization tolerance must not be negative")
+        if semantics is InputSemantics.TOLERANCE and resolved is None:
+            raise ValueError("tolerance semantics requires an explicit tolerance")
+        if semantics is not InputSemantics.TOLERANCE and resolved is not None:
+            raise ValueError("tolerance is valid only for tolerance semantics")
+        if not isinstance(missing, MissingInputPolicy):
+            raise ValueError("missing must be a MissingInputPolicy")
+        return SynchronizedFlow(self, semantics, resolved, missing)
+
     def map(
         self,
         operation: Callable[..., U] | Kernel[U],
@@ -339,6 +500,18 @@ class Flow(Generic[T]):
             ValueError: 異なるGraphのFlowを入力した場合、またはmax_itemsが正でない場合。
         """
 
+        if isinstance(operation, CallableAdapter):
+            if max_items != 1 or accepts_invalid:
+                raise ValueError(
+                    "CallableAdapter max_items/accepts_invalid must not be overridden in map"
+                )
+            max_items = operation.max_items
+            accepts_invalid = operation.accepts_invalid
+            time_transform = operation.time_transform
+            gap_policy = operation.gap_policy
+        else:
+            time_transform = "preserve"
+            gap_policy = GapPolicy.RESET
         if max_items <= 0:
             raise ValueError("map max_items must be positive")
 
@@ -348,15 +521,32 @@ class Flow(Generic[T]):
             if isinstance(value, StateFlow):
                 other = value.flow
                 semantics = InputSemantics.LATEST
+                tolerance = None
+                missing_policy = MissingInputPolicy.STALL
+            elif isinstance(value, SynchronizedFlow):
+                other = value.flow
+                semantics = value.semantics
+                tolerance = value.tolerance
+                missing_policy = value.missing_policy
             elif isinstance(value, Flow):
                 other = value
                 semantics = InputSemantics.SYNCHRONOUS
+                tolerance = None
+                missing_policy = MissingInputPolicy.STALL
             else:
                 constants[name] = value
                 continue
             if other._graph is not self._graph:
                 raise ValueError(f"Flow argument {name!r} belongs to a different Graph")
-            inputs.append(InputSpec(other.port_id, semantics, keyword=name))
+            inputs.append(
+                InputSpec(
+                    other.port_id,
+                    semantics,
+                    keyword=name,
+                    tolerance=tolerance,
+                    missing_policy=missing_policy,
+                )
+            )
 
         port_id = self._graph.add_node(
             NodeKind.MAP,
@@ -367,8 +557,84 @@ class Flow(Generic[T]):
             config_paths=config_paths,
             accepts_invalid=accepts_invalid,
             max_items=max_items,
+            time_transform=time_transform,
+            gap_policy=gap_policy,
         )
         return self._from_port(self._graph, port_id, self._config)
+
+    def map_outputs(
+        self,
+        operation: Callable[..., object] | Kernel[object],
+        *,
+        output_count: int,
+        config_paths: tuple[str, ...] | None = None,
+        accepts_invalid: bool = False,
+        max_items: int = 1,
+        **arguments: object,
+    ) -> tuple[Flow[Any], ...]:
+        """明示数の複数output Portを持つMAP Nodeを登録する。
+
+        Args:
+            operation: `KernelOutputs`を返す処理。
+            output_count: 固定output Port数。2以上。
+            config_paths: callableが参照するConfig属性path。
+            accepts_invalid: INVALID入力を実行する場合にTrue。
+            max_items: 各Portの一回あたりEmission上限。
+            arguments: 定数または追加Flow入力。
+
+        Returns:
+            output index順の通常Flow handle tuple。
+
+        Raises:
+            ValueError: output_count、Graph、max_itemsが不正な場合。
+        """
+
+        if output_count < 2:
+            raise ValueError("map_outputs output_count must be at least two")
+        if isinstance(operation, CallableAdapter):
+            if max_items != 1 or accepts_invalid:
+                raise ValueError("CallableAdapter max_items/accepts_invalid must not be overridden")
+            max_items = operation.max_items
+            accepts_invalid = operation.accepts_invalid
+            time_transform = operation.time_transform
+            gap_policy = operation.gap_policy
+        else:
+            time_transform = "preserve"
+            gap_policy = GapPolicy.RESET
+        if max_items <= 0:
+            raise ValueError("map_outputs max_items must be positive")
+        inputs = [InputSpec(self._port_id, InputSemantics.SYNCHRONOUS)]
+        constants: dict[str, object] = {}
+        for name, value in arguments.items():
+            if isinstance(value, StateFlow):
+                other, semantics = value.flow, InputSemantics.LATEST
+                tolerance, missing_policy = None, MissingInputPolicy.STALL
+            elif isinstance(value, SynchronizedFlow):
+                other, semantics = value.flow, value.semantics
+                tolerance, missing_policy = value.tolerance, value.missing_policy
+            elif isinstance(value, Flow):
+                other, semantics = value, InputSemantics.SYNCHRONOUS
+                tolerance, missing_policy = None, MissingInputPolicy.STALL
+            else:
+                constants[name] = value
+                continue
+            if other._graph is not self._graph:
+                raise ValueError(f"Flow argument {name!r} belongs to a different Graph")
+            inputs.append(InputSpec(other.port_id, semantics, name, tolerance, missing_policy))
+        ports = self._graph.add_node_ports(
+            NodeKind.MAP,
+            self._config,
+            inputs=tuple(inputs),
+            operation=operation,
+            constants=constants,
+            config_paths=config_paths,
+            accepts_invalid=accepts_invalid,
+            max_items=max_items,
+            output_count=output_count,
+            time_transform=time_transform,
+            gap_policy=gap_policy,
+        )
+        return tuple(self._from_port(self._graph, port, self._config) for port in ports)
 
     def frame(
         self,

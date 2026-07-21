@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import inspect
+import time
 from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from fractions import Fraction
 from pathlib import Path
@@ -21,6 +22,7 @@ from .errors import (
     KernelExecutionError,
     MissingConfigError,
     PlanSessionError,
+    SourceExecutionError,
 )
 from .extension import (
     Always,
@@ -33,12 +35,22 @@ from .extension import (
     PlanContext,
     TriggerSession,
 )
-from .graph import Flow, Graph, InputSemantics, NodeKind, NodeSpec, RatePolicy
+from .graph import (
+    Flow,
+    Graph,
+    InputSemantics,
+    InputSpec,
+    MissingInputPolicy,
+    NodeKind,
+    NodeSpec,
+    RatePolicy,
+)
 from .kernel import (
     Backend,
     CompileContext,
     CompiledKernel,
     CompiledKernelSession,
+    GapPolicy,
     Kernel,
     PythonBackend,
     PythonCallableKernel,
@@ -49,6 +61,7 @@ from .model import (
     Emission,
     EmissionStatus,
     EmitMany,
+    KernelOutputs,
     LogicalInterval,
     LogicalTime,
     Severity,
@@ -123,6 +136,89 @@ class RunResult:
     diagnostics: tuple[Diagnostic, ...]
     status_counts: dict[EmissionStatus, int]
     completed: bool
+    profile: SessionProfile | None = None
+
+
+@dataclass(frozen=True)
+class KernelProfile:
+    """一つのMAP Nodeのsession内実行時間summary。"""
+
+    node_id: int
+    call_count: int
+    total_ns: int
+    max_ns: int
+
+
+@dataclass(frozen=True)
+class BufferProfile:
+    """一つのruntime bufferの使用量summary。"""
+
+    buffer_id: int
+    kind: str
+    capacity: int
+    current_items: int
+    high_watermark: int
+
+
+@dataclass(frozen=True)
+class SourceProfile:
+    """一つのSourceの配送、pending、drop summary。"""
+
+    node_id: int
+    emitted_count: int
+    pending_items: int
+    dropped_count: int
+    logical_end: Fraction | None
+
+
+@dataclass(frozen=True)
+class SessionProfile:
+    """Profiler有効時だけRunResultへ付加するrun-local snapshot。"""
+
+    scheduler_steps: int
+    kernels: tuple[KernelProfile, ...]
+    buffers: tuple[BufferProfile, ...]
+    sources: tuple[SourceProfile, ...]
+
+
+@dataclass(frozen=True)
+class RuntimeOptions:
+    """Executorのchunk、buffer watermark、実行budgetを指定する。
+
+    Args:
+        source_chunk_duration: pull Source一回の要求幅。Noneはcompile済み既定値。
+        port_high_watermark: 全PORT_SHARED bufferの最小capacity。Noneはcompile済み値。
+        port_low_watermark: pull再開目安。high未満の非負整数。
+        max_scheduler_steps: 一回のrunまたはrun_untilで進める実行単位上限。
+        profiler_enabled: session profilerを有効化する場合にTrue。
+
+    Raises:
+        ValueError: 値が正でない、またはwatermark関係が不正な場合。
+    """
+
+    source_chunk_duration: Fraction | None = None
+    port_high_watermark: int | None = None
+    port_low_watermark: int | None = None
+    max_scheduler_steps: int | None = None
+    profiler_enabled: bool = False
+
+    def __post_init__(self) -> None:
+        if self.source_chunk_duration is not None and self.source_chunk_duration <= 0:
+            raise ValueError("source_chunk_duration must be positive")
+        if self.port_high_watermark is not None and self.port_high_watermark <= 0:
+            raise ValueError("port_high_watermark must be positive")
+        if self.port_low_watermark is not None and self.port_low_watermark < 0:
+            raise ValueError("port_low_watermark must not be negative")
+        if self.port_low_watermark is not None and self.port_high_watermark is None:
+            raise ValueError("port_low_watermark requires port_high_watermark")
+        if (
+            self.port_low_watermark is not None
+            and self.port_high_watermark is not None
+            and self.port_low_watermark >= self.port_high_watermark
+        ):
+            raise ValueError("port_low_watermark must be below port_high_watermark")
+        if self.max_scheduler_steps is not None and self.max_scheduler_steps <= 0:
+            raise ValueError("max_scheduler_steps must be positive")
 
 
 @dataclass
@@ -176,19 +272,23 @@ def _time_signature(nodes: Sequence[NodeSpec]) -> dict[int, tuple[Fraction, Frac
     signatures: dict[int, tuple[Fraction, Fraction]] = {}
     for node in nodes:
         if node.kind is NodeKind.SOURCE:
-            signatures[node.output_port] = (Fraction(1), Fraction(1))
+            value = (Fraction(1), Fraction(1))
         elif node.kind is NodeKind.MAP:
-            signatures[node.output_port] = signatures[node.inputs[0].source_port]
+            value = signatures[node.inputs[0].source_port]
         elif node.kind is NodeKind.FRAME:
             input_length, input_step = signatures[node.inputs[0].source_port]
             if node.frame_size is None or node.frame_hop is None:
                 raise RuntimeError("FRAME Node lacks size or hop")
             length = input_length + (node.frame_size - 1) * input_step
-            signatures[node.output_port] = (length, node.frame_hop * input_step)
+            value = (length, node.frame_hop * input_step)
         elif node.kind is NodeKind.RATE:
             if node.rate_period is None:
                 raise RuntimeError("RATE Node lacks period")
-            signatures[node.output_port] = (node.rate_period, node.rate_period)
+            value = (node.rate_period, node.rate_period)
+        else:
+            raise RuntimeError(f"unsupported Node kind {node.kind!r}")
+        for output_port in node.output_ports:
+            signatures[output_port] = value
     return signatures
 
 
@@ -198,7 +298,7 @@ def _port_finiteness(nodes: Sequence[NodeSpec]) -> dict[int, bool]:
     finite: dict[int, bool] = {}
     for node in nodes:
         if node.kind is NodeKind.SOURCE:
-            finite[node.output_port] = (
+            value = (
                 False
                 if isinstance(node.source, RealtimeSource)
                 else node.source.is_finite
@@ -206,9 +306,9 @@ def _port_finiteness(nodes: Sequence[NodeSpec]) -> dict[int, bool]:
                 else True
             )
         else:
-            finite[node.output_port] = all(
-                finite[input_spec.source_port] for input_spec in node.inputs
-            )
+            value = all(finite[input_spec.source_port] for input_spec in node.inputs)
+        for output_port in node.output_ports:
+            finite[output_port] = value
     return finite
 
 
@@ -216,6 +316,16 @@ def _compile_diagnostics(nodes: Sequence[NodeSpec]) -> tuple[Diagnostic, ...]:
     diagnostics: list[Diagnostic] = []
     signatures = _time_signature(nodes)
     for node in nodes:
+        if node.kind is NodeKind.MAP and node.time_transform == "explicit":
+            diagnostics.append(
+                Diagnostic(
+                    Severity.INFO,
+                    "EXPLICIT_TIME_TRANSFORM",
+                    "Kernel defines output intervals; numerical resampling remains external",
+                    node_id=node.id,
+                    port_id=node.output_port,
+                )
+            )
         for path in node.config_paths or ():
             if not node.config.has(path):
                 raise MissingConfigError(f"node {node.id} requires missing Config path {path!r}")
@@ -293,13 +403,14 @@ def _planned_port_buffers(
 ) -> dict[int, _BufferPlan]:
     """merge分岐の共有祖先需要からPort別の保持上限を証明する。"""
 
-    nodes_by_port = {node.output_port: node for node in nodes}
-    capacities = {node.output_port: _node_max_items(node, signatures) for node in nodes}
+    nodes_by_port = {port: node for node in nodes for port in node.output_ports}
+    capacities = {
+        port: _node_max_items(node, signatures) for node in nodes for port in node.output_ports
+    }
     reasons: dict[int, list[str]] = {
-        node.output_port: [
-            f"producer_burst:node={node.id}:max_items={capacities[node.output_port]}"
-        ]
+        port: [f"producer_burst:node={node.id}:max_items={capacities[port]}"]
         for node in nodes
+        for port in node.output_ports
     }
     consumer_counts: Counter[int] = Counter(
         input_spec.source_port for node in nodes for input_spec in node.inputs
@@ -402,6 +513,13 @@ def _trigger_descriptor(observation: ObservationSpec) -> TriggerDescriptor:
     )
 
 
+def _input_tolerance_descriptor(input_spec: InputSpec) -> RationalDescriptor | None:
+    """InputSpecの任意toleranceをportable descriptorへ変換する。"""
+
+    tolerance = input_spec.tolerance
+    return None if tolerance is None else RationalDescriptor.from_fraction(tolerance)
+
+
 def _portable_plan_ir(
     *,
     nodes: tuple[NodeSpec, ...],
@@ -431,6 +549,8 @@ def _portable_plan_ir(
             edge_id,
             True,
             None,
+            _input_tolerance_descriptor(node.inputs[input_index]),
+            node.inputs[input_index].missing_policy.value,
         )
         for edge_id, (node, input_index) in enumerate(edge_rows)
     )
@@ -443,7 +563,7 @@ def _portable_plan_ir(
             node.id,
             node.kind.value,
             tuple(item.source_port for item in node.inputs),
-            (node.output_port,),
+            node.output_ports,
             node.config.scope_id,
             node_backend_names[node.id],
             (
@@ -456,34 +576,46 @@ def _portable_plan_ir(
             node.accepts_invalid,
             node.output_port,
             _node_max_items(node, signatures),
+            node.frame_size,
+            node.frame_hop,
+            node.pad_end,
+            (
+                None
+                if node.rate_period is None
+                else RationalDescriptor.from_fraction(node.rate_period)
+            ),
+            None if node.rate_policy is None else node.rate_policy.value,
+            node.time_transform,
+            node.gap_policy.value,
         )
         for node in nodes
     )
     ports = tuple(
         PortDescriptor(
-            node.output_port,
+            output_port,
             node.id,
-            0,
+            output_index,
             "python:opaque",
-            node.output_port,
-            f"port:{node.output_port}",
-            node.output_port,
+            output_port,
+            f"port:{output_port}",
+            output_port,
         )
         for node in nodes
+        for output_index, output_port in enumerate(node.output_ports)
     )
     port_buffers = tuple(
         BufferDescriptor(
-            buffer_id=node.output_port,
+            buffer_id=output_port,
             kind="port_shared",
-            producer_port_id=node.output_port,
+            producer_port_id=output_port,
             owner_node_id=None,
             owner_input_index=None,
-            consumer_cursor_ids=tuple(cursors_by_port[node.output_port]),
-            max_items=buffer_plans[node.output_port].max_items,
+            consumer_cursor_ids=tuple(cursors_by_port[output_port]),
+            max_items=buffer_plans[output_port].max_items,
             max_bytes=None,
-            capacity_reasons=buffer_plans[node.output_port].capacity_reasons,
-            high_watermark=buffer_plans[node.output_port].high_watermark,
-            low_watermark=buffer_plans[node.output_port].low_watermark,
+            capacity_reasons=buffer_plans[output_port].capacity_reasons,
+            high_watermark=buffer_plans[output_port].high_watermark,
+            low_watermark=buffer_plans[output_port].low_watermark,
             overflow_policy="fail",
             reclaim_policy="all_consumers_advanced",
             read_only=True,
@@ -493,10 +625,12 @@ def _portable_plan_ir(
             copy_policy="shared_reference",
         )
         for node in nodes
+        for output_port in node.output_ports
     )
     edge_by_input = {(edge.target_node_id, edge.target_input_index): edge for edge in edges}
-    next_buffer_id = max((node.output_port for node in nodes), default=-1) + 1
+    next_buffer_id = max((port for node in nodes for port in node.output_ports), default=-1) + 1
     internal_buffers: list[BufferDescriptor] = []
+    adapter_by_edge: dict[int, int] = {}
     for node in nodes:
         if node.kind is NodeKind.SOURCE and isinstance(node.source, RealtimeSource):
             if (
@@ -566,28 +700,41 @@ def _portable_plan_ir(
                     copy_policy="shared_reference",
                 )
             )
+            adapter_by_edge[edge.edge_id] = next_buffer_id
             next_buffer_id += 1
         for input_index, input_spec in enumerate(node.inputs):
-            if input_spec.semantics is not InputSemantics.LATEST:
-                continue
             edge = edge_by_input[(node.id, input_index)]
+            if input_spec.semantics is InputSemantics.LATEST:
+                kind = "latest_state"
+                reason = f"latest_state:node={node.id}:input={input_index}:max_items=1"
+                overflow = "replace_oldest"
+                reclaim = "replace_on_newer"
+            elif input_spec.semantics in {
+                InputSemantics.CONTAINS,
+                InputSemantics.OVERLAPS,
+                InputSemantics.TOLERANCE,
+            }:
+                kind = "sync_selection"
+                reason = f"sync_selection:node={node.id}:input={input_index}:max_items=1"
+                overflow = "replace_when_before_frontier"
+                reclaim = "reference_interval_advanced"
+            else:
+                continue
             internal_buffers.append(
                 BufferDescriptor(
                     buffer_id=next_buffer_id,
-                    kind="latest_state",
+                    kind=kind,
                     producer_port_id=input_spec.source_port,
                     owner_node_id=node.id,
                     owner_input_index=input_index,
                     consumer_cursor_ids=(edge.cursor_id,),
                     max_items=1,
                     max_bytes=None,
-                    capacity_reasons=(
-                        f"latest_state:node={node.id}:input={input_index}:max_items=1",
-                    ),
+                    capacity_reasons=(reason,),
                     high_watermark=1,
                     low_watermark=0,
-                    overflow_policy="replace_oldest",
-                    reclaim_policy="replace_on_newer",
+                    overflow_policy=overflow,
+                    reclaim_policy=reclaim,
                     read_only=True,
                     device="cpu",
                     alignment_bytes=None,
@@ -595,22 +742,27 @@ def _portable_plan_ir(
                     copy_policy="shared_reference",
                 )
             )
+            adapter_by_edge[edge.edge_id] = next_buffer_id
             next_buffer_id += 1
+    edges = tuple(
+        replace(edge, adapter_buffer_id=adapter_by_edge.get(edge.edge_id)) for edge in edges
+    )
     buffers = port_buffers + tuple(internal_buffers)
     port_finiteness = _port_finiteness(nodes)
     times = tuple(
         TimeDescriptor(
-            node.output_port,
+            output_port,
             RationalDescriptor(1, 1),
-            RationalDescriptor.from_fraction(signatures[node.output_port][0]),
-            RationalDescriptor.from_fraction(signatures[node.output_port][1]),
+            RationalDescriptor.from_fraction(signatures[output_port][0]),
+            RationalDescriptor.from_fraction(signatures[output_port][1]),
             RationalDescriptor(0, 1),
-            node.kind.value,
-            True,
-            port_finiteness[node.output_port],
+            node.time_transform if node.kind is NodeKind.MAP else node.kind.value,
+            not (node.kind is NodeKind.MAP and node.time_transform == "explicit"),
+            port_finiteness[output_port],
             None,
         )
         for node in nodes
+        for output_port in node.output_ports
     )
     ingress_by_node = {
         item.owner_node_id: item for item in buffers if item.kind == "realtime_ingress"
@@ -693,7 +845,7 @@ def _portable_plan_ir(
         ]
     )
     return PortablePlanIR(
-        schema_version="0.1",
+        schema_version="0.2",
         kind="execution_plan",
         backend=backend_name,
         nodes=plan_nodes,
@@ -885,17 +1037,23 @@ class ExecutionPlan:
 
         return self._portable_ir
 
-    def run(self, *, duration: float | None = None) -> RunResult:
+    def run(
+        self,
+        *,
+        duration: float | None = None,
+        options: RuntimeOptions | None = None,
+    ) -> RunResult:
         """単一threadの決定的SchedulerでPlanを実行する。
 
         Args:
             duration: Sourceの論理時間上限。Noneではfinite SourceのEOFまで実行。
+            options: Source chunk、watermark、budget、profiler設定。
 
         Returns:
             collector結果、Diagnostic、status件数を持つRunResult。
         """
 
-        return self.create_session().run(duration=duration)
+        return self.create_session().run(duration=duration, options=options)
 
     def create_session(
         self,
@@ -956,11 +1114,13 @@ class ExecutionPlan:
         self,
         *,
         extension_bindings: Mapping[str, Extension] | None = None,
+        options: RuntimeOptions | None = None,
     ) -> PlanSession:
         """v0.2の継続実行状態を持つPlanSessionを生成する。
 
         Args:
             extension_bindings: extension_idからrun-local Extension factoryへの完全な対応。
+            options: session全体へ適用するruntime調整値。
 
         Returns:
             `start()`前の新しいPlanSession。
@@ -970,7 +1130,7 @@ class ExecutionPlan:
         """
 
         one_shot = self.create_session(extension_bindings=extension_bindings)
-        return PlanSession(self, one_shot._extensions)
+        return PlanSession(self, one_shot._extensions, options or RuntimeOptions())
 
     def export(self, path: str | Path) -> None:
         """required Node、output、compile DiagnosticをJSONまたはDOTへ出力する。
@@ -1024,17 +1184,28 @@ class ExecutionSession:
         self._plan = plan
         self._extensions = extensions
 
-    def run(self, *, duration: float | None = None) -> RunResult:
+    def run(
+        self,
+        *,
+        duration: float | None = None,
+        options: RuntimeOptions | None = None,
+    ) -> RunResult:
         """新しいKernel、collector、Extension状態でPlanを一回実行する。
 
         Args:
             duration: Sourceの論理時間上限。Noneではfinite SourceのEOFまで実行。
+            options: Source chunk、watermark、budget、profiler設定。
 
         Returns:
             collector結果、Diagnostic、status件数を持つRunResult。
         """
 
-        runtime = _PlanRuntime(self._plan, duration, self._extensions)
+        runtime = _PlanRuntime(
+            self._plan,
+            duration,
+            self._extensions,
+            options=options or RuntimeOptions(),
+        )
         return runtime.run()
 
 
@@ -1059,9 +1230,11 @@ class PlanSession:
         self,
         plan: ExecutionPlan,
         extensions: tuple[_BoundExtension, ...],
+        options: RuntimeOptions,
     ) -> None:
         self._plan = plan
         self._extensions = extensions
+        self._options = options
         self._runtime: _PlanRuntime | None = None
         self._state = PlanSessionState.CREATED
         self._logical_end: Fraction | None = None
@@ -1083,7 +1256,13 @@ class PlanSession:
             raise PlanSessionError(
                 f"PlanSession.start requires state=created; actual={self._state.value}"
             )
-        runtime = _PlanRuntime(self._plan, None, self._extensions, continuous=True)
+        runtime = _PlanRuntime(
+            self._plan,
+            None,
+            self._extensions,
+            continuous=True,
+            options=self._options,
+        )
         try:
             runtime.start()
         except Exception as error:
@@ -1119,7 +1298,8 @@ class PlanSession:
         except Exception as error:
             self._fail_and_finish(runtime, error)
             raise
-        self._logical_end = target
+        if not runtime.last_budget_exhausted:
+            self._logical_end = target
         return result
 
     def flush(self) -> RunResult:
@@ -1142,7 +1322,7 @@ class PlanSession:
             raise
 
     def close(self) -> RunResult:
-        """pending有限入力をflushし、全run-local resourceを解放する。
+        """Source受付を停止してpending入力をdrainし、resourceを解放する。
 
         Returns:
             resource解放直前の最終RunResult。
@@ -1150,7 +1330,7 @@ class PlanSession:
 
         runtime = self._running_runtime("close")
         try:
-            result = runtime.flush()
+            result = runtime.close()
             runtime.finish()
         except Exception as error:
             self._fail_and_finish(runtime, error)
@@ -1209,11 +1389,15 @@ class _PlanRuntime:
         extensions: tuple[_BoundExtension, ...],
         *,
         continuous: bool = False,
+        options: RuntimeOptions,
     ) -> None:
         self.plan = plan
         self.duration = None if duration is None else Fraction(str(duration))
         self.continuous = continuous
-        self.nodes_by_port = {node.output_port: node for node in plan._nodes}
+        self.options = options
+        self.nodes_by_port = {
+            output_port: node for node in plan._nodes for output_port in node.output_ports
+        }
         self.nodes_by_id = {node.id: node for node in plan._nodes}
         signatures = _time_signature(plan._nodes)
         self.node_max_items = {node.id: _node_max_items(node, signatures) for node in plan._nodes}
@@ -1224,14 +1408,16 @@ class _PlanRuntime:
             if item.kind == "port_shared"
         }
         self.port_buffers: dict[int, PortBuffer[Emission[object]]] = {
-            node.output_port: PortBuffer(
-                node.output_port,
-                max_items=self._required_buffer_capacity(
-                    node.output_port,
-                    port_buffer_descriptors[node.output_port].max_items,
+            output_port: PortBuffer(
+                output_port,
+                max_items=self._runtime_buffer_capacity(
+                    output_port,
+                    port_buffer_descriptors[output_port].max_items,
+                    options.port_high_watermark,
                 ),
             )
             for node in plan._nodes
+            for output_port in node.output_ports
         }
         self.queues: dict[tuple[int, int], CursorQueue[Emission[object]]] = {}
         cursor_id = 0
@@ -1242,6 +1428,7 @@ class _PlanRuntime:
                 self.queues[(node.id, input_index)] = CursorQueue(buffer, cursor_id)
                 cursor_id += 1
         self.latest: dict[tuple[int, int], LatestStateBuffer[Emission[object]]] = {}
+        self.flexible_current: dict[tuple[int, int], Emission[object]] = {}
         self.frames: dict[int, _FrameState] = {}
         for descriptor in buffer_descriptors.values():
             owner = (descriptor.owner_node_id, descriptor.owner_input_index)
@@ -1326,6 +1513,11 @@ class _PlanRuntime:
         self._finished = False
         self._cancelled = False
         self._reported_unmatched = False
+        self.last_budget_exhausted = False
+        self._scheduler_steps = 0
+        self._kernel_calls: Counter[int] = Counter()
+        self._kernel_total_ns: Counter[int] = Counter()
+        self._kernel_max_ns: Counter[int] = Counter()
 
     @staticmethod
     def _required_buffer_capacity(port_id: int, max_items: int | None) -> int:
@@ -1336,6 +1528,23 @@ class _PlanRuntime:
                 f"port {port_id} PORT_SHARED buffer lacks a positive max_items contract"
             )
         return max_items
+
+    @classmethod
+    def _runtime_buffer_capacity(
+        cls,
+        port_id: int,
+        compiled: int | None,
+        requested: int | None,
+    ) -> int:
+        """RuntimeOptions watermarkがcompile済み下限を満たすことを検証する。"""
+
+        required = cls._required_buffer_capacity(port_id, compiled)
+        if requested is not None and requested < required:
+            raise PlanSessionError(
+                f"port {port_id} requested high_watermark={requested} is below "
+                f"compiled capacity={required}; contract=bounded_shared_buffer"
+            )
+        return required if requested is None else requested
 
     def _create_extension_runtime(self, bound: _BoundExtension) -> _ExtensionRuntime:
         """binding factoryから型検証済みのrun-local handlerを生成する。"""
@@ -1385,6 +1594,19 @@ class _PlanRuntime:
         self.root_ports = set(self._roots)
         self._active = set(self._roots)
         self._started = True
+        if self.continuous:
+            diagnostic = Diagnostic(
+                Severity.INFO,
+                "SESSION_STARTED",
+                "PlanSession acquired run-local resources",
+                details={
+                    "kernel_sessions": sorted(self.kernel_sessions),
+                    "realtime_source_sessions": sorted(self.realtime_sessions),
+                    "buffer_ids": sorted(buffer.buffer_id for buffer in self.port_buffers.values()),
+                },
+            )
+            self.diagnostics.append(diagnostic)
+            self._notify_diagnostic(diagnostic)
 
     def run_until(self, logical_end: Fraction) -> RunResult:
         """状態を保持したまま排他的な論理時間上限まで進める。"""
@@ -1397,13 +1619,20 @@ class _PlanRuntime:
         return self._result()
 
     def flush(self) -> RunResult:
-        """有限SourceをEOFまで進めてpending runtime stateをdrainする。"""
+        """finiteまたは既にclose済みSourceをdrainする。"""
 
-        non_finite = [item.node_id for item in self.plan._portable_ir.sources if not item.is_finite]
-        if non_finite:
+        open_realtime = [
+            node_id for node_id, ingress in self.realtime_ingresses.items() if not ingress.is_closed
+        ]
+        non_finite_pull = [
+            item.node_id
+            for item in self.plan._portable_ir.sources
+            if not item.is_finite and item.mode != "realtime_push"
+        ]
+        if open_realtime or non_finite_pull:
             raise PlanSessionError(
-                f"PlanSession.flush requires closed finite Sources in this v0.2 baseline; "
-                f"non_finite_nodes={non_finite}"
+                "PlanSession.flush requires finite or already closed Sources; "
+                f"open_realtime_nodes={open_realtime}; non_finite_pull_nodes={non_finite_pull}"
             )
         self.duration = None
         self.boundary_blocked_ports.clear()
@@ -1412,14 +1641,56 @@ class _PlanRuntime:
             self._report_unmatched_once()
         return self._result()
 
+    def close(self) -> RunResult:
+        """Realtime受付を停止・closeして全Sourceと下流状態をdrainする。"""
+
+        self._stop_realtime_sources(close_ingress=True)
+        non_finite_pull = [
+            item.node_id
+            for item in self.plan._portable_ir.sources
+            if not item.is_finite and item.mode != "realtime_push"
+        ]
+        if non_finite_pull:
+            raise PlanSessionError(
+                "PlanSession.close cannot infer EOF for non-finite pull Sources; "
+                f"nodes={non_finite_pull}; call cancel()"
+            )
+        self.duration = None
+        self.boundary_blocked_ports.clear()
+        self._drive()
+        if not self._active:
+            self._report_unmatched_once()
+        diagnostic = Diagnostic(
+            Severity.INFO,
+            "SESSION_CLOSED",
+            "PlanSession stopped Sources and drained run-local resources",
+            details={
+                "remaining_active_ports": sorted(self._active),
+                "realtime_pending_items": {
+                    node_id: ingress.pending_count
+                    for node_id, ingress in self.realtime_ingresses.items()
+                },
+            },
+        )
+        self.diagnostics.append(diagnostic)
+        self._notify_diagnostic(diagnostic)
+        return self._result()
+
     def cancel(self) -> RunResult:
         """pending処理を破棄したことをDiagnosticへ記録する。"""
 
+        self._stop_realtime_sources(close_ingress=False)
+        discarded = {
+            node_id: ingress.discard() for node_id, ingress in self.realtime_ingresses.items()
+        }
         diagnostic = Diagnostic(
             Severity.WARNING,
             "SESSION_CANCELLED",
             "PlanSession was cancelled without flushing pending state",
-            details={"active_ports": sorted(self._active)},
+            details={
+                "active_ports": sorted(self._active),
+                "discarded_realtime_items": discarded,
+            },
         )
         self.diagnostics.append(diagnostic)
         self._notify_diagnostic(diagnostic)
@@ -1433,12 +1704,10 @@ class _PlanRuntime:
             return
         self._finished = True
         first_error: Exception | None = None
-        for session in self.realtime_sessions.values():
-            try:
-                session.stop()
-            except Exception as error:
-                if first_error is None:
-                    first_error = error
+        try:
+            self._stop_realtime_sources(close_ingress=True)
+        except Exception as error:
+            first_error = error
         for extension in reversed(self._initialized_extensions):
             try:
                 self._finalize_extension(extension, self._context)
@@ -1451,6 +1720,8 @@ class _PlanRuntime:
     def _drive(self) -> None:
         """active rootを境界、EOF、stallのいずれかまで決定的に進める。"""
 
+        steps = 0
+        self.last_budget_exhausted = False
         while self._active:
             progressed = False
             for port_id in self._roots:
@@ -1465,8 +1736,25 @@ class _PlanRuntime:
                     continue
                 if self._advance_port(port_id):
                     progressed = True
+                    steps += 1
+                    self._scheduler_steps += 1
                 elif port_id in self.exhausted_ports:
                     self._active.remove(port_id)
+            if (
+                self._active
+                and self.options.max_scheduler_steps is not None
+                and steps >= self.options.max_scheduler_steps
+            ):
+                self.last_budget_exhausted = True
+                diagnostic = Diagnostic(
+                    Severity.INFO,
+                    "EXECUTION_BUDGET_EXHAUSTED",
+                    "scheduler step budget ended this execution slice",
+                    details={"max_scheduler_steps": self.options.max_scheduler_steps},
+                )
+                self.diagnostics.append(diagnostic)
+                self._notify_diagnostic(diagnostic)
+                break
             if self._active and not progressed:
                 if self.boundary_blocked_ports:
                     break
@@ -1499,13 +1787,41 @@ class _PlanRuntime:
             source = node.source
             if not isinstance(source, RealtimeSource):
                 raise RuntimeError(f"realtime source node {node_id} lost its binding")
-            session = source.start(ingress, node.config)
+            try:
+                session = source.start(ingress, node.config)
+            except Exception as error:
+                raise SourceExecutionError(
+                    f"realtime source node {node.id} port {node.output_port} start failed: "
+                    f"{error}; contract=RealtimeSource.start"
+                ) from error
             if not isinstance(session, RealtimeSourceSession):
                 raise TypeError(
                     f"realtime source node {node.id} port {node.output_port} start returned "
                     "an invalid RealtimeSourceSession"
                 )
             self.realtime_sessions[node_id] = session
+
+    def _stop_realtime_sources(self, *, close_ingress: bool) -> None:
+        """各Realtime Sourceを一度だけ停止し、必要ならingress受付も閉じる。"""
+
+        first_error: SourceExecutionError | None = None
+        for node_id, session in tuple(self.realtime_sessions.items()):
+            node = self.nodes_by_id[node_id]
+            try:
+                session.stop()
+            except Exception as error:
+                if first_error is None:
+                    first_error = SourceExecutionError(
+                        f"realtime source node {node.id} port {node.output_port} stop failed: "
+                        f"{error}; contract=RealtimeSourceSession.stop"
+                    )
+            finally:
+                self.realtime_sessions.pop(node_id, None)
+        if close_ingress:
+            for ingress in self.realtime_ingresses.values():
+                ingress.close()
+        if first_error is not None:
+            raise first_error
 
     def _finalize_extension(
         self,
@@ -1571,7 +1887,10 @@ class _PlanRuntime:
                     yield _SOURCE_BOUNDARY
                     continue
                 return
-            request_duration = self.plan._source_request_periods.get(node.id, Fraction(1))
+            request_duration = (
+                self.options.source_chunk_duration
+                or self.plan._source_request_periods.get(node.id, Fraction(1))
+            )
             batch = source.read(SourceRequest(logical_start, request_duration), node.config)
             if not batch.emissions and not batch.eof:
                 raise RuntimeError("Source returned an empty non-EOF batch")
@@ -1614,7 +1933,15 @@ class _PlanRuntime:
         if port_id in self.exhausted_ports:
             return False
         node = self.nodes_by_port[port_id]
-        if not self.port_buffers[port_id].can_publish(self.node_max_items[node.id]):
+        demanded_outputs = [
+            output_port
+            for output_port in node.output_ports
+            if output_port in self.root_ports or self.port_buffers[output_port].consumer_count > 0
+        ]
+        if any(
+            not self.port_buffers[output_port].can_publish(self.node_max_items[node.id])
+            for output_port in demanded_outputs
+        ):
             return False
         if node.kind is NodeKind.SOURCE:
             return self._advance_source(node)
@@ -1635,7 +1962,13 @@ class _PlanRuntime:
 
         ingress = self.realtime_ingresses.get(node.id)
         if ingress is not None:
-            record = ingress.take()
+            try:
+                record = ingress.take()
+            except Exception as error:
+                raise SourceExecutionError(
+                    f"realtime source node {node.id} port {node.output_port} receive failed: "
+                    f"{error}; contract=RealtimeReceiver.fail"
+                ) from error
             if record is None:
                 self.exhausted_ports.add(node.output_port)
                 return True
@@ -1794,8 +2127,21 @@ class _PlanRuntime:
         main_queue = self.queues[(node.id, 0)]
         main_port = node.inputs[0].source_port
         if not main_queue:
+            for input_index, input_spec in enumerate(node.inputs[1:], start=1):
+                if input_spec.semantics in {
+                    InputSemantics.SYNCHRONOUS,
+                    InputSemantics.LATEST,
+                }:
+                    continue
+                queue = self.queues[(node.id, input_index)]
+                if (
+                    not queue
+                    and input_spec.source_port not in self.exhausted_ports
+                    and self._advance_port(input_spec.source_port)
+                ):
+                    return True
             if main_port in self.exhausted_ports:
-                self.exhausted_ports.add(node.output_port)
+                self.exhausted_ports.update(node.output_ports)
                 return True
             return self._advance_port(main_port)
         main = main_queue[0]
@@ -1803,6 +2149,16 @@ class _PlanRuntime:
         latest_progress = self._advance_missing_latest(node, main)
         if latest_progress is not None:
             return latest_progress
+
+        for input_index, input_spec in enumerate(node.inputs[1:], start=1):
+            if input_spec.semantics in {
+                InputSemantics.SYNCHRONOUS,
+                InputSemantics.LATEST,
+            }:
+                continue
+            flexible_progress = self._advance_flexible_input(node, input_index, input_spec, main)
+            if flexible_progress is not None:
+                return flexible_progress
 
         for input_index, input_spec in enumerate(node.inputs[1:], start=1):
             if input_spec.semantics is not InputSemantics.SYNCHRONOUS:
@@ -1852,6 +2208,108 @@ class _PlanRuntime:
             )
             return True
         return self._process_map_if_ready(node)
+
+    def _advance_flexible_input(
+        self,
+        node: NodeSpec,
+        input_index: int,
+        input_spec: InputSpec,
+        main: Emission[object],
+    ) -> bool | None:
+        """包含、overlap、tolerance入力をsequence最小の候補へ合わせる。"""
+
+        queue = self.queues[(node.id, input_index)]
+        current = self.flexible_current.get((node.id, input_index))
+        if current is not None:
+            if self._flexible_match(input_spec, main.interval, current.interval):
+                return None
+            if self._candidate_is_before(input_spec, main.interval, current.interval):
+                self.flexible_current.pop((node.id, input_index), None)
+                return True
+            return self._handle_missing_flexible(node, input_index, input_spec, main.interval)
+        if queue:
+            candidate = queue[0]
+            if self._flexible_match(input_spec, main.interval, candidate.interval):
+                self.flexible_current[(node.id, input_index)] = queue.popleft()
+                return None
+            if self._candidate_is_before(input_spec, main.interval, candidate.interval):
+                queue.popleft()
+                return True
+            return self._handle_missing_flexible(node, input_index, input_spec, main.interval)
+        if input_spec.source_port not in self.exhausted_ports:
+            return self._advance_port(input_spec.source_port)
+        return self._handle_missing_flexible(node, input_index, input_spec, main.interval)
+
+    @staticmethod
+    def _flexible_match(
+        input_spec: InputSpec,
+        reference: LogicalInterval,
+        candidate: LogicalInterval,
+    ) -> bool:
+        if input_spec.semantics is InputSemantics.CONTAINS:
+            return candidate.start <= reference.start and candidate.end >= reference.end
+        if input_spec.semantics is InputSemantics.OVERLAPS:
+            return candidate.start < reference.end and candidate.end > reference.start
+        if input_spec.semantics is InputSemantics.TOLERANCE:
+            tolerance = input_spec.tolerance
+            if tolerance is None:
+                raise RuntimeError("tolerance input lacks a tolerance contract")
+            return (
+                abs(candidate.start.as_fraction() - reference.start.as_fraction()) <= tolerance
+                and abs(candidate.end.as_fraction() - reference.end.as_fraction()) <= tolerance
+            )
+        raise RuntimeError(f"unsupported flexible synchronization {input_spec.semantics!r}")
+
+    @staticmethod
+    def _candidate_is_before(
+        input_spec: InputSpec,
+        reference: LogicalInterval,
+        candidate: LogicalInterval,
+    ) -> bool:
+        if input_spec.semantics in {InputSemantics.CONTAINS, InputSemantics.OVERLAPS}:
+            return candidate.end <= reference.start
+        tolerance = input_spec.tolerance
+        if tolerance is None:
+            raise RuntimeError("tolerance input lacks a tolerance contract")
+        return candidate.end.as_fraction() < reference.end.as_fraction() - tolerance
+
+    def _handle_missing_flexible(
+        self,
+        node: NodeSpec,
+        input_index: int,
+        input_spec: InputSpec,
+        required: LogicalInterval,
+    ) -> bool:
+        """生成不能なflexible同期を明示policyどおり停止またはskipする。"""
+
+        diagnostic = Diagnostic(
+            Severity.WARNING,
+            (
+                "SYNC_INPUT_SKIPPED"
+                if input_spec.missing_policy is MissingInputPolicy.SKIP
+                else "STALLED_SYNCHRONIZATION"
+            ),
+            "synchronized input cannot produce a matching interval",
+            node_id=node.id,
+            port_id=node.output_port,
+            interval=required,
+            details={
+                "failed_input_index": input_index,
+                "semantics": input_spec.semantics.value,
+                "missing_policy": input_spec.missing_policy.value,
+                "tolerance": (None if input_spec.tolerance is None else str(input_spec.tolerance)),
+                "tie_break": "lowest_sequence",
+                "reference_input_index": 0,
+            },
+        )
+        if input_spec.missing_policy is MissingInputPolicy.STALL:
+            self._stop_node(node, diagnostic)
+            return True
+        self.queues[(node.id, 0)].popleft()
+        self.diagnostics.append(diagnostic)
+        self._advance_frontier(node.output_port, required.end.as_fraction())
+        self._notify_diagnostic(diagnostic)
+        return True
 
     def _advance_missing_latest(
         self,
@@ -1974,7 +2432,7 @@ class _PlanRuntime:
         """停止Nodeのcursorを解除し、無関係な観測経路を継続可能にする。"""
 
         self.stalled_nodes.add(node.id)
-        self.exhausted_ports.add(node.output_port)
+        self.exhausted_ports.update(node.output_ports)
         self.diagnostics.append(diagnostic)
         for input_index, _ in enumerate(node.inputs):
             self.queues[(node.id, input_index)].close()
@@ -2169,14 +2627,21 @@ class _PlanRuntime:
         inputs = [main_queue.popleft()]
         for index, input_spec in enumerate(node.inputs[1:], start=1):
             emission = (
-                self.queues[(node.id, index)].popleft()
-                if input_spec.semantics is InputSemantics.SYNCHRONOUS
-                else self.latest[(node.id, index)].get()
+                self.latest[(node.id, index)].get()
+                if input_spec.semantics is InputSemantics.LATEST
+                else self.flexible_current[(node.id, index)]
+                if input_spec.semantics
+                in {
+                    InputSemantics.CONTAINS,
+                    InputSemantics.OVERLAPS,
+                    InputSemantics.TOLERANCE,
+                }
+                else self.queues[(node.id, index)].popleft()
             )
             inputs.append(emission)
 
         self._record_emission_gaps(node.output_port, inputs)
-        if any(_has_input_overrun(item) for item in inputs):
+        if any(_has_input_overrun(item) for item in inputs) and node.gap_policy is GapPolicy.RESET:
             compiled = self.plan._compiled_kernels.get(node.id)
             if compiled is None:
                 raise RuntimeError(f"MAP Node {node.id} lacks a CompiledKernel")
@@ -2194,19 +2659,24 @@ class _PlanRuntime:
                 port_id=node.output_port,
                 interval=main.interval,
             )
-            self._publish(
-                node.output_port,
-                Emission(
-                    main.value,
-                    main.interval,
-                    self._next_sequence(node.output_port),
-                    EmissionStatus.INVALID,
-                    tuple(item for value in inputs for item in value.diagnostics) + (diagnostic,),
-                ),
-            )
-            self._advance_frontier(node.output_port, main.interval.end.as_fraction())
+            for output_port in node.output_ports:
+                if not self._output_is_demanded(output_port):
+                    continue
+                self._publish(
+                    output_port,
+                    Emission(
+                        main.value,
+                        main.interval,
+                        self._next_sequence(output_port),
+                        EmissionStatus.INVALID,
+                        tuple(item for value in inputs for item in value.diagnostics)
+                        + (diagnostic,),
+                    ),
+                )
+                self._advance_frontier(output_port, main.interval.end.as_fraction())
             return True
 
+        started_ns = time.perf_counter_ns() if self.options.profiler_enabled else None
         try:
             session = self.kernel_sessions.get(node.id)
             if session is None:
@@ -2219,22 +2689,55 @@ class _PlanRuntime:
             raise KernelExecutionError(
                 f"node {node.id} failed for interval {main.interval}: {error}"
             ) from error
+        finally:
+            if started_ns is not None:
+                elapsed = time.perf_counter_ns() - started_ns
+                self._kernel_calls[node.id] += 1
+                self._kernel_total_ns[node.id] += elapsed
+                self._kernel_max_ns[node.id] = max(self._kernel_max_ns[node.id], elapsed)
         inherited_status = _combined_status(inputs)
         inherited_diagnostics = tuple(item for value in inputs for item in value.diagnostics)
-        normalized = self._normalize_result(
-            result,
-            main.interval,
-            node.id,
-            node.output_port,
-            node.max_items,
-            inherited_status,
-            inherited_diagnostics,
-        )
-        self._record_emission_gaps(node.output_port, normalized)
-        for emission in normalized:
-            self._publish(node.output_port, emission)
-        self._advance_frontier(node.output_port, main.interval.end.as_fraction())
+        if len(node.output_ports) == 1:
+            if isinstance(result, KernelOutputs):
+                raise KernelExecutionError(
+                    f"node {node.id} port {node.output_port} returned KernelOutputs for a "
+                    "single-output contract"
+                )
+            port_results = (result,)
+        else:
+            if not isinstance(result, KernelOutputs):
+                raise KernelExecutionError(
+                    f"node {node.id} ports {node.output_ports} requires KernelOutputs; "
+                    "ordinary tuple remains a single value"
+                )
+            if len(result.values) != len(node.output_ports):
+                raise KernelExecutionError(
+                    f"node {node.id} ports {node.output_ports} returned {len(result.values)} "
+                    f"outputs; contract output_count={len(node.output_ports)}"
+                )
+            port_results = result.values
+        for output_port, port_result in zip(node.output_ports, port_results, strict=True):
+            if not self._output_is_demanded(output_port):
+                continue
+            normalized = self._normalize_result(
+                port_result,
+                main.interval,
+                node.id,
+                output_port,
+                node.max_items,
+                inherited_status,
+                inherited_diagnostics,
+            )
+            self._record_emission_gaps(output_port, normalized)
+            for emission in normalized:
+                self._publish(output_port, emission)
+            self._advance_frontier(output_port, main.interval.end.as_fraction())
         return True
+
+    def _output_is_demanded(self, port_id: int) -> bool:
+        """Portが終端または生存consumerを持つ場合にTrueを返す。"""
+
+        return port_id in self.root_ports or self.port_buffers[port_id].consumer_count > 0
 
     def _next_sequence(self, port_id: int) -> int:
         sequence = self.port_sequences[port_id]
@@ -2327,6 +2830,91 @@ class _PlanRuntime:
                 not self.stalled_nodes
                 and not any(item.code == "SCHEDULER_DEADLOCK" for item in self.diagnostics)
                 and not self._cancelled
+                and not self.last_budget_exhausted
                 and (not self.continuous or not self._active)
             ),
+            profile=self._profile_snapshot() if self.options.profiler_enabled else None,
+        )
+
+    def _profile_snapshot(self) -> SessionProfile:
+        """現在までのbuffer、Source、Kernel統計を不変snapshotへ変換する。"""
+
+        descriptors = {item.buffer_id: item for item in self.plan._portable_ir.buffers}
+        buffers = [
+            BufferProfile(
+                buffer.buffer_id,
+                "port_shared",
+                buffer.max_items,
+                buffer.retained_count,
+                buffer.high_watermark,
+            )
+            for buffer in self.port_buffers.values()
+        ]
+        buffers.extend(
+            BufferProfile(
+                state.history.buffer_id,
+                "frame_history",
+                state.history.max_items,
+                len(state.history),
+                state.history.high_watermark,
+            )
+            for state in self.frames.values()
+        )
+        buffers.extend(
+            BufferProfile(
+                ingress.buffer_id,
+                "realtime_ingress",
+                ingress.max_items,
+                ingress.pending_count,
+                ingress.high_watermark,
+            )
+            for ingress in self.realtime_ingresses.values()
+        )
+        known = {item.buffer_id for item in buffers}
+        for descriptor in descriptors.values():
+            if descriptor.buffer_id in known:
+                continue
+            buffers.append(
+                BufferProfile(
+                    descriptor.buffer_id,
+                    descriptor.kind,
+                    descriptor.max_items or 1,
+                    0,
+                    0,
+                )
+            )
+        sources = []
+        for node in self.plan._nodes:
+            if node.kind is not NodeKind.SOURCE:
+                continue
+            ingress = self.realtime_ingresses.get(node.id)
+            end = self.port_frontiers.get(node.output_port)
+            sources.append(
+                SourceProfile(
+                    node.id,
+                    self.published_counts[node.output_port],
+                    (
+                        1
+                        if ingress is None and node.id in self.source_pending
+                        else 0
+                        if ingress is None
+                        else ingress.pending_count
+                    ),
+                    0 if ingress is None else ingress.total_dropped_count,
+                    end,
+                )
+            )
+        return SessionProfile(
+            self._scheduler_steps,
+            tuple(
+                KernelProfile(
+                    node_id,
+                    self._kernel_calls[node_id],
+                    self._kernel_total_ns[node_id],
+                    self._kernel_max_ns[node_id],
+                )
+                for node_id in sorted(self._kernel_calls)
+            ),
+            tuple(sorted(buffers, key=lambda item: item.buffer_id)),
+            tuple(sources),
         )

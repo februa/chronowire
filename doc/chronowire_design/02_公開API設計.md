@@ -305,6 +305,26 @@ result = session.run()
 
 `extension_id`は安定した観測契約IDであり、`extension:spectrum_snapshot`のようなbinding slotとは同一fieldにしない。missing、unknown、unused、binding種別、ABI不一致は`create_session()`で明示例外にする。
 
+## v0.2公開API
+
+継続実行は一回実行の`ExecutionSession`と区別し、次の明示lifecycleを持つ。
+
+```python
+session = plan.create_plan_session(options=cw.RuntimeOptions(max_scheduler_steps=1000))
+session.start()
+session.run_until(10)
+session.run_until(20)
+result = session.close()
+```
+
+`run_until()`は境界を単調増加させ、Kernel、FRAME、RATE、buffer、collector、Extension trigger状態を保持する。budget終了時だけ同じ境界を再指定できる。`close()`はRealtime受付停止後にdrainし、`cancel()`は未処理値を破棄して`SESSION_CANCELLED`を残す。
+
+追加Flow入力の同期は`flow.synchronize()`で明示する。referenceは常にMAPの主入力index 0、tie-breakは最小sequenceとする。`MissingInputPolicy.STALL`はNodeを診断停止し、`SKIP`は該当referenceだけを破棄する。
+
+複数outputは通常tupleを暗黙展開せず、`map_outputs(..., output_count=N)`と`kernel_outputs(...)`を組み合わせる。外部制御値は`main.state_source(source)`で同じGraphへSOURCE Portを追加し、LATEST Edgeとして渡す。
+
+plain callableの契約は`callable_kernel()`へまとめる。v0.2ではtime transformは`preserve`だけを提供し、`max_items`、`accepts_invalid`、gap後の`RESET`/`CONTINUE`をIRへ固定する。
+
 ### 8.2 途中Flowの指定
 
 ```python

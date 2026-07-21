@@ -102,6 +102,31 @@ class Emission(Generic[T_co]):
 
 
 @dataclass(frozen=True)
+class KernelOutputs:
+    """複数output Portへ一件ずつ配送するKernel戻り値を表す。"""
+
+    values: tuple[object, ...]
+
+
+def kernel_outputs(*values: object) -> KernelOutputs:
+    """複数Port用の明示KernelOutputsを生成する。
+
+    Args:
+        values: output index順の値。一件以上必要。
+
+    Returns:
+        通常tupleと区別される複数Port戻り値。
+
+    Raises:
+        ValueError: valuesが空の場合。
+    """
+
+    if not values:
+        raise ValueError("kernel_outputs requires at least one value")
+    return KernelOutputs(tuple(values))
+
+
+@dataclass(frozen=True)
 class Skip:
     """Python callableが0件のEmissionを返すことを明示するmarker。"""
 

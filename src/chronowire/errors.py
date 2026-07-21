@@ -43,3 +43,11 @@ class SynchronizationError(ChronowireError):
 
 class PlanSessionError(ChronowireError):
     """PlanSessionの状態遷移または継続実行契約違反。"""
+
+
+class SourceExecutionError(ChronowireError):
+    """Sourceの開始、受信、停止契約に起因する実行時例外。"""
+
+
+class ExecutionBindingError(ChronowireError):
+    """PortablePlanIRとprocess-local bindingの不一致。"""

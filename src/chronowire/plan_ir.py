@@ -174,6 +174,13 @@ class NodeDescriptor:
     accepts_invalid: bool
     time_transform_id: int
     max_items: int
+    frame_size: int | None = None
+    frame_hop: int | None = None
+    pad_end: bool = False
+    rate_period: RationalDescriptor | None = None
+    rate_policy: str | None = None
+    callable_time_transform: str = "preserve"
+    gap_policy: str = "reset"
 
     def __post_init__(self) -> None:
         if self.max_items <= 0:
@@ -195,6 +202,17 @@ class NodeDescriptor:
             _boolean(data, "accepts_invalid"),
             _integer(data, "time_transform_id"),
             _integer(data, "max_items"),
+            _optional_integer(data, "frame_size"),
+            _optional_integer(data, "frame_hop"),
+            _boolean(data, "pad_end") if "pad_end" in data else False,
+            (
+                None
+                if data.get("rate_period") is None
+                else RationalDescriptor.from_dict(data.get("rate_period"))
+            ),
+            _optional_string(data, "rate_policy"),
+            _optional_string(data, "callable_time_transform") or "preserve",
+            _optional_string(data, "gap_policy") or "reset",
         )
 
 
@@ -240,6 +258,8 @@ class EdgeDescriptor:
     cursor_id: int
     required: bool
     adapter_buffer_id: int | None
+    tolerance: RationalDescriptor | None = None
+    missing_policy: str = "stall"
 
     @classmethod
     def from_dict(cls, value: object) -> EdgeDescriptor:
@@ -257,6 +277,12 @@ class EdgeDescriptor:
             _integer(data, "cursor_id"),
             _boolean(data, "required"),
             _optional_integer(data, "adapter_buffer_id"),
+            (
+                None
+                if data.get("tolerance") is None
+                else RationalDescriptor.from_dict(data.get("tolerance"))
+            ),
+            _optional_string(data, "missing_policy") or "stall",
         )
 
 
@@ -491,9 +517,8 @@ class PortablePlanIR:
     """Executorと言語に依存しないserialization可能なExecutionPlan。
 
     Python callable、collector instance、pointer、allocatorは含めず、安定IDと
-    descriptorだけを保持する。v0.1ではschema round-tripとexportを保証する。
-    Extension以外も含むdeserialize後の完全なprocess-local binding実行は
-    v0.2で扱う。
+    descriptorだけを保持する。schema 0.1/0.2の読込みとround-tripを保証し、
+    v0.2ではExecutionBindingsによるprocess-local binding実行を提供する。
     """
 
     schema_version: str

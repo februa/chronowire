@@ -4,12 +4,77 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol, TypeVar, runtime_checkable
 
 from .config import Config
 from .model import LogicalInterval
 
 T_co = TypeVar("T_co", covariant=True)
+
+
+class GapPolicy(StrEnum):
+    """入力gap境界後のstateful Kernel session処理を表す。"""
+
+    RESET = "reset"
+    CONTINUE = "continue"
+
+
+@dataclass(frozen=True)
+class CallableAdapter:
+    """plain callableへGraph上の実行契約を付与する。"""
+
+    operation: Callable[..., object]
+    max_items: int = 1
+    accepts_invalid: bool = False
+    time_transform: str = "preserve"
+    gap_policy: GapPolicy = GapPolicy.RESET
+
+    def __post_init__(self) -> None:
+        if self.max_items <= 0:
+            raise ValueError("callable adapter max_items must be positive")
+        if self.time_transform not in {"preserve", "explicit"}:
+            raise ValueError("callable adapter time_transform must be preserve or explicit")
+        if not isinstance(self.gap_policy, GapPolicy):
+            raise ValueError("gap_policy must be a GapPolicy")
+
+    def __call__(self, value: object, **arguments: object) -> object:
+        """元のcallableへ主入力と解決済みkeyword引数を渡す。"""
+
+        return self.operation(value, **arguments)
+
+
+def callable_kernel(
+    operation: Callable[..., object],
+    *,
+    max_items: int = 1,
+    accepts_invalid: bool = False,
+    time_transform: str = "preserve",
+    gap_policy: GapPolicy = GapPolicy.RESET,
+) -> CallableAdapter:
+    """plain callableを明示実行契約付きadapterへ変換する。
+
+    Args:
+        operation: 主入力とkeyword引数を受け取るcallable。
+        max_items: 一回の呼出しで生成できるEmission上限。
+        accepts_invalid: INVALID入力でも呼び出す場合にTrue。
+        time_transform: 入力interval維持は`preserve`、Kernel明示変更は`explicit`。
+        gap_policy: gap後にKernel sessionをresetまたは継続する規則。
+
+    Returns:
+        Flow.mapへ渡せる不変CallableAdapter。
+
+    Raises:
+        ValueError: 件数、time transform、gap policyが不正な場合。
+    """
+
+    return CallableAdapter(
+        operation,
+        max_items,
+        accepts_invalid,
+        time_transform,
+        gap_policy,
+    )
 
 
 @dataclass(frozen=True)

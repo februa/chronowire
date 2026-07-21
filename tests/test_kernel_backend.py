@@ -101,6 +101,53 @@ def test_kernel_compiles_once_and_plan_reuses_compiled_kernel() -> None:
     assert kernel.compile_count == 1
 
 
+def test_callable_adapter_fixes_emission_time_and_gap_contracts_in_ir() -> None:
+    """plain callableの分散設定を一つのadapter契約としてGraphとIRへ固定する。"""
+
+    adapter = cw.callable_kernel(
+        lambda value: cw.emit_many([value, value + 1]),
+        max_items=2,
+        accepts_invalid=True,
+        gap_policy=cw.GapPolicy.CONTINUE,
+    )
+    mapped = cw.Flow([1]).map(adapter)
+    plan = cw.compile([cw.output(mapped, collector=cw.Bounded(2))])
+    node = next(item for item in plan.portable_ir.nodes if item.opcode == "map")
+
+    result = plan.run()
+
+    assert [item.value for item in result.outputs[0].emissions] == [1, 2]
+    assert node.max_items == 2
+    assert node.accepts_invalid
+    assert node.callable_time_transform == "preserve"
+    assert node.gap_policy == "continue"
+
+
+def test_callable_adapter_marks_explicit_time_transform_boundary() -> None:
+    """外部resampling Kernelのinterval変更をGraphとTime descriptorへ明示する。"""
+
+    adapter = cw.callable_kernel(
+        lambda value: cw.Emission(
+            value,
+            cw.LogicalInterval(cw.LogicalTime(10), cw.LogicalTime(11)),
+            0,
+        ),
+        time_transform="explicit",
+    )
+    mapped = cw.Flow([1]).map(adapter)
+    plan = cw.compile([cw.output(mapped, collector=cw.Latest())])
+    time = next(
+        item for item in plan.portable_ir.times if item.time_descriptor_id == mapped.port_id
+    )
+
+    result = plan.run()
+
+    assert result.outputs[0].emissions[0].interval.start == cw.LogicalTime(10)
+    assert time.transform == "explicit"
+    assert not time.exact
+    assert any(item.code == "EXPLICIT_TIME_TRANSFORM" for item in plan.diagnostics)
+
+
 def test_unknown_backend_is_rejected_at_compile() -> None:
     """未実装Backendへ暗黙fallbackせず、指定誤りをcompile時に検出する。"""
 

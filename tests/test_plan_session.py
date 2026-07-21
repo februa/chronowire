@@ -193,3 +193,41 @@ def test_one_shot_duration_keeps_v01_completion_semantics() -> None:
 
     assert _values(result) == [1]
     assert result.completed
+
+
+def test_runtime_options_budget_allows_retrying_same_logical_boundary() -> None:
+    """budget終了時は同じrun_until境界を再指定して継続できる。"""
+
+    plan = cw.compile([cw.output(cw.Flow([1, 2, 3]), collector=cw.Bounded(3))])
+    session = plan.create_plan_session(options=cw.RuntimeOptions(max_scheduler_steps=1))
+    session.start()
+
+    first = session.run_until(3)
+    second = session.run_until(3)
+
+    assert _values(first) == [1]
+    assert _values(second) == [1, 2]
+    assert [item.code for item in second.diagnostics].count("EXECUTION_BUDGET_EXHAUSTED") == 2
+    session.cancel()
+
+
+def test_runtime_options_validates_watermarks_and_budget() -> None:
+    """無効なchunk、watermark、budgetをGraph実行前に拒否する。"""
+
+    with pytest.raises(ValueError, match="source_chunk_duration"):
+        cw.RuntimeOptions(source_chunk_duration=Fraction(0))
+    with pytest.raises(ValueError, match="requires port_high_watermark"):
+        cw.RuntimeOptions(port_low_watermark=0)
+    with pytest.raises(ValueError, match="below port_high_watermark"):
+        cw.RuntimeOptions(port_high_watermark=2, port_low_watermark=2)
+    with pytest.raises(ValueError, match="max_scheduler_steps"):
+        cw.RuntimeOptions(max_scheduler_steps=0)
+
+    source = cw.Flow([1, 2])
+    framed = source.frame(2)
+    merged = source.map(lambda value, *, frame: (value, frame), frame=framed)
+    session = cw.compile([merged]).create_plan_session(
+        options=cw.RuntimeOptions(port_high_watermark=1)
+    )
+    with pytest.raises(cw.PlanSessionError, match="below compiled capacity"):
+        session.start()
