@@ -78,6 +78,8 @@ def test_realtime_drop_oldest_degrades_next_retained_emission() -> None:
     assert source_descriptor.burst_max_items == 2
     assert source_descriptor.overflow_policy == "drop_oldest"
     assert ingress.max_items == 2
+    assert not plan.portable_ir.times[0].finite
+    assert plan.portable_ir.times[0].exact
 
     result = plan.run()
     emissions = result.outputs[0].emissions
@@ -233,3 +235,41 @@ def test_stateful_kernel_session_resets_after_gap() -> None:
     result = cw.compile([cw.output(counted, collector=cw.Bounded(2))]).run()
 
     assert [item.value for item in result.outputs[0].emissions] == [1, 1]
+
+
+def test_exact_merge_skips_only_interval_proven_missing_by_gap() -> None:
+    """gapで欠落した一intervalを解放し、後続の共通frontierから再開する。"""
+
+    source = cw.Flow([0, 1, 2, 3])
+    main = source.map(lambda value: value)
+
+    def with_gap(value: int) -> object:
+        if value == 0:
+            return cw.Emission(
+                value,
+                cw.LogicalInterval(cw.LogicalTime(0), cw.LogicalTime(1)),
+                0,
+                cw.EmissionStatus.DEGRADED,
+                (_gap_diagnostic(1, 2),),
+            )
+        if value == 1:
+            return cw.skip()
+        return value
+
+    auxiliary = source.map(with_gap)
+    merged = main.map(lambda value, *, other: (value, other), other=auxiliary)
+
+    result = cw.compile([cw.output(merged, collector=cw.Bounded(3))]).run()
+
+    assert [item.value for item in result.outputs[0].emissions] == [
+        (0, 0),
+        (2, 2),
+        (3, 3),
+    ]
+    recovered = [item for item in result.diagnostics if item.code == "MERGE_INPUT_GAP"]
+    assert [item.interval for item in recovered] == [
+        cw.LogicalInterval(cw.LogicalTime(1), cw.LogicalTime(2))
+    ]
+    assert not any(item.code == "STALLED_EXACT_MERGE" for item in result.diagnostics)
+    assert not any(item.code == "SCHEDULER_DEADLOCK" for item in result.diagnostics)
+    assert result.completed

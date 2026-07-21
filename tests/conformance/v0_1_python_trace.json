@@ -1,0 +1,45 @@
+{
+  "outputs": [
+    {
+      "collector_kind": "bounded",
+      "received_count": 2,
+      "dropped_count": 0,
+      "emissions": [
+        {
+          "value": "safe-fallback",
+          "interval": [[0, 1], [1, 2]],
+          "sequence": 0,
+          "status": "degraded",
+          "diagnostic_codes": ["SAFE_FALLBACK"],
+          "metadata": {"integration_count": 1, "origin": "conformance"}
+        },
+        {
+          "value": "safe-fallback",
+          "interval": [[1, 2], [1, 1]],
+          "sequence": 1,
+          "status": "degraded",
+          "diagnostic_codes": ["SAFE_FALLBACK"],
+          "metadata": {"integration_count": 1, "origin": "conformance"}
+        }
+      ]
+    },
+    {
+      "collector_kind": "bounded",
+      "received_count": 1,
+      "dropped_count": 0,
+      "emissions": [
+        {
+          "value": ["safe-fallback", "safe-fallback"],
+          "interval": [[0, 1], [1, 1]],
+          "sequence": 0,
+          "status": "degraded",
+          "diagnostic_codes": ["SAFE_FALLBACK", "SAFE_FALLBACK"],
+          "metadata": {}
+        }
+      ]
+    }
+  ],
+  "status_counts": {"degraded": 4},
+  "diagnostic_codes": [],
+  "completed": true
+}

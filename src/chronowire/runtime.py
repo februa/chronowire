@@ -189,6 +189,26 @@ def _time_signature(nodes: Sequence[NodeSpec]) -> dict[int, tuple[Fraction, Frac
     return signatures
 
 
+def _port_finiteness(nodes: Sequence[NodeSpec]) -> dict[int, bool]:
+    """各Portの生成列が有限と証明できるかをGraph順に求める。"""
+
+    finite: dict[int, bool] = {}
+    for node in nodes:
+        if node.kind is NodeKind.SOURCE:
+            finite[node.output_port] = (
+                False
+                if isinstance(node.source, RealtimeSource)
+                else node.source.is_finite
+                if isinstance(node.source, Source)
+                else True
+            )
+        else:
+            finite[node.output_port] = all(
+                finite[input_spec.source_port] for input_spec in node.inputs
+            )
+    return finite
+
+
 def _compile_diagnostics(nodes: Sequence[NodeSpec]) -> tuple[Diagnostic, ...]:
     diagnostics: list[Diagnostic] = []
     signatures = _time_signature(nodes)
@@ -406,6 +426,8 @@ def _portable_plan_ir(
             node.inputs[input_index].keyword,
             node.inputs[input_index].source_port,
             edge_id,
+            True,
+            None,
         )
         for edge_id, (node, input_index) in enumerate(edge_rows)
     )
@@ -572,6 +594,7 @@ def _portable_plan_ir(
             )
             next_buffer_id += 1
     buffers = port_buffers + tuple(internal_buffers)
+    port_finiteness = _port_finiteness(nodes)
     times = tuple(
         TimeDescriptor(
             node.output_port,
@@ -580,6 +603,9 @@ def _portable_plan_ir(
             RationalDescriptor.from_fraction(signatures[node.output_port][1]),
             RationalDescriptor(0, 1),
             node.kind.value,
+            True,
+            port_finiteness[node.output_port],
+            None,
         )
         for node in nodes
     )
@@ -1056,6 +1082,7 @@ class _PlanRuntime:
         self.port_sequences: dict[int, int] = defaultdict(int)
         self.published_counts: Counter[int] = Counter()
         self.port_frontiers: dict[int, Fraction] = {}
+        self.port_gaps: dict[int, list[LogicalInterval]] = defaultdict(list)
         self.exhausted_ports: set[int] = set()
         self.stalled_nodes: set[int] = set()
         self.source_indexes: dict[int, int] = defaultdict(int)
@@ -1371,6 +1398,7 @@ class _PlanRuntime:
         )
         self.pending_source_gaps[node.id].append(diagnostic)
         self.diagnostics.append(diagnostic)
+        self._record_port_gap(node.output_port, marker.interval)
         self._advance_frontier(node.output_port, marker.interval.end.as_fraction())
         self._notify_diagnostic(diagnostic)
 
@@ -1400,6 +1428,42 @@ class _PlanRuntime:
             emission.diagnostics + diagnostics,
             metadata,
         )
+
+    def _record_port_gap(self, port_id: int, interval: LogicalInterval) -> None:
+        """Portで生成不能なgap intervalをrun-localに順序保持する。"""
+
+        gaps = self.port_gaps[port_id]
+        if gaps and gaps[-1].end == interval.start:
+            gaps[-1] = LogicalInterval(gaps[-1].start, interval.end)
+            return
+        if interval not in gaps:
+            gaps.append(interval)
+
+    def _record_emission_gaps(
+        self,
+        port_id: int,
+        emissions: Sequence[Emission[object]],
+    ) -> None:
+        """入力Diagnosticが示すgapを変換後Portのcontrol stateへ伝播する。"""
+
+        for emission in emissions:
+            for diagnostic in emission.diagnostics:
+                if diagnostic.code == "INPUT_OVERRUN" and diagnostic.interval is not None:
+                    self._record_port_gap(port_id, diagnostic.interval)
+
+    def _gap_for_interval(
+        self,
+        port_id: int,
+        required: LogicalInterval,
+    ) -> LogicalInterval | None:
+        """required intervalと重なる既知gapを返す。"""
+
+        required_start = required.start.as_fraction()
+        required_end = required.end.as_fraction()
+        for gap in self.port_gaps.get(port_id, ()):
+            if gap.start.as_fraction() < required_end and required_start < gap.end.as_fraction():
+                return gap
+        return None
 
     def _advance_frame(self, node: NodeSpec) -> bool:
         """frame履歴を一件進め、入力EOFでは必要なら一度だけpaddingする。"""
@@ -1451,10 +1515,18 @@ class _PlanRuntime:
             queue = self.queues[(node.id, input_index)]
             if not queue:
                 if input_spec.source_port in self.exhausted_ports:
+                    gap = self._gap_for_interval(input_spec.source_port, main.interval)
+                    if gap is not None:
+                        self._skip_exact_merge_gap(node, input_index, main.interval, gap)
+                        return True
                     self._stall_exact_merge(node, input_index, main.interval, None, None)
                     return True
                 frontier = self.port_frontiers.get(input_spec.source_port)
                 if frontier is not None and frontier > main.interval.start.as_fraction():
+                    gap = self._gap_for_interval(input_spec.source_port, main.interval)
+                    if gap is not None:
+                        self._skip_exact_merge_gap(node, input_index, main.interval, gap)
+                        return True
                     self._stall_exact_merge(
                         node,
                         input_index,
@@ -1471,6 +1543,10 @@ class _PlanRuntime:
             available_start = available.interval.start.as_fraction()
             if available_start < main_start:
                 queue.popleft()
+                return True
+            gap = self._gap_for_interval(input_spec.source_port, main.interval)
+            if gap is not None:
+                self._skip_exact_merge_gap(node, input_index, main.interval, gap)
                 return True
             self._stall_exact_merge(
                 node,
@@ -1546,6 +1622,40 @@ class _PlanRuntime:
         )
         self._stop_node(node, diagnostic)
 
+    def _skip_exact_merge_gap(
+        self,
+        node: NodeSpec,
+        input_index: int,
+        required: LogicalInterval,
+        gap: LogicalInterval,
+    ) -> None:
+        """GapMarkerで生成不能と証明された一intervalだけを解放する。"""
+
+        for index, input_spec in enumerate(node.inputs):
+            if input_spec.semantics is not InputSemantics.SYNCHRONOUS:
+                continue
+            queue = self.queues[(node.id, index)]
+            if queue and queue[0].interval == required:
+                queue.popleft()
+        diagnostic = Diagnostic(
+            Severity.WARNING,
+            "MERGE_INPUT_GAP",
+            "exact merge skipped an interval proven missing by realtime input gap",
+            node_id=node.id,
+            port_id=node.output_port,
+            interval=required,
+            details={
+                "failed_input_index": input_index,
+                "failed_port_id": node.inputs[input_index].source_port,
+                "gap_interval": str(gap),
+                "contract": "gap_resynchronize_at_common_frontier",
+            },
+        )
+        self.diagnostics.append(diagnostic)
+        self._record_port_gap(node.output_port, required)
+        self._advance_frontier(node.output_port, required.end.as_fraction())
+        self._notify_diagnostic(diagnostic)
+
     def _stall_latest(
         self,
         node: NodeSpec,
@@ -1606,6 +1716,7 @@ class _PlanRuntime:
             return False
         state = self.frames[node.id]
         emission = queue.popleft()
+        self._record_emission_gaps(node.output_port, (emission,))
         if _has_input_overrun(emission):
             state.history.clear()
             state.skip_remaining = 0
@@ -1704,6 +1815,7 @@ class _PlanRuntime:
         if not queue:
             return False
         source = queue.popleft()
+        self._record_emission_gaps(node.output_port, (source,))
         period = node.rate_period
         if period is None or node.rate_policy is not RatePolicy.HOLD:
             raise RuntimeError("RATE Node lacks a supported period and policy")
@@ -1768,6 +1880,7 @@ class _PlanRuntime:
             )
             inputs.append(emission)
 
+        self._record_emission_gaps(node.output_port, inputs)
         if any(_has_input_overrun(item) for item in inputs):
             compiled = self.plan._compiled_kernels.get(node.id)
             if compiled is None:
@@ -1822,6 +1935,7 @@ class _PlanRuntime:
             inherited_status,
             inherited_diagnostics,
         )
+        self._record_emission_gaps(node.output_port, normalized)
         for emission in normalized:
             self._publish(node.output_port, emission)
         self._advance_frontier(node.output_port, main.interval.end.as_fraction())
@@ -1914,5 +2028,8 @@ class _PlanRuntime:
             tuple(outputs),
             tuple(self.diagnostics),
             dict(self.status_counts),
-            completed=True,
+            completed=(
+                not self.stalled_nodes
+                and not any(item.code == "SCHEDULER_DEADLOCK" for item in self.diagnostics)
+            ),
         )

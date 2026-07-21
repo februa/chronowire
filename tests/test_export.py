@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 import chronowire as cw
 
 
@@ -93,6 +95,9 @@ def test_portable_plan_round_trip_preserves_edges_buffers_and_time() -> None:
     assert restored.buffers[0].capacity_reasons[0].startswith("producer_burst:")
     assert restored.buffers[0].consumer_cursor_ids == (0, 1)
     assert restored.buffers[0].reclaim_policy == "all_consumers_advanced"
+    assert all(edge.required and edge.adapter_buffer_id is None for edge in restored.edges)
+    assert all(item.exact and item.finite for item in restored.times)
+    assert all(item.generation_end is None for item in restored.times)
     assert all(binding.abi_version for binding in restored.bindings)
 
 
@@ -192,3 +197,21 @@ def test_frame_and_latest_internal_buffers_round_trip() -> None:
     assert latest_buffer.overflow_policy == "replace_oldest"
     assert latest_buffer.reclaim_policy == "replace_on_newer"
     assert plan.run().outputs[0].received_count == 1
+
+
+def test_portable_plan_rejects_invalid_edge_and_time_schema_fields() -> None:
+    """required/exact fieldの欠落や型違反を曖昧な既定値で受理しない。"""
+
+    source = cw.Flow([1])
+    mapped = source.map(lambda value: value)
+    payload = json.loads(cw.compile([mapped]).portable_ir.to_json())
+    payload["edges"][0]["required"] = "true"
+
+    with pytest.raises(ValueError, match="required must be a boolean"):
+        cw.PortablePlanIR.from_dict(payload)
+
+    payload = json.loads(cw.compile([mapped]).portable_ir.to_json())
+    del payload["times"][0]["exact"]
+
+    with pytest.raises(ValueError, match="exact must be a boolean"):
+        cw.PortablePlanIR.from_dict(payload)

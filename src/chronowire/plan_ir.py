@@ -134,6 +134,9 @@ class TimeDescriptor:
     period: RationalDescriptor
     phase: RationalDescriptor
     transform: str
+    exact: bool
+    finite: bool
+    generation_end: RationalDescriptor | None
 
     @classmethod
     def from_dict(cls, value: object) -> TimeDescriptor:
@@ -147,6 +150,13 @@ class TimeDescriptor:
             RationalDescriptor.from_dict(data.get("period")),
             RationalDescriptor.from_dict(data.get("phase")),
             _string(data, "transform"),
+            _boolean(data, "exact"),
+            _boolean(data, "finite"),
+            (
+                None
+                if data.get("generation_end") is None
+                else RationalDescriptor.from_dict(data.get("generation_end"))
+            ),
         )
 
 
@@ -228,6 +238,8 @@ class EdgeDescriptor:
     keyword: str | None
     buffer_id: int
     cursor_id: int
+    required: bool
+    adapter_buffer_id: int | None
 
     @classmethod
     def from_dict(cls, value: object) -> EdgeDescriptor:
@@ -243,6 +255,8 @@ class EdgeDescriptor:
             _optional_string(data, "keyword"),
             _integer(data, "buffer_id"),
             _integer(data, "cursor_id"),
+            _boolean(data, "required"),
+            _optional_integer(data, "adapter_buffer_id"),
         )
 
 

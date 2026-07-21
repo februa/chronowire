@@ -155,6 +155,7 @@ def test_exact_merge_stall_stops_unneeded_pull_before_source_eof() -> None:
     assert values.yielded == 2
     assert result.outputs[0].emissions == ()
     assert any(item.code == "STALLED_EXACT_MERGE" for item in result.diagnostics)
+    assert not result.completed
 
 
 def test_stalled_merge_releases_cursors_for_independent_output() -> None:
