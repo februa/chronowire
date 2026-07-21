@@ -77,6 +77,18 @@ def test_portable_plan_round_trip_preserves_edges_buffers_and_time() -> None:
 
     assert restored == plan.portable_ir
     assert restored.buffers[0].read_only
+    assert restored.buffers[0].max_items == 1
     assert restored.buffers[0].consumer_cursor_ids == (0, 1)
     assert restored.buffers[0].reclaim_policy == "all_consumers_advanced"
     assert all(binding.abi_version for binding in restored.bindings)
+
+
+def test_frame_structure_increases_planned_buffer_capacity() -> None:
+    """frame需要を満たす静的capacityがPortablePlanIRへ記録される。"""
+
+    source = cw.Flow(range(8))
+    framed = source.frame(4)
+    merged = source.map(lambda value, *, frame: (value, frame), frame=framed)
+    plan = cw.compile([merged])
+
+    assert {buffer.max_items for buffer in plan.portable_ir.buffers} == {4}

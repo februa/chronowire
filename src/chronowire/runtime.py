@@ -215,6 +215,32 @@ def _node_max_items(
     return max(1, -(-ratio.numerator // ratio.denominator))
 
 
+def _planned_buffer_capacity(
+    nodes: Sequence[NodeSpec],
+    signatures: dict[int, tuple[Fraction, Fraction]],
+) -> int:
+    """一回の終端需要を満たす構造上の最大pull burstを保守的に求める。"""
+
+    demand_by_port: dict[int, int] = {}
+    maximum = 1
+    for node in nodes:
+        node_items = _node_max_items(node, signatures)
+        if node.kind is NodeKind.SOURCE:
+            demand = 1
+        elif node.kind is NodeKind.FRAME:
+            if node.frame_size is None:
+                raise RuntimeError("FRAME Node lacks size")
+            demand = demand_by_port[node.inputs[0].source_port] * node.frame_size
+        else:
+            demand = max(
+                (demand_by_port[item.source_port] for item in node.inputs),
+                default=1,
+            )
+        demand_by_port[node.output_port] = demand
+        maximum = max(maximum, demand, node_items)
+    return maximum
+
+
 def _collector_descriptor(index: int, item: OutputSpec[Any]) -> OutputDescriptor:
     """collector instanceをportableな終端descriptorへ変換する。"""
 
@@ -256,6 +282,7 @@ def _portable_plan_ir(
     """compile済みPython実体からportable descriptorだけを抽出する。"""
 
     signatures = _time_signature(nodes)
+    buffer_capacity = _planned_buffer_capacity(nodes, signatures)
     edge_rows = tuple(
         (node, input_index) for node in nodes for input_index, _ in enumerate(node.inputs)
     )
@@ -315,7 +342,7 @@ def _portable_plan_ir(
             "port_shared",
             node.output_port,
             tuple(cursors_by_port[node.output_port]),
-            None,
+            buffer_capacity,
             None,
             "fail",
             "all_consumers_advanced",
@@ -586,8 +613,15 @@ class _PlanRuntime:
         self.duration = None if duration is None else Fraction(str(duration))
         self.nodes_by_port = {node.output_port: node for node in plan._nodes}
         self.nodes_by_id = {node.id: node for node in plan._nodes}
+        signatures = _time_signature(plan._nodes)
+        self.node_max_items = {node.id: _node_max_items(node, signatures) for node in plan._nodes}
+        self.buffer_capacity = _planned_buffer_capacity(plan._nodes, signatures)
         self.port_buffers: dict[int, PortBuffer[Emission[object]]] = {
-            node.output_port: PortBuffer(node.output_port) for node in plan._nodes
+            node.output_port: PortBuffer(
+                node.output_port,
+                max_items=self.buffer_capacity,
+            )
+            for node in plan._nodes
         }
         self.queues: dict[tuple[int, int], CursorQueue[Emission[object]]] = {}
         cursor_id = 0
@@ -601,6 +635,12 @@ class _PlanRuntime:
         self.frames: dict[int, _FrameState] = {}
         self.rates: dict[int, _RateState] = {}
         self.port_sequences: dict[int, int] = defaultdict(int)
+        self.published_counts: Counter[int] = Counter()
+        self.exhausted_ports: set[int] = set()
+        self.stalled_nodes: set[int] = set()
+        self.source_indexes: dict[int, int] = defaultdict(int)
+        source_nodes = (node for node in plan._nodes if node.kind is NodeKind.SOURCE)
+        self.source_iterators = {node.id: iter(self._source_values(node)) for node in source_nodes}
         self.diagnostics = list(plan._compile_diagnostics)
         self.status_counts: Counter[EmissionStatus] = Counter()
         self.collectors: dict[int, CollectorSession[Any]] = {
@@ -610,6 +650,7 @@ class _PlanRuntime:
             node_id: kernel.create_session() for node_id, kernel in plan._compiled_kernels.items()
         }
         self.output_ports = set(self.collectors)
+        self.root_ports: set[int] = set()
 
     def run(self) -> RunResult:
         context = PlanContext(required_node_count=len(self.plan._nodes))
@@ -618,33 +659,39 @@ class _PlanRuntime:
             for extension in self.plan._extensions:
                 extension.initialize(context)
                 initialized.append(extension)
-            sources = [node for node in self.plan._nodes if node.kind is NodeKind.SOURCE]
-            iterators = {node.id: iter(self._source_values(node)) for node in sources}
-            active = {node.id for node in sources}
-            source_indexes: dict[int, int] = defaultdict(int)
-
+            roots = tuple(
+                dict.fromkeys(
+                    [item.flow.port_id for item in self.plan._outputs]
+                    + [
+                        port
+                        for extension in self.plan._extensions
+                        for port in extension.observed_ports()
+                    ]
+                )
+            )
+            self.root_ports = set(roots)
+            seen_counts: Counter[int] = Counter()
+            active = set(roots)
             while active:
-                for node in sources:
-                    if node.id not in active:
+                progressed = False
+                for port_id in roots:
+                    if port_id not in active:
                         continue
-                    try:
-                        value = next(iterators[node.id])
-                    except StopIteration:
-                        active.remove(node.id)
+                    if seen_counts[port_id] < self.published_counts[port_id]:
+                        seen_counts[port_id] += 1
+                        progressed = True
                         continue
-                    emission = self._source_emission(value, source_indexes[node.id])
-                    source_indexes[node.id] += 1
-                    if (
-                        self.duration is not None
-                        and emission.interval.end.as_fraction() > self.duration
-                    ):
-                        active.remove(node.id)
+                    if port_id in self.exhausted_ports:
+                        active.remove(port_id)
                         continue
-                    self._publish(node.output_port, emission)
-                    self._drain_ready_nodes()
+                    if self._advance_port(port_id):
+                        progressed = True
+                    elif port_id in self.exhausted_ports:
+                        active.remove(port_id)
+                if active and not progressed:
+                    self._report_scheduler_deadlock(active)
+                    break
 
-            self._flush_padded_frames()
-            self._drain_ready_nodes()
             self._report_unmatched_inputs()
             return self._result()
         finally:
@@ -698,24 +745,216 @@ class _PlanRuntime:
         if port_id in self.output_ports:
             self.collectors[port_id].add(emission)
         self.port_buffers[port_id].publish(emission)
+        self.published_counts[port_id] += 1
 
-    def _drain_ready_nodes(self) -> None:
-        while True:
-            progressed = False
-            for node in self.plan._nodes:
-                if node.kind is NodeKind.SOURCE:
+    def _advance_port(self, port_id: int) -> bool:
+        """portの未充足需要へ向けて高々一つの実行単位だけを進める。"""
+
+        if port_id in self.exhausted_ports:
+            return False
+        node = self.nodes_by_port[port_id]
+        if not self.port_buffers[port_id].can_publish(self.node_max_items[node.id]):
+            return False
+        if node.kind is NodeKind.SOURCE:
+            return self._advance_source(node)
+        if node.kind is NodeKind.FRAME:
+            return self._advance_frame(node)
+        if node.kind is NodeKind.RATE:
+            return self._advance_rate(node)
+        if node.kind is NodeKind.MAP:
+            return self._advance_map(node)
+        raise RuntimeError(f"unsupported Node kind {node.kind!r}")
+
+    def _advance_source(self, node: NodeSpec) -> bool:
+        """需要があるSourceから一件だけpublishする。"""
+
+        try:
+            value = next(self.source_iterators[node.id])
+        except StopIteration:
+            self.exhausted_ports.add(node.output_port)
+            return True
+        emission = self._source_emission(value, self.source_indexes[node.id])
+        self.source_indexes[node.id] += 1
+        if self.duration is not None and emission.interval.end.as_fraction() > self.duration:
+            self.exhausted_ports.add(node.output_port)
+            return True
+        self._publish(node.output_port, emission)
+        return True
+
+    def _advance_frame(self, node: NodeSpec) -> bool:
+        """frame履歴を一件進め、入力EOFでは必要なら一度だけpaddingする。"""
+
+        queue = self.queues[(node.id, 0)]
+        if queue:
+            return self._process_frame_input(node)
+        input_port = node.inputs[0].source_port
+        if input_port not in self.exhausted_ports:
+            return self._advance_port(input_port)
+        if self._flush_padded_frame(node):
+            return True
+        self.exhausted_ports.add(node.output_port)
+        return True
+
+    def _advance_rate(self, node: NodeSpec) -> bool:
+        """RATE入力を一件処理し、未到着ならそのproducerだけを進める。"""
+
+        queue = self.queues[(node.id, 0)]
+        if queue:
+            return self._process_rate_input(node)
+        input_port = node.inputs[0].source_port
+        if input_port in self.exhausted_ports:
+            self.exhausted_ports.add(node.output_port)
+            return True
+        return self._advance_port(input_port)
+
+    def _advance_map(self, node: NodeSpec) -> bool:
+        """MAPの次intervalに必要な不足入力だけを一段進める。"""
+
+        if node.id in self.stalled_nodes:
+            return False
+        main_queue = self.queues[(node.id, 0)]
+        main_port = node.inputs[0].source_port
+        if not main_queue:
+            if main_port in self.exhausted_ports:
+                self.exhausted_ports.add(node.output_port)
+                return True
+            return self._advance_port(main_port)
+        main = main_queue[0]
+
+        latest_progress = self._advance_missing_latest(node, main)
+        if latest_progress is not None:
+            return latest_progress
+
+        for input_index, input_spec in enumerate(node.inputs[1:], start=1):
+            if input_spec.semantics is not InputSemantics.SYNCHRONOUS:
+                continue
+            queue = self.queues[(node.id, input_index)]
+            if not queue:
+                if input_spec.source_port in self.exhausted_ports:
+                    self._stall_exact_merge(node, input_index, main.interval, None)
+                    return True
+                return self._advance_port(input_spec.source_port)
+            available = queue[0]
+            if available.interval == main.interval:
+                continue
+            main_start = main.interval.start.as_fraction()
+            available_start = available.interval.start.as_fraction()
+            if available_start < main_start:
+                queue.popleft()
+                return True
+            self._stall_exact_merge(node, input_index, main.interval, available.interval)
+            return True
+        return self._process_map_if_ready(node)
+
+    def _advance_missing_latest(
+        self,
+        node: NodeSpec,
+        main: Emission[object],
+    ) -> bool | None:
+        """latest入力をmain時刻まで進め、未充足時だけ進捗結果を返す。"""
+
+        for input_index, input_spec in enumerate(node.inputs):
+            if input_spec.semantics is not InputSemantics.LATEST:
+                continue
+            queue = self.queues[(node.id, input_index)]
+            consumed = False
+            while queue and queue[0].interval.start <= main.interval.start:
+                self.latest[(node.id, input_index)] = queue.popleft()
+                consumed = True
+            if consumed:
+                return True
+            if queue:
+                if (node.id, input_index) in self.latest:
                     continue
-                if (
-                    node.kind is NodeKind.FRAME
-                    and self._process_frame_input(node)
-                    or node.kind is NodeKind.RATE
-                    and self._process_rate_input(node)
-                    or node.kind is NodeKind.MAP
-                    and self._process_map_if_ready(node)
-                ):
-                    progressed = True
-            if not progressed:
-                return
+                self._stall_latest(node, input_index, main.interval)
+                return True
+            if input_spec.source_port not in self.exhausted_ports:
+                return self._advance_port(input_spec.source_port)
+            if (node.id, input_index) not in self.latest:
+                self._stall_latest(node, input_index, main.interval)
+                return True
+        return None
+
+    def _stall_exact_merge(
+        self,
+        node: NodeSpec,
+        input_index: int,
+        required: LogicalInterval,
+        available: LogicalInterval | None,
+    ) -> None:
+        """生成不能なexact intervalを診断し、Nodeの全cursorを解除する。"""
+
+        diagnostic = Diagnostic(
+            Severity.WARNING,
+            "STALLED_EXACT_MERGE",
+            "exact merge input can no longer produce the required interval",
+            node_id=node.id,
+            port_id=node.output_port,
+            interval=required,
+            details={
+                "input_ports": [item.source_port for item in node.inputs],
+                "failed_input_index": input_index,
+                "required_interval": str(required),
+                "available_interval": None if available is None else str(available),
+            },
+        )
+        self._stop_node(node, diagnostic)
+
+    def _stall_latest(
+        self,
+        node: NodeSpec,
+        input_index: int,
+        required: LogicalInterval,
+    ) -> None:
+        """初期latest値が得られないNodeを診断して停止する。"""
+
+        diagnostic = Diagnostic(
+            Severity.WARNING,
+            "STALLED_LATEST_INPUT",
+            "latest input has no value at or before the required interval",
+            node_id=node.id,
+            port_id=node.output_port,
+            interval=required,
+            details={"failed_input_index": input_index},
+        )
+        self._stop_node(node, diagnostic)
+
+    def _stop_node(self, node: NodeSpec, diagnostic: Diagnostic) -> None:
+        """停止Nodeのcursorを解除し、無関係な観測経路を継続可能にする。"""
+
+        self.stalled_nodes.add(node.id)
+        self.exhausted_ports.add(node.output_port)
+        self.diagnostics.append(diagnostic)
+        for input_index, _ in enumerate(node.inputs):
+            self.queues[(node.id, input_index)].close()
+        for input_spec in node.inputs:
+            self._release_if_undemanded(input_spec.source_port)
+        for extension in self.plan._extensions:
+            extension.on_diagnostic(diagnostic)
+
+    def _release_if_undemanded(self, port_id: int) -> None:
+        """終端にもconsumerにも到達しない経路のcursorを上流へ再帰的に解除する。"""
+
+        if port_id in self.root_ports or self.port_buffers[port_id].consumer_count:
+            return
+        node = self.nodes_by_port[port_id]
+        self.exhausted_ports.add(port_id)
+        for input_index, input_spec in enumerate(node.inputs):
+            self.queues[(node.id, input_index)].close()
+            self._release_if_undemanded(input_spec.source_port)
+
+    def _report_scheduler_deadlock(self, active_ports: set[int]) -> None:
+        """容量待ちだけが残った実装不整合をruntime Diagnosticへ残す。"""
+
+        diagnostic = Diagnostic(
+            Severity.ERROR,
+            "SCHEDULER_DEADLOCK",
+            "no demanded path can advance within planned buffer capacities",
+            details={"active_ports": sorted(active_ports)},
+        )
+        self.diagnostics.append(diagnostic)
+        for extension in self.plan._extensions:
+            extension.on_diagnostic(diagnostic)
 
     def _process_frame_input(self, node: NodeSpec) -> bool:
         queue = self.queues[(node.id, 0)]
@@ -752,40 +991,42 @@ class _PlanRuntime:
         )
         self._publish(node.output_port, frame)
 
-    def _flush_padded_frames(self) -> None:
-        for node in self.plan._nodes:
-            if node.kind is not NodeKind.FRAME or not node.pad_end:
-                continue
-            state = self.frames.get(node.id)
-            if state is None or not state.items or node.frame_size is None:
-                continue
-            items = list(state.items)
-            last = items[-1]
-            padding_count = node.frame_size - len(items)
-            item_duration = last.interval.end.as_fraction() - last.interval.start.as_fraction()
-            for offset in range(padding_count):
-                start = last.interval.end.as_fraction() + offset * item_duration
-                items.append(
-                    Emission(
-                        None,
-                        LogicalInterval(
-                            self._time_from_fraction(start),
-                            self._time_from_fraction(start + item_duration),
+    def _flush_padded_frame(self, node: NodeSpec) -> bool:
+        """有限入力EOFの未完成frameを一度だけpaddingしてpublishする。"""
+
+        if not node.pad_end:
+            return False
+        state = self.frames.get(node.id)
+        if state is None or not state.items or node.frame_size is None:
+            return False
+        items = list(state.items)
+        last = items[-1]
+        padding_count = node.frame_size - len(items)
+        item_duration = last.interval.end.as_fraction() - last.interval.start.as_fraction()
+        for offset in range(padding_count):
+            start = last.interval.end.as_fraction() + offset * item_duration
+            items.append(
+                Emission(
+                    None,
+                    LogicalInterval(
+                        self._time_from_fraction(start),
+                        self._time_from_fraction(start + item_duration),
+                    ),
+                    last.sequence + offset + 1,
+                    EmissionStatus.DEGRADED,
+                    (
+                        Diagnostic(
+                            Severity.WARNING,
+                            "FRAME_PADDED_AT_EOF",
+                            "frame was padded at finite Source EOF",
+                            node_id=node.id,
                         ),
-                        last.sequence + offset + 1,
-                        EmissionStatus.DEGRADED,
-                        (
-                            Diagnostic(
-                                Severity.WARNING,
-                                "FRAME_PADDED_AT_EOF",
-                                "frame was padded at finite Source EOF",
-                                node_id=node.id,
-                            ),
-                        ),
-                    )
+                    ),
                 )
-            self._emit_frame(node, items)
-            state.items.clear()
+            )
+        self._emit_frame(node, items)
+        state.items.clear()
+        return True
 
     @staticmethod
     def _time_from_fraction(value: Fraction) -> LogicalTime:

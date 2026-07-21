@@ -186,7 +186,7 @@ def test_compile_warns_for_possible_interval_mismatch() -> None:
 
     assert [item.code for item in plan.diagnostics] == ["POSSIBLE_INTERVAL_MISMATCH"]
     run_result = plan.run()
-    assert any(item.code == "UNMATCHED_INTERVAL_AT_EOF" for item in run_result.diagnostics)
+    assert any(item.code == "STALLED_EXACT_MERGE" for item in run_result.diagnostics)
 
 
 def test_snapshot_records_degraded_emission(tmp_path: Path) -> None:

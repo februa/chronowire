@@ -26,6 +26,7 @@ class PortBuffer(Generic[T]):
 
     Args:
         buffer_id: PortablePlanIRと対応するrun-local buffer ID。
+        max_items: 同時保持できるitem数。正の整数。
 
     境界条件:
         itemは全consumerが通過するまで一度だけ保持する。consumerがない
@@ -36,8 +37,11 @@ class PortBuffer(Generic[T]):
         ValueError: cursor IDを重複登録した場合。
     """
 
-    def __init__(self, buffer_id: int) -> None:
+    def __init__(self, buffer_id: int, max_items: int = 1) -> None:
+        if max_items <= 0:
+            raise ValueError("PortBuffer max_items must be positive")
         self.buffer_id = buffer_id
+        self.max_items = max_items
         self._items: deque[T] = deque()
         self._start_position = 0
         self._next_position = 0
@@ -63,12 +67,34 @@ class PortBuffer(Generic[T]):
         self._cursors[cursor_id] = cursor
         return cursor
 
+    def unregister_consumer(self, cursor_id: int) -> None:
+        """停止したconsumerを解除し、不要になった共有prefixを解放する。
+
+        Raises:
+            KeyError: cursorが登録されていない場合。
+        """
+
+        self._cursor(cursor_id)
+        del self._cursors[cursor_id]
+        self._reclaim_consumed_prefix()
+
+    def can_publish(self, count: int = 1) -> bool:
+        """count件をdropなしで原子的に追加できる場合にTrueを返す。"""
+
+        if count < 0:
+            raise ValueError("publish count must not be negative")
+        return not self._cursors or len(self._items) + count <= self.max_items
+
     def publish(self, item: T) -> None:
         """itemを一度だけ末尾へ追加する。
 
         consumerがない場合は同期観測完了後の値を保持しない。
         """
 
+        if not self.can_publish():
+            raise BufferError(
+                f"buffer {self.buffer_id} capacity {self.max_items} would be exceeded"
+            )
         self._next_position += 1
         if not self._cursors:
             self._start_position = self._next_position
@@ -150,14 +176,19 @@ class CursorQueue(Generic[T]):
     def __init__(self, buffer: PortBuffer[T], cursor_id: int) -> None:
         self._buffer = buffer
         self._cursor_id = cursor_id
+        self._closed = False
 
     def __bool__(self) -> bool:
-        return self._buffer.pending_count(self._cursor_id) > 0
+        return not self._closed and self._buffer.pending_count(self._cursor_id) > 0
 
     def __len__(self) -> int:
+        if self._closed:
+            return 0
         return self._buffer.pending_count(self._cursor_id)
 
     def __getitem__(self, index: int) -> T:
+        if self._closed:
+            raise IndexError("CursorQueue is closed")
         if index != 0:
             raise IndexError("CursorQueue supports only head access")
         item = self._buffer.peek(self._cursor_id)
@@ -169,3 +200,11 @@ class CursorQueue(Generic[T]):
         """先頭itemを返して対応consumer cursorを一件進める。"""
 
         return self._buffer.pop(self._cursor_id)
+
+    def close(self) -> None:
+        """consumerを停止し、以後このqueueを空として扱う。"""
+
+        if self._closed:
+            return
+        self._buffer.unregister_consumer(self._cursor_id)
+        self._closed = True

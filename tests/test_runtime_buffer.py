@@ -28,7 +28,7 @@ def test_fan_out_keeps_one_shared_item_until_all_consumers_advance() -> None:
 def test_cursor_queue_preserves_independent_fifo_positions() -> None:
     """consumerごとのFIFO位置が互いに影響せず、値本体だけを共有する。"""
 
-    buffer = PortBuffer[int](buffer_id=3)
+    buffer = PortBuffer[int](buffer_id=3, max_items=2)
     buffer.register_consumer(20)
     buffer.register_consumer(21)
     first = CursorQueue(buffer, 20)
@@ -68,3 +68,34 @@ def test_port_without_consumers_does_not_retain_items() -> None:
 
     assert buffer.retained_count == 0
     assert buffer.high_watermark == 0
+
+
+def test_capacity_applies_to_shared_retention_without_partial_publish() -> None:
+    """遅いconsumerがいる場合は保持上限を越えるpublishを拒否する。"""
+
+    buffer = PortBuffer[int](buffer_id=6, max_items=2)
+    buffer.register_consumer(40)
+    buffer.publish(1)
+    buffer.publish(2)
+
+    assert not buffer.can_publish()
+    with pytest.raises(BufferError, match="capacity 2"):
+        buffer.publish(3)
+    assert buffer.retained_count == 2
+
+
+def test_closing_stalled_cursor_reclaims_shared_prefix() -> None:
+    """停止Nodeのcursor解除後は他consumerが通過済みのprefixを解放する。"""
+
+    buffer = PortBuffer[int](buffer_id=8, max_items=2)
+    buffer.register_consumer(50)
+    buffer.register_consumer(51)
+    fast = CursorQueue(buffer, 50)
+    stalled = CursorQueue(buffer, 51)
+    buffer.publish(1)
+    assert fast.popleft() == 1
+
+    stalled.close()
+
+    assert buffer.retained_count == 0
+    assert not stalled

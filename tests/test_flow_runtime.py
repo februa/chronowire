@@ -1,5 +1,6 @@
 """Flow、compile、runtimeのv0.1契約を検証する。"""
 
+from collections.abc import Iterator
 from fractions import Fraction
 
 import pytest
@@ -41,6 +42,19 @@ class _RequestRecordingSource:
             cw.LogicalTime(end.numerator, 1, end.denominator),
         )
         return cw.SourceBatch((cw.Emission(len(self.durations), interval, 0),))
+
+
+class _CountingIterable:
+    """Schedulerがfinite Sourceを何件先行取得したか記録する。"""
+
+    def __init__(self, count: int) -> None:
+        self.count = count
+        self.yielded = 0
+
+    def __iter__(self) -> Iterator[int]:
+        for value in range(self.count):
+            self.yielded += 1
+            yield value
 
 
 def test_fan_out_executes_common_ancestor_once() -> None:
@@ -126,6 +140,40 @@ def test_latest_state_uses_value_at_or_before_main_interval() -> None:
     result = cw.compile([cw.output(combined, collector=cw.Bounded(3))]).run()
 
     assert _values(result.outputs[0]) == [11, 22, 33]
+
+
+def test_exact_merge_stall_stops_unneeded_pull_before_source_eof() -> None:
+    """生成不能intervalを検出した経路がfinite Sourceを末尾まで先行取得しない。"""
+
+    values = _CountingIterable(100)
+    source = cw.Flow(values)
+    framed = source.frame(2)
+    merged = source.map(lambda value, *, frame: (value, frame), frame=framed)
+
+    result = cw.compile([cw.output(merged, collector=cw.Latest())]).run()
+
+    assert values.yielded == 2
+    assert result.outputs[0].emissions == ()
+    assert any(item.code == "STALLED_EXACT_MERGE" for item in result.diagnostics)
+
+
+def test_stalled_merge_releases_cursors_for_independent_output() -> None:
+    """停止mergeのcursorを解放し、同じSourceの独立終端はEOFまで継続する。"""
+
+    values = _CountingIterable(5)
+    source = cw.Flow(values)
+    framed = source.frame(2)
+    merged = source.map(lambda value, *, frame: (value, frame), frame=framed)
+    result = cw.compile(
+        [
+            cw.output(merged, collector=cw.Latest()),
+            cw.output(source, collector=cw.Bounded(5)),
+        ]
+    ).run()
+
+    assert values.yielded == 5
+    assert _values(result.outputs[1]) == [0, 1, 2, 3, 4]
+    assert not any(item.code == "SCHEDULER_DEADLOCK" for item in result.diagnostics)
 
 
 def test_plan_run_resets_runtime_state() -> None:
