@@ -43,14 +43,7 @@ uv add "chronowire @ git+https://github.com/februa/chronowire.git@v0.1.0.dev0"
 python -m pip install "chronowire @ git+https://github.com/februa/chronowire.git@v0.1.0.dev0"
 ```
 
-PyPIへ`0.1.0.dev0`を公開した後は、通常のversion指定も利用できる。
-
-```bash
-uv add "chronowire==0.1.0.dev0"
-python -m pip install "chronowire==0.1.0.dev0"
-```
-
-`0.1.0.dev0`はv0.1 release gate前の開発版である。releaseとPyPI Trusted Publishingの手順は[RELEASING.md](RELEASING.md)を参照する。
+`0.1.0.dev0`はv0.1 release gate前の開発版であり、0.xの間はGitHub tagからinstallする。PyPIへは、Python/C++ Executor、継続streaming、評価例、API usabilityを確認したv1.0から正式公開する。release方針は[RELEASING.md](RELEASING.md)を参照する。
 
 ## 開発環境
 

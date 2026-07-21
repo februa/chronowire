@@ -8,7 +8,25 @@ permissions:
   contents: read
 
 jobs:
+  version-gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Reject pre-v1 PyPI publication
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+
+          tag = os.environ["RELEASE_TAG"]
+          if re.fullmatch(r"v[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag) is None:
+              raise SystemExit("PyPI publication requires a stable v1.0.0 or later tag")
+          PY
+
   build:
+    needs: version-gate
     runs-on: ubuntu-latest
 
     steps:
@@ -18,6 +36,8 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Verify release tag and package version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           python - <<'PY'
           import os
@@ -25,7 +45,7 @@ jobs:
           import tomllib
 
           version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
-          tag = os.environ["GITHUB_REF_NAME"]
+          tag = os.environ["RELEASE_TAG"]
           if tag != f"v{version}":
               raise SystemExit(f"release tag {tag!r} does not match package version {version!r}")
           PY
