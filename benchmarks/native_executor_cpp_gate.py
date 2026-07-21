@@ -24,7 +24,7 @@ from chronowire._cython_executor import run_f64_vector_rate_frame
 from chronowire_reference import CythonCbfBackend, FixedCbfKernel
 from chronowire_reference._cython_cbf import run_fixed_cbf_batch
 
-_SCHEMA_VERSION = "0.1"
+_SCHEMA_VERSION = "0.2"
 
 
 @dataclass(frozen=True)
@@ -92,6 +92,44 @@ class CopyAccounting:
 
 
 @dataclass(frozen=True)
+class CppExecutorMeasurement:
+    """CppExecutorのsession生成込みと構築済みsession実行を分離した測定値。
+
+    Args:
+        end_to_end: `ExecutionPlan.run(executor=CppExecutor())`のlatency。
+        session_run: 構築済みrun-local C++ sessionのlatency。
+        cython_collected_end_to_end: 全frameをBounded保持するCython latency。
+        cpp_collected_end_to_end: 全frameをBounded保持するC++ latency。
+        end_to_end_samples_per_second: session生成込みの入力throughput。
+        session_samples_per_second: 構築済みsessionの入力throughput。
+        speedup_over_cython: Cython/Cpp end-to-end p50比。
+        session_speedup_over_cython: Cython/Cpp session p50比。
+        collected_speedup_over_cython: Bounded保持時のCython/Cpp p50比。
+        runtime_metrics: C++内部区間と境界の直近計測値。
+        collected_runtime_metrics: Bounded保持時のC++内部計測値。
+        python_heap_peak_bytes: session生成込みrunのPython heap peak。
+        collected_python_heap_peak_bytes: Bounded保持時のPython heap peak。
+
+    境界条件:
+        NoCollect経路なのでruntime_metricsのoutput boundary byteは0になる。
+    """
+
+    end_to_end: LatencyDistribution
+    session_run: LatencyDistribution
+    cython_collected_end_to_end: LatencyDistribution
+    cpp_collected_end_to_end: LatencyDistribution
+    end_to_end_samples_per_second: float
+    session_samples_per_second: float
+    speedup_over_cython: float
+    session_speedup_over_cython: float
+    collected_speedup_over_cython: float
+    runtime_metrics: cw.CppRuntimeMetrics
+    collected_runtime_metrics: cw.CppRuntimeMetrics
+    python_heap_peak_bytes: int
+    collected_python_heap_peak_bytes: int
+
+
+@dataclass(frozen=True)
 class BenchmarkCase:
     """一つのblock sizeについて得たC++移行判断指標を保持する。
 
@@ -119,6 +157,7 @@ class BenchmarkCase:
     accounted_calls_share_percent: float
     python_heap_peak_bytes: int
     copy_accounting: CopyAccounting
+    cpp: CppExecutorMeasurement
 
 
 @dataclass(frozen=True)
@@ -265,7 +304,13 @@ def _run_case(
         [cw.output(output, collector=cw.NoCollect())],
         backend=CythonCbfBackend(),
     )
+    frame_count = sample_count // block_size
+    collected_plan = cw.compile(
+        [cw.output(output, collector=cw.Bounded(frame_count))],
+        backend=CythonCbfBackend(),
+    )
     executor = cw.CythonExecutor()
+    cpp_executor = cw.CppExecutor()
 
     def run_end_to_end() -> object:
         return plan.run(executor=executor)
@@ -273,9 +318,29 @@ def _run_case(
     first_result = run_end_to_end()
     if not isinstance(first_result, cw.RunResult):
         raise RuntimeError("Cython benchmark did not return RunResult")
-    frame_count = sample_count // block_size
     if first_result.outputs[0].received_count != frame_count:
         raise RuntimeError("Cython benchmark frame count does not match the fixed grid")
+
+    def run_cpp_end_to_end() -> object:
+        return plan.run(executor=cpp_executor)
+
+    cpp_session = plan.create_session(executor=cpp_executor)
+    cpp_collected_session = collected_plan.create_session(executor=cpp_executor)
+
+    def run_cpp_session() -> object:
+        return cpp_session.run()
+
+    def run_cython_collected_end_to_end() -> object:
+        return collected_plan.run(executor=executor)
+
+    def run_cpp_collected_end_to_end() -> object:
+        return collected_plan.run(executor=cpp_executor)
+
+    cpp_reference = run_cpp_session()
+    if cpp_reference != first_result:
+        raise RuntimeError("CppExecutor benchmark trace differs from CythonExecutor")
+    if cpp_collected_session.run() != run_cython_collected_end_to_end():
+        raise RuntimeError("CppExecutor collected trace differs from CythonExecutor")
 
     def run_source_materialization() -> object:
         return source_values_contract.emissions()
@@ -410,6 +475,26 @@ def _run_case(
         warmups=warmups,
         repeats=repeats,
     )
+    cpp_end_to_end = _measure(run_cpp_end_to_end, warmups=warmups, repeats=repeats)
+    cpp_session_run = _measure(run_cpp_session, warmups=warmups, repeats=repeats)
+    cython_collected_end_to_end = _measure(
+        run_cython_collected_end_to_end,
+        warmups=warmups,
+        repeats=repeats,
+    )
+    cpp_collected_end_to_end = _measure(
+        run_cpp_collected_end_to_end,
+        warmups=warmups,
+        repeats=repeats,
+    )
+    cpp_session.run()
+    cpp_metrics = getattr(cpp_session, "last_metrics", None)
+    if not isinstance(cpp_metrics, cw.CppRuntimeMetrics):
+        raise RuntimeError("CppExecutor benchmark did not expose native runtime metrics")
+    cpp_collected_session.run()
+    cpp_collected_metrics = getattr(cpp_collected_session, "last_metrics", None)
+    if not isinstance(cpp_collected_metrics, cw.CppRuntimeMetrics):
+        raise RuntimeError("CppExecutor collected benchmark did not expose native metrics")
     native_calls_p50 = scheduler_call.p50_ns + kernel_call.p50_ns
     accounted_calls_p50 = (
         source_materialization_call.p50_ns
@@ -443,6 +528,21 @@ def _run_case(
             block_size=block_size,
             channels=channels,
             beams=beams,
+        ),
+        CppExecutorMeasurement(
+            cpp_end_to_end,
+            cpp_session_run,
+            cython_collected_end_to_end,
+            cpp_collected_end_to_end,
+            sample_count * 1_000_000_000.0 / cpp_end_to_end.p50_ns,
+            sample_count * 1_000_000_000.0 / cpp_session_run.p50_ns,
+            end_to_end.p50_ns / cpp_end_to_end.p50_ns,
+            end_to_end.p50_ns / cpp_session_run.p50_ns,
+            cython_collected_end_to_end.p50_ns / cpp_collected_end_to_end.p50_ns,
+            cpp_metrics,
+            cpp_collected_metrics,
+            _python_heap_peak(run_cpp_end_to_end),
+            _python_heap_peak(run_cpp_collected_end_to_end),
         ),
     )
 

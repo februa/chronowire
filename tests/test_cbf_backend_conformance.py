@@ -9,11 +9,12 @@ from chronowire_reference import CythonCbfBackend, FixedCbfKernel, run_cbf_confo
 def test_python_cython_and_mixed_cbf_traces_are_equivalent() -> None:
     """CBF実装言語とPython境界の有無で意味論traceを変えない。"""
 
-    python, cython, mixed, cython_executor = run_cbf_conformance()
+    python, cython, mixed, cython_executor, cpp_executor = run_cbf_conformance()
 
     assert cython.trace == python.trace
     assert mixed.trace == python.trace
     assert cython_executor.trace == python.trace
+    assert cpp_executor.trace == python.trace
     assert [item.value for item in python.trace] == [
         ((1.0, 2.0, 3.0, 4.0),),
         ((5.0, 6.0, 7.0, 8.0),),
@@ -24,7 +25,7 @@ def test_python_cython_and_mixed_cbf_traces_are_equivalent() -> None:
 def test_cython_cbf_abi_and_mixed_stage_boundaries_are_explicit() -> None:
     """Cython ABIと前後のPython callback境界をPlanへ記録する。"""
 
-    python, cython, mixed, cython_executor = run_cbf_conformance()
+    python, cython, mixed, cython_executor, cpp_executor = run_cbf_conformance()
 
     assert python.kernel_abi == "python-v1"
     assert cython.kernel_abi == "chronowire.reference.fixed_cbf_f64.v1"
@@ -35,6 +36,10 @@ def test_cython_cbf_abi_and_mixed_stage_boundaries_are_explicit() -> None:
     assert cython_executor.stage_domains == cython.stage_domains
     assert cython_executor.native_buffer_count == 4
     assert cython_executor.opaque_port_count == 0
+    assert cpp_executor.kernel_abi == cython_executor.kernel_abi
+    assert cpp_executor.stage_domains == cython_executor.stage_domains
+    assert cpp_executor.native_buffer_count == cython_executor.native_buffer_count
+    assert cpp_executor.opaque_port_count == 0
 
 
 def test_cython_executor_cbf_accepts_empty_fixed_shape_source() -> None:

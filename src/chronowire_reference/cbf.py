@@ -145,6 +145,20 @@ class _CompiledCythonCbf:
 
         return _CythonCbfSession(self.weights)
 
+    def create_native_runtime_binding(self) -> cw.NativeKernelRuntimeBinding:
+        """CppExecutorへ固定CBF係数をimmutable f64 bindingとして渡す。"""
+
+        weight_buffer = array("d", (item for beam in self.weights for item in beam))
+        if weight_buffer.itemsize != 8:
+            raise RuntimeError("fixed CBF native binding requires 64-bit double")
+        return cw.NativeKernelRuntimeBinding(
+            self.abi_version,
+            self.process_model,
+            "float64",
+            (len(self.weights), len(self.weights[0])),
+            weight_buffer.tobytes(),
+        )
+
     def resolve_output_shape(self, input_shape: tuple[int, ...]) -> tuple[int, ...]:
         """`frame_size x channels`を`beams x frame_size`へ解決する。"""
 
@@ -293,8 +307,8 @@ def _run(
     )
 
 
-def _run_cython_executor() -> CbfRun:
-    """固定shape SourceからCBFまでをCython Executorでbatch実行する。"""
+def _run_native_executor(name: str, executor: cw.Executor) -> CbfRun:
+    """固定shape SourceからCBFまでを指定したnative Executorでbatch実行する。"""
 
     source = cw.Flow(cw.f64_vector_source(_source(), width=2))
     frames = source.rate(4).frame(4)
@@ -303,10 +317,10 @@ def _run_cython_executor() -> CbfRun:
         [cw.output(beams, collector=cw.Bounded(2))],
         backend=CythonCbfBackend(),
     )
-    result = plan.run(executor=cw.CythonExecutor())
+    result = plan.run(executor=executor)
     abi = next(item for item in plan.portable_ir.kernel_abis if item.native_compatible)
     return CbfRun(
-        "cython_executor_cbf",
+        name,
         tuple(
             CbfTraceItem(
                 item.value,
@@ -325,12 +339,13 @@ def _run_cython_executor() -> CbfRun:
     )
 
 
-def run_cbf_conformance() -> tuple[CbfRun, CbfRun, CbfRun, CbfRun]:
-    """Python、Cython Kernel、混在、Cython Executorの四構成を実行する。"""
+def run_cbf_conformance() -> tuple[CbfRun, CbfRun, CbfRun, CbfRun, CbfRun]:
+    """Python/Cython KernelとCython/C++ Executorの五構成を実行する。"""
 
     return (
         _run("python_cbf", backend="python", mixed=False),
         _run("cython_cbf", backend=CythonCbfBackend(), mixed=False),
         _run("mixed_python_cython", backend=CythonCbfBackend(), mixed=True),
-        _run_cython_executor(),
+        _run_native_executor("cython_executor_cbf", cw.CythonExecutor()),
+        _run_native_executor("cpp_executor_cbf", cw.CppExecutor()),
     )

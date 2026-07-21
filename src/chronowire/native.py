@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+from array import array
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from fractions import Fraction
 from functools import reduce
-from math import isfinite
+from math import isfinite, lcm
 from operator import mul
 
 from .kernel import CompileContext, CompiledKernel, RunContext
-from .model import Emission, LogicalInterval, LogicalTime
+from .model import Emission, EmissionStatus, LogicalInterval, LogicalTime
+
+_I64_MIN = -(2**63)
+_I64_MAX = 2**63 - 1
+_STATUS_TO_NATIVE = {
+    EmissionStatus.OK: 0,
+    EmissionStatus.DEGRADED: 1,
+    EmissionStatus.INVALID: 2,
+}
 
 
 def _normalized_f64(value: int | float) -> float:
@@ -56,6 +66,97 @@ class NativeValueBatch:
         return memoryview(self.values).cast("d")
 
 
+@dataclass(frozen=True)
+class NativeF64Ingress:
+    """CppExecutor sessionへbindする固定shape read-only f64 Source batch。
+
+    Args:
+        values: item-major contiguous native-endian float64。
+        start_ticks: source timebase上のsigned i64 interval start列。
+        end_ticks: source timebase上のsigned i64 interval end列。
+        statuses: `OK=0, DEGRADED=1, INVALID=2`のu8列。
+        item_count: Source item件数。
+        width: 一つのitemのf64要素数。
+        timebase_denominator: 一tickを`1 / denominator`論理秒とする正の分母。
+
+    Raises:
+        ValueError: byte長、件数、shapeまたはtimebaseが不正な場合。
+
+    境界条件:
+        Diagnostic本体はPython bindingが所有し、native runtimeはsource indexだけを伝播する。
+    """
+
+    values: bytes
+    start_ticks: bytes
+    end_ticks: bytes
+    statuses: bytes
+    item_count: int
+    width: int
+    timebase_denominator: int
+
+    def __post_init__(self) -> None:
+        if self.item_count < 0 or self.width <= 0 or self.timebase_denominator <= 0:
+            raise ValueError("native ingress count, width, and timebase must be valid")
+        if len(self.values) != self.item_count * self.width * 8:
+            raise ValueError("native ingress value byte length does not match its shape")
+        if len(self.start_ticks) != self.item_count * 8:
+            raise ValueError("native ingress start tick byte length does not match item count")
+        if len(self.end_ticks) != self.item_count * 8:
+            raise ValueError("native ingress end tick byte length does not match item count")
+        if len(self.statuses) != self.item_count:
+            raise ValueError("native ingress status byte length does not match item count")
+        if any(item > 2 for item in self.statuses):
+            raise ValueError("native ingress status is outside the StreamItem ABI")
+
+
+def _checked_i64_ticks(value: Fraction, denominator: int) -> int:
+    ticks = value * denominator
+    if ticks.denominator != 1 or not _I64_MIN <= ticks.numerator <= _I64_MAX:
+        raise ValueError("native ingress logical time is outside signed i64 tick range")
+    return ticks.numerator
+
+
+def _pack_vector_ingress(
+    emissions: tuple[Emission[tuple[float, ...]], ...],
+    width: int,
+) -> NativeF64Ingress:
+    denominator = 1
+    for emission in emissions:
+        denominator = lcm(
+            denominator,
+            emission.interval.start.as_fraction().denominator,
+            emission.interval.end.as_fraction().denominator,
+        )
+        if denominator > _I64_MAX:
+            raise ValueError("native ingress timebase exceeds signed i64 range")
+    values = array("d", (value for emission in emissions for value in emission.value))
+    starts = array(
+        "q",
+        (
+            _checked_i64_ticks(emission.interval.start.as_fraction(), denominator)
+            for emission in emissions
+        ),
+    )
+    ends = array(
+        "q",
+        (
+            _checked_i64_ticks(emission.interval.end.as_fraction(), denominator)
+            for emission in emissions
+        ),
+    )
+    if values.itemsize != 8 or starts.itemsize != 8 or ends.itemsize != 8:
+        raise RuntimeError("native ingress requires 64-bit double and signed integer arrays")
+    return NativeF64Ingress(
+        values.tobytes(),
+        starts.tobytes(),
+        ends.tobytes(),
+        bytes(_STATUS_TO_NATIVE[emission.status] for emission in emissions),
+        len(emissions),
+        width,
+        denominator,
+    )
+
+
 VectorF64 = tuple[float, ...]
 
 
@@ -73,6 +174,8 @@ class F64VectorSourceValues:
 
     items: tuple[VectorF64 | Emission[VectorF64], ...]
     width: int
+    _emission_items: tuple[Emission[VectorF64], ...] = field(init=False, repr=False)
+    _native_ingress: NativeF64Ingress = field(init=False, repr=False)
 
     def __init__(
         self,
@@ -106,18 +209,8 @@ class F64VectorSourceValues:
                     value.metadata,
                 )
             )
-        object.__setattr__(self, "items", tuple(normalized))
-        object.__setattr__(self, "width", width)
-
-    def __iter__(self) -> Iterator[VectorF64 | Emission[VectorF64]]:
-        """正規化済みvectorまたはEmissionをSource順で返す。"""
-
-        return iter(self.items)
-
-    def emissions(self) -> tuple[Emission[VectorF64], ...]:
-        """Cython境界用に全vectorを明示Emissionへ正規化する。"""
-
-        return tuple(
+        normalized_items = tuple(normalized)
+        emissions = tuple(
             item
             if isinstance(item, Emission)
             else Emission(
@@ -125,8 +218,27 @@ class F64VectorSourceValues:
                 LogicalInterval(LogicalTime(index), LogicalTime(index + 1)),
                 index,
             )
-            for index, item in enumerate(self.items)
+            for index, item in enumerate(normalized_items)
         )
+        object.__setattr__(self, "items", normalized_items)
+        object.__setattr__(self, "width", width)
+        object.__setattr__(self, "_emission_items", emissions)
+        object.__setattr__(self, "_native_ingress", _pack_vector_ingress(emissions, width))
+
+    def __iter__(self) -> Iterator[VectorF64 | Emission[VectorF64]]:
+        """正規化済みvectorまたはEmissionをSource順で返す。"""
+
+        return iter(self.items)
+
+    def emissions(self) -> tuple[Emission[VectorF64], ...]:
+        """全vectorを一度だけ正規化した不変Emission列として返す。"""
+
+        return self._emission_items
+
+    def native_ingress(self) -> NativeF64Ingress:
+        """CppExecutorがPython値を再走査せずbindできるimmutable batchを返す。"""
+
+        return self._native_ingress
 
 
 def f64_vector_source(

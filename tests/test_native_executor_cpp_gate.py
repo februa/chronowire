@@ -17,7 +17,7 @@ def test_cpp_gate_benchmark_records_latency_copy_and_boundary_metrics() -> None:
         repeats=2,
     )
 
-    assert report.schema_version == "0.1"
+    assert report.schema_version == "0.2"
     assert report.repeats == 2
     case = report.cases[0]
     assert case.output_frames == 2
@@ -43,6 +43,18 @@ def test_cpp_gate_benchmark_records_latency_copy_and_boundary_metrics() -> None:
     assert case.copy_accounting.scheduler_return_copy_bytes == 8 * 4 * 2 * 2
     assert case.copy_accounting.kernel_return_copy_bytes == 8 * 4 * 1 * 2
     assert case.copy_accounting.total_payload_copy_bytes == 576
+    assert case.cpp.end_to_end.p50_ns > 0
+    assert case.cpp.session_run.p50_ns > 0
+    assert case.cpp.cython_collected_end_to_end.p50_ns > 0
+    assert case.cpp.cpp_collected_end_to_end.p50_ns > 0
+    assert case.cpp.end_to_end_samples_per_second > 0
+    assert case.cpp.session_samples_per_second > 0
+    assert case.cpp.runtime_metrics.output_boundary_bytes == 0
+    assert case.cpp.collected_runtime_metrics.output_boundary_bytes == 8 * 4 * 1 * 2
+    assert case.cpp.runtime_metrics.python_native_transitions == 2
+    assert case.cpp.runtime_metrics.stage_python_dispatches == 0
+    assert case.cpp.python_heap_peak_bytes > 0
+    assert case.cpp.collected_python_heap_peak_bytes > 0
 
 
 @pytest.mark.parametrize("block_sizes", [(), (0,), (3,)])

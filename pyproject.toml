@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chronowire"
-version = "0.3.0.dev0"
+version = "0.4.0.dev0"
 description = "Explicitly compiled streaming graphs with logical-time diagnostics."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -48,11 +48,17 @@ sources = ["src/chronowire/_cython_executor.pyx"]
 name = "chronowire_reference._cython_cbf"
 sources = ["src/chronowire_reference/_cython_cbf.pyx"]
 
+[[tool.setuptools.ext-modules]]
+name = "chronowire._cpp_executor"
+sources = ["src/chronowire/_cpp_executor.pyx", "src/chronowire/cpp_runtime.cpp"]
+language = "c++"
+extra-compile-args = ["-std=c++17"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-chronowire = ["py.typed", "_cython_executor.pyi"]
+chronowire = ["py.typed", "_cython_executor.pyi", "_cpp_executor.pyi", "cpp_runtime.hpp"]
 chronowire_reference = ["_cython_cbf.pyi", "py.typed"]
 
 [tool.pytest.ini_options]

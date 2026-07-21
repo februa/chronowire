@@ -9,6 +9,7 @@ __pycache__/
 build/
 dist/
 src/chronowire/_cython_executor.c
+src/chronowire/_cpp_executor.cpp
 src/chronowire_reference/_cython_cbf.c
 .DS_Store
 *.swp

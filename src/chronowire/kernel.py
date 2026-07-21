@@ -164,6 +164,54 @@ class NativeValueSchemaProvider(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class NativeKernelRuntimeBinding:
+    """PortablePlanIRのKernel slotへ注入するprocess-local native定数。
+
+    Args:
+        abi_version: PortablePlanIRのKernel ABIと一致すべきversion付きID。
+        process_model: native runtimeが選択する処理モデル。
+        parameter_dtype: parameter bufferの要素型。
+        parameter_shape: parameter bufferの固定shape。
+        parameter_bytes: native endianで連続したimmutable parameter値。
+
+    Raises:
+        ValueError: ABI、dtype、shapeまたはbyte長が自己矛盾する場合。
+
+    境界条件:
+        pointerやallocatorは保持せず、binding自身がimmutable bytesを所有する。
+    """
+
+    abi_version: str
+    process_model: str
+    parameter_dtype: str
+    parameter_shape: tuple[int, ...]
+    parameter_bytes: bytes
+
+    def __post_init__(self) -> None:
+        if not self.abi_version or not self.process_model:
+            raise ValueError("native Kernel runtime binding requires ABI and process model")
+        if self.parameter_dtype != "float64":
+            raise ValueError("native Kernel runtime binding currently requires float64 parameters")
+        if not self.parameter_shape or any(item <= 0 for item in self.parameter_shape):
+            raise ValueError("native Kernel runtime binding requires a positive fixed shape")
+        element_count = 1
+        for item in self.parameter_shape:
+            element_count *= item
+        if len(self.parameter_bytes) != element_count * 8:
+            raise ValueError("native Kernel parameter byte length does not match its shape")
+
+
+@runtime_checkable
+class NativeRuntimeBindingProvider(Protocol):
+    """CppExecutor用のprocess-local Kernel bindingを生成するprotocol。"""
+
+    def create_native_runtime_binding(self) -> NativeKernelRuntimeBinding:
+        """pointerを含まないimmutable native定数bindingを返す。"""
+
+        ...
+
+
 @runtime_checkable
 class Kernel(Protocol[T_co]):
     """Config解決と作業領域準備をrunから分離するprotocol。"""

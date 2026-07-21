@@ -24,7 +24,14 @@ from .errors import (
     PlanSessionError,
     SourceExecutionError,
 )
-from .executor import Executor, ExecutorPlanSession, ExecutorSession, PythonExecutor
+from .executor import (
+    CppExecutor,
+    CythonExecutor,
+    Executor,
+    ExecutorPlanSession,
+    ExecutorSession,
+    PythonExecutor,
+)
 from .extension import (
     Always,
     Every,
@@ -1503,6 +1510,10 @@ class ExecutionPlan:
 
         if executor == "python":
             return PythonExecutor()
+        if executor == "cython":
+            return CythonExecutor()
+        if executor == "cpp":
+            return CppExecutor()
         if isinstance(executor, str):
             raise ValueError(f"unsupported executor {executor!r}")
         if not isinstance(executor, Executor):

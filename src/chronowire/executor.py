@@ -161,3 +161,68 @@ class CythonExecutor:
             "CythonExecutor prototype does not support PlanSession; "
             "contract=cython_continuous_session"
         )
+
+
+@dataclass(frozen=True)
+class CppRuntimeMetrics:
+    """一回のC++ runtime実行で観測したnative境界指標。
+
+    Args:
+        scheduler_ns: RATEとFRAMEを含むC++ Scheduler時間。
+        kernel_ns: C++固定CBF処理時間。
+        output_select_ns: native collector policy適用時間。
+        owned_input_bytes: sessionが所有するSource、時刻、status、Kernel定数byte。
+        output_boundary_bytes: Python観測境界へcopyした値byte。
+        python_native_transitions: 一回のrunでPython/native境界を跨ぐ回数。
+        stage_python_dispatches: native Stage内のPython method dispatch数。
+
+    境界条件:
+        Pythonでの公開Emission復元時間とobject memoryは含まない。
+    """
+
+    scheduler_ns: int
+    kernel_ns: int
+    output_select_ns: int
+    owned_input_bytes: int
+    output_boundary_bytes: int
+    python_native_transitions: int = 2
+    stage_python_dispatches: int = 0
+
+
+@dataclass(frozen=True)
+class CppExecutor:
+    """compile済みPortablePlanIRをrun-local C++ runtimeで運用するExecutor。"""
+
+    name: str = "cpp"
+
+    def create_session(
+        self,
+        plan: ExecutionPlan,
+        extension_bindings: Mapping[str, Extension] | None,
+    ) -> ExecutorSession:
+        """検証済みPlanから自立したC++一回実行sessionを生成する。
+
+        Raises:
+            ValueError: Extension bindingまたは最小C++契約外Planの場合。
+        """
+
+        if extension_bindings:
+            raise ValueError("CppExecutor contract=extension_stage is not implemented")
+        from .cpp_executor import CppExecutionSession
+
+        return CppExecutionSession(plan)
+
+    def create_plan_session(
+        self,
+        plan: ExecutionPlan,
+        extension_bindings: Mapping[str, Extension] | None,
+        options: RuntimeOptions | None,
+    ) -> ExecutorPlanSession:
+        """未実装の継続C++ sessionを暗黙fallbackせず拒否する。"""
+
+        del plan, extension_bindings, options
+        from .errors import PlanSessionError
+
+        raise PlanSessionError(
+            "CppExecutor does not support PlanSession; contract=cpp_continuous_session"
+        )

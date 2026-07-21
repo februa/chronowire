@@ -137,3 +137,50 @@ native Sinkでは復元しない。Latest、Bounded、Extension、Python callbac
 
 性能改善率だけを報告せず、どの境界を除去した結果かをPlanと測定内訳から説明できることを
 CppExecutorの移行gateとする。
+
+## 9. 最小CppExecutor実装後の再測定
+
+### 9.1 実装条件
+
+`0.4.0.dev0`では、`f64_vector_source()`がSource宣言時にEmission列とnative-endian値、source timebase
+上のsigned i64 tick、statusを一度だけpackする。CppExecutorはPortablePlanIRのopcode、RATE period、
+FRAME size/hop、Kernel ABI、collector descriptorとprocess-local bindingからC++ sessionを生成する。
+
+C++ sessionは入力と固定CBF係数を所有し、`run()`中はGILを解放する。NoCollectではCBFを実行するが
+出力値をPythonへcopyしない。Latest/BoundedではC++側で保持対象を選択してから公開Emissionへ戻す。
+
+再測定日時は2026-07-21 23:34:44 UTC / 2026-07-22 08:34:44 JST、machineと入力条件は第3節と
+同一である。benchmark JSON schemaは`0.2`とした。
+
+### 9.2 結果
+
+| block | Cython NoCollect p50 ms | C++生成込み p50 ms | C++構築済みsession ms | NoCollect speedup | Cython Bounded ms | C++ Bounded ms | Bounded speedup |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 18.120 | 0.509 | 0.071 | 35.6x | 18.039 | 1.691 | 10.7x |
+| 256 | 17.605 | 0.486 | 0.071 | 36.2x | 17.802 | 1.424 | 12.5x |
+| 1024 | 17.631 | 0.484 | 0.071 | 36.5x | 17.595 | 1.406 | 12.5x |
+| 4096 | 17.600 | 0.504 | 0.071 | 34.9x | 17.535 | 1.374 | 12.8x |
+
+CppExecutorの直近内部計測では、RATE/FRAMEが約0.056 msから0.084 ms、固定CBFが約0.011 msだった。
+owned inputは392.1 KiB、NoCollectのoutput boundaryは0 byte、全frameを保持するBoundedでは128 KiB
+だった。Python heap peakはNoCollectで約2.9 KiB、Boundedで約964 KiBから1050 KiBだった。
+
+Cython値が初回の約36 msから約18 msへ下がったのは、Source EmissionをSource宣言時に一度だけ
+正規化するよう変更したためである。Cython Executorはrunごとの有理時刻検査とnative array packing、
+collector復元を引き続き行う。CppExecutorのsession生成込み約0.5 msと構築済み約0.071 msの差は、
+主にowned input/Kernel bindingのsession copyとPlan validationである。
+
+### 9.3 判定
+
+最小線形経路について、次を満たした。
+
+- PythonでFlowを記述・compileし、PortablePlanIRからC++ sessionを生成する
+- C++がRATE、FRAME、CBF、collector保持選択を一つのstate machineとして運用する
+- run中にGILを保持せず、native Stage内Python dispatchを0にする
+- NoCollectの値copyを0 byteにする
+- Python/Cython/C++で値、interval、sequence、status、Diagnosticを一致させる
+- 同じsessionを再実行してもcursor、status、collector状態を持ち越さない
+
+ただし、現runtimeは固定CBF ABIを直接認識する最小実証である。汎用function pointer ABI、複数native
+Kernel chain、継続PlanSession、Extension/Python callback境界、gap reset、INVALID partition、
+metadata table、fan-out共有寿命は未実装であり、CppExecutor v0.4の残件とする。

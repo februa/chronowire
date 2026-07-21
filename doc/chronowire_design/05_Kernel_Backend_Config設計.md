@@ -159,6 +159,12 @@ Python BackendまたはCython Backendでcompileできる。plain Python callable
 item shapeを一回だけ渡し、Kernelは`NativeValueBatch`を返す。出力shapeが入力shapeから決まる
 Kernelは`NativeValueSchemaProvider`でcompile時に解決し、推測ではなくPort schemaへ記録する。
 
+v0.4では`NativeRuntimeBindingProvider`が`NativeKernelRuntimeBinding`を生成する。PortablePlanIRは
+ABI version、process model、binding slotだけを保持し、固定係数等のprocess-local定数はdtype、shape、
+immutable bytesとして`ExecutionPlan.create_session()`時にCppExecutorへbindする。pointer、Python
+class、allocatorはIRへ含めない。最小固定CBFではCython Backendが生成したfactoryも同binding契約を
+提供するため、CppExecutorはPython Kernel sessionを呼ばずにABI IDと係数だけからC++処理を選択する。
+
 ## 2.3 backend境界
 
 backendが異なるNode間では以下の変換が発生し得る。

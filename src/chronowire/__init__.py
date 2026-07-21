@@ -25,7 +25,15 @@ from .errors import (
     SourceExecutionError,
     SynchronizationError,
 )
-from .executor import CythonExecutor, Executor, ExecutorPlanSession, ExecutorSession, PythonExecutor
+from .executor import (
+    CppExecutor,
+    CppRuntimeMetrics,
+    CythonExecutor,
+    Executor,
+    ExecutorPlanSession,
+    ExecutorSession,
+    PythonExecutor,
+)
 from .extension import (
     Always,
     Every,
@@ -61,6 +69,8 @@ from .kernel import (
     NativeBatchCompiledKernel,
     NativeBatchKernelSession,
     NativeCompiledKernel,
+    NativeKernelRuntimeBinding,
+    NativeRuntimeBindingProvider,
     NativeValueSchemaProvider,
     PythonBackend,
     RunContext,
@@ -82,6 +92,7 @@ from .native import (
     F64SourceValues,
     F64VectorSourceValues,
     IdentityF64Kernel,
+    NativeF64Ingress,
     NativeValueBatch,
     f64_source,
     f64_vector_source,
@@ -128,6 +139,8 @@ __all__ = [
     "CompiledKernel",
     "CompiledKernelSession",
     "Config",
+    "CppExecutor",
+    "CppRuntimeMetrics",
     "CythonExecutor",
     "Diagnostic",
     "DuplicateExtensionIdError",
@@ -170,6 +183,9 @@ __all__ = [
     "NativeBatchCompiledKernel",
     "NativeBatchKernelSession",
     "NativeCompiledKernel",
+    "NativeF64Ingress",
+    "NativeKernelRuntimeBinding",
+    "NativeRuntimeBindingProvider",
     "NativeValueBatch",
     "NativeValueSchemaProvider",
     "NoCollect",
