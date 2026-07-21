@@ -277,6 +277,12 @@ Python objectのdtypeやshapeを値の実行結果から推測しない。宣言
 `identity_f64`だけがversion付き実験ABI、workspace 0 byte、alignment 8 byte、
 native互換を宣言する。通常のIterableやPython callableからdtype/shapeを推測しない。
 
+同版は`StreamItemAbiDescriptor`と`NativeBufferDescriptor`も追加する。前者は共有timebaseの
+signed i64 tick、Portごとの暗黙単調u64 sequence、u8 status、Diagnostic provenance、
+metadata境界方式を固定する。
+後者はnative化可能なPortごとにvalue schema、item ABI、SoA layout、alignment、read-only、
+session-local ownershipを結び付ける。実pointer、allocator、Diagnostic objectはIRへ入れない。
+
 StageはPython Source、Python callback、Backend変更、観測Portで分割する。連続するRATE/FRAMEは`executor_opcode` Stageへまとめてよいが、観測Portを越えてまとめない。schema 0.1/0.2ではこれら三descriptorが存在しないため空tupleとして読み込む。
 
 ## 8. compile時のbuffer planning

@@ -28,6 +28,8 @@ def test_v03_plan_records_stage_value_schema_and_experimental_kernel_abi() -> No
     assert ir.kernel_abis[0].process_model == "python_object"
     assert not ir.kernel_abis[0].native_compatible
     assert ir.kernel_abis[0].workspace_size_bytes is None
+    assert ir.stream_item_abis == ()
+    assert ir.native_buffers == ()
 
 
 def test_v02_plan_without_native_descriptors_remains_readable() -> None:
@@ -38,6 +40,8 @@ def test_v02_plan_without_native_descriptors_remains_readable() -> None:
     del payload["value_schemas"]
     del payload["stages"]
     del payload["kernel_abis"]
+    del payload["stream_item_abis"]
+    del payload["native_buffers"]
 
     restored = cw.PortablePlanIR.from_dict(payload)
 
@@ -45,3 +49,5 @@ def test_v02_plan_without_native_descriptors_remains_readable() -> None:
     assert restored.value_schemas == ()
     assert restored.stages == ()
     assert restored.kernel_abis == ()
+    assert restored.stream_item_abis == ()
+    assert restored.native_buffers == ()

@@ -75,6 +75,7 @@ from .plan_ir import (
     EdgeDescriptor,
     ExtensionDescriptor,
     KernelAbiDescriptor,
+    NativeBufferDescriptor,
     NodeDescriptor,
     OutputDescriptor,
     PlanDiagnosticDescriptor,
@@ -83,6 +84,7 @@ from .plan_ir import (
     RationalDescriptor,
     SourceDescriptor,
     StageDescriptor,
+    StreamItemAbiDescriptor,
     TimeDescriptor,
     TriggerDescriptor,
     ValueSchemaDescriptor,
@@ -1083,6 +1085,37 @@ def _portable_plan_ir(
         for node in nodes
         if node.kind is NodeKind.MAP
     )
+    native_port_ids = tuple(
+        port.port_id for port in ports if port.value_schema_id != "python:opaque"
+    )
+    stream_item_abis = (
+        (
+            StreamItemAbiDescriptor(
+                "chronowire.stream_item.v1",
+                "structure_of_arrays",
+                "signed_i64_ticks_shared_rational_timebase",
+                "implicit_port_monotonic_u64",
+                "u8:ok=0,degraded=1,invalid=2",
+                "source_provenance_index_table",
+                "python_boundary_object_table",
+            ),
+        )
+        if native_port_ids
+        else ()
+    )
+    native_buffers = tuple(
+        NativeBufferDescriptor(
+            port.port_id,
+            port.value_schema_id,
+            "chronowire.stream_item.v1",
+            "structure_of_arrays",
+            8,
+            "session_owned_immutable_shared",
+            True,
+        )
+        for port in ports
+        if port.port_id in native_port_ids
+    )
     return PortablePlanIR(
         schema_version="0.3",
         kind="execution_plan",
@@ -1091,6 +1124,8 @@ def _portable_plan_ir(
         value_schemas=value_schemas,
         stages=stages,
         kernel_abis=kernel_abis,
+        stream_item_abis=stream_item_abis,
+        native_buffers=native_buffers,
         ports=ports,
         edges=edges,
         buffers=buffers,

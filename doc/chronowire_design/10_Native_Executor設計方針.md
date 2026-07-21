@@ -259,11 +259,17 @@ PortablePlanIR schema 0.3は最小`StageDescriptor`、`ValueSchemaDescriptor`、
 RATEとFRAMEは有理数periodを共通分母の整数tickへ変換し、native配列上の`nogil` loopで
 実行する。Pythonの`Emission`はcollector境界でだけ構築する。
 
-この限定経路では値、interval、sequence、OK status集計、空入力、重複frameを
-Python Executorと比較する。Python値、任意callback、Extension、EOF padding、
-`PlanSession`、DEGRADED/INVALIDとDiagnosticを伴う入力は未対応であり、Pythonへ
-暗黙fallbackせず契約名、Node、Portを含むエラーで拒否する。status/Diagnosticを含む
-native item ABIとnative CBFはPhase 4の契約固定後に接続する。
+この限定経路では値、interval、sequence、status集計、空入力、重複frameを
+Python Executorと比較する。native itemはstructure-of-arraysとし、論理時間は共有有理
+timebase上のsigned i64 tick、statusはu8、DiagnosticはSource provenance indexとして運ぶ。
+collector境界でだけ公開`Emission`とDiagnostic列を復元するため、同じSource Diagnosticが
+RATEで複製された場合の重複と順序も保存できる。DEGRADEDは値を保持し、INVALIDを受理しない
+MAPではPython Executorと同じ`INVALID_INPUT_PROPAGATED`を生成する。
+
+Python値、任意callback、Extension、EOF padding、`PlanSession`は未対応である。
+`INPUT_OVERRUN`はRATE cursorだけでなくFRAME履歴もresetする必要があるため、この段階では
+`contract=gap_reset`として拒否する。未対応契約はPythonへ暗黙fallbackせず、契約名、Node、
+Portを含むエラーにする。汎用metadata table、gap-aware frame state、native CBFはPhase 4で接続する。
 
 ### Phase 4: portable IRとnative buffer契約の固定
 

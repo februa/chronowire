@@ -528,6 +528,66 @@ class KernelAbiDescriptor:
 
 
 @dataclass(frozen=True)
+class StreamItemAbiDescriptor:
+    """native Stage内で値に付随するEmission情報の固定ABI。"""
+
+    item_abi_id: str
+    layout: str
+    logical_time_encoding: str
+    sequence_encoding: str
+    status_encoding: str
+    diagnostic_encoding: str
+    metadata_encoding: str
+
+    @classmethod
+    def from_dict(cls, value: object) -> StreamItemAbiDescriptor:
+        """JSON objectからStreamItem ABI descriptorを復元する。"""
+
+        data = _mapping(value, "stream item ABI descriptor")
+        return cls(
+            _string(data, "item_abi_id"),
+            _string(data, "layout"),
+            _string(data, "logical_time_encoding"),
+            _string(data, "sequence_encoding"),
+            _string(data, "status_encoding"),
+            _string(data, "diagnostic_encoding"),
+            _string(data, "metadata_encoding"),
+        )
+
+
+@dataclass(frozen=True)
+class NativeBufferDescriptor:
+    """Portの物理native buffer layoutと所有権要求を表す。"""
+
+    port_id: int
+    value_schema_id: str
+    item_abi_id: str
+    layout: str
+    alignment_bytes: int
+    ownership: str
+    read_only: bool
+
+    def __post_init__(self) -> None:
+        if self.alignment_bytes <= 0:
+            raise ValueError("native buffer alignment must be positive")
+
+    @classmethod
+    def from_dict(cls, value: object) -> NativeBufferDescriptor:
+        """JSON objectからnative buffer descriptorを復元する。"""
+
+        data = _mapping(value, "native buffer descriptor")
+        return cls(
+            _integer(data, "port_id"),
+            _string(data, "value_schema_id"),
+            _string(data, "item_abi_id"),
+            _string(data, "layout"),
+            _integer(data, "alignment_bytes"),
+            _string(data, "ownership"),
+            _boolean(data, "read_only"),
+        )
+
+
+@dataclass(frozen=True)
 class OutputDescriptor:
     """観測終端とcollectorのportable設定を表す。"""
 
@@ -655,7 +715,8 @@ class PortablePlanIR:
 
     Python callable、collector instance、pointer、allocatorは含めず、安定IDと
     descriptorだけを保持する。schema 0.1/0.2/0.3の読込みとround-tripを保証し、
-    v0.3ではStage、value schema、実験的Kernel ABIを追加する。
+    v0.3ではStage、value schema、実験的Kernel ABI、stream item ABI、
+    native buffer layoutを追加する。
     """
 
     schema_version: str
@@ -665,6 +726,8 @@ class PortablePlanIR:
     value_schemas: tuple[ValueSchemaDescriptor, ...]
     stages: tuple[StageDescriptor, ...]
     kernel_abis: tuple[KernelAbiDescriptor, ...]
+    stream_item_abis: tuple[StreamItemAbiDescriptor, ...]
+    native_buffers: tuple[NativeBufferDescriptor, ...]
     ports: tuple[PortDescriptor, ...]
     edges: tuple[EdgeDescriptor, ...]
     buffers: tuple[BufferDescriptor, ...]
@@ -718,6 +781,14 @@ class PortablePlanIR:
             kernel_abis=tuple(
                 KernelAbiDescriptor.from_dict(item)
                 for item in _items(data.get("kernel_abis", ()), "kernel_abis")
+            ),
+            stream_item_abis=tuple(
+                StreamItemAbiDescriptor.from_dict(item)
+                for item in _items(data.get("stream_item_abis", ()), "stream_item_abis")
+            ),
+            native_buffers=tuple(
+                NativeBufferDescriptor.from_dict(item)
+                for item in _items(data.get("native_buffers", ()), "native_buffers")
             ),
             ports=tuple(
                 PortDescriptor.from_dict(item) for item in _items(data.get("ports"), "ports")

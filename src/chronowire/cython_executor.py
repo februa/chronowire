@@ -5,13 +5,53 @@ from __future__ import annotations
 from array import array
 from collections import Counter
 from dataclasses import dataclass
+from fractions import Fraction
+from math import lcm
 
 from ._cython_executor import run_f64_rate_frame
 from .executor import ExecutorSession
 from .graph import NodeKind, RatePolicy
-from .model import Emission, EmissionStatus, LogicalInterval, LogicalTime
+from .model import Diagnostic, Emission, EmissionStatus, LogicalInterval, LogicalTime, Severity
 from .native import F64SourceValues, IdentityF64Kernel
 from .runtime import ExecutionPlan, OutputResult, RunResult, RuntimeOptions
+
+_STATUS_TO_NATIVE = {
+    EmissionStatus.OK: 0,
+    EmissionStatus.DEGRADED: 1,
+    EmissionStatus.INVALID: 2,
+}
+_NATIVE_TO_STATUS = (
+    EmissionStatus.OK,
+    EmissionStatus.DEGRADED,
+    EmissionStatus.INVALID,
+)
+_I64_MIN = -(2**63)
+_I64_MAX = 2**63 - 1
+
+
+def _shared_timebase(emissions: tuple[Emission[float], ...], period: Fraction) -> int:
+    """Source intervalとRATE periodをlossless整数tickへ揃える分母を返す。"""
+
+    denominator = period.denominator
+    for emission in emissions:
+        denominator = lcm(
+            denominator,
+            emission.interval.start.as_fraction().denominator,
+            emission.interval.end.as_fraction().denominator,
+        )
+    return denominator
+
+
+def _ticks(value: Fraction, denominator: int, *, node_id: int, port_id: int) -> int:
+    """有理時刻を検証済みsigned i64 tickへ変換する。"""
+
+    ticks = value * denominator
+    if ticks.denominator != 1 or not _I64_MIN <= ticks.numerator <= _I64_MAX:
+        raise ValueError(
+            "CythonExecutor contract=signed_i64_ticks cannot represent logical time; "
+            f"node={node_id} port={port_id} value={value}"
+        )
+    return ticks.numerator
 
 
 @dataclass(frozen=True)
@@ -46,37 +86,131 @@ class CythonExecutionSession(ExecutorSession):
             raise ValueError("CythonExecutor prototype requires duration=None")
         if options is not None and options != RuntimeOptions():
             raise ValueError("CythonExecutor prototype does not support RuntimeOptions overrides")
-        source_node, rate_node, frame_node, _ = self.plan._nodes
+        source_node, rate_node, frame_node, map_node = self.plan._nodes
         source = source_node.source
         if not isinstance(source, F64SourceValues):
             raise RuntimeError("validated Cython source binding was lost")
         period = rate_node.rate_period
         if period is None or frame_node.frame_size is None or frame_node.frame_hop is None:
             raise RuntimeError("validated Cython RATE/FRAME parameters were lost")
-        values = array("d", source.values)
-        frames, starts, ends, timebase_denominator, rate_count = run_f64_rate_frame(
+        source_emissions = source.emissions()
+        if any(
+            diagnostic.code == "INPUT_OVERRUN"
+            for emission in source_emissions
+            for diagnostic in emission.diagnostics
+        ):
+            raise ValueError(
+                "CythonExecutor contract=gap_reset is not implemented; "
+                f"node={source_node.id} port={source_node.output_port}"
+            )
+        timebase_denominator = _shared_timebase(source_emissions, period)
+        if timebase_denominator > _I64_MAX:
+            raise ValueError(
+                "CythonExecutor contract=signed_i64_ticks cannot represent timebase; "
+                f"node={rate_node.id} port={rate_node.output_port}"
+            )
+        values = array("d", (item.value for item in source_emissions))
+        start_ticks = tuple(
+            _ticks(
+                item.interval.start.as_fraction(),
+                timebase_denominator,
+                node_id=source_node.id,
+                port_id=source_node.output_port,
+            )
+            for item in source_emissions
+        )
+        end_ticks = tuple(
+            _ticks(
+                item.interval.end.as_fraction(),
+                timebase_denominator,
+                node_id=source_node.id,
+                port_id=source_node.output_port,
+            )
+            for item in source_emissions
+        )
+        starts = array("q", start_ticks)
+        ends = array("q", end_ticks)
+        source_statuses = array("B", (_STATUS_TO_NATIVE[item.status] for item in source_emissions))
+        source_resets = array("B", (0 for _ in source_emissions))
+        period_ticks = _ticks(
+            period,
+            timebase_denominator,
+            node_id=rate_node.id,
+            port_id=rate_node.output_port,
+        )
+        if any(
+            end > _I64_MAX - period_ticks or end - start > _I64_MAX - period_ticks + 1
+            for start, end in zip(start_ticks, end_ticks, strict=True)
+        ):
+            raise ValueError(
+                "CythonExecutor contract=signed_i64_ticks would overflow RATE interval; "
+                f"node={rate_node.id} port={rate_node.output_port}"
+            )
+        (
+            frames,
+            frame_starts,
+            frame_ends,
+            frame_statuses,
+            frame_provenance,
+            returned_timebase,
+            rate_status_counts,
+        ) = run_f64_rate_frame(
             memoryview(values),
-            period.numerator,
-            period.denominator,
+            memoryview(starts),
+            memoryview(ends),
+            memoryview(source_statuses),
+            memoryview(source_resets),
+            period_ticks,
+            timebase_denominator,
             frame_node.frame_size,
             frame_node.frame_hop,
         )
+        if returned_timebase != timebase_denominator:
+            raise RuntimeError("Cython native Stage changed the shared logical timebase")
         output_spec = self.plan._outputs[0]
         collector = output_spec.collector.create_session()
-        # RunResultの集計はcollector出力だけでなく、Python Executorと同じく
-        # SOURCE/RATE/FRAME/MAPの各PortへpublishされたEmissionを数える。
-        status_counts: Counter[EmissionStatus] = Counter()
-        published_count = len(source.values) + rate_count + 2 * len(frames)
-        if published_count:
-            status_counts[EmissionStatus.OK] = published_count
-        for sequence, (frame, start, end) in enumerate(zip(frames, starts, ends, strict=True)):
+        status_counts: Counter[EmissionStatus] = Counter(item.status for item in source_emissions)
+        for status, count in zip(_NATIVE_TO_STATUS, rate_status_counts, strict=True):
+            if count:
+                status_counts[status] += count
+        for sequence, (frame, start, end, native_status, provenance) in enumerate(
+            zip(
+                frames,
+                frame_starts,
+                frame_ends,
+                frame_statuses,
+                frame_provenance,
+                strict=True,
+            )
+        ):
+            status = _NATIVE_TO_STATUS[native_status]
+            diagnostics = tuple(
+                diagnostic
+                for source_index in provenance
+                for diagnostic in source_emissions[source_index].diagnostics
+            )
+            interval = LogicalInterval(
+                LogicalTime(start, 1, timebase_denominator),
+                LogicalTime(end, 1, timebase_denominator),
+            )
+            status_counts[status] += 2
+            if status is EmissionStatus.INVALID and not map_node.accepts_invalid:
+                diagnostics += (
+                    Diagnostic(
+                        Severity.WARNING,
+                        "INVALID_INPUT_PROPAGATED",
+                        "Kernel was skipped because it does not accept INVALID input",
+                        node_id=map_node.id,
+                        port_id=map_node.output_port,
+                        interval=interval,
+                    ),
+                )
             emission = Emission(
                 frame,
-                LogicalInterval(
-                    LogicalTime(start, 1, timebase_denominator),
-                    LogicalTime(end, 1, timebase_denominator),
-                ),
+                interval,
                 sequence,
+                status,
+                diagnostics,
             )
             collector.add(emission)
         snapshot = collector.snapshot()

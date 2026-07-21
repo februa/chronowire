@@ -79,6 +79,11 @@ result = plan.run(executor=cw.PythonExecutor())
 だけを受理する。未対応Node、Python callback、Extension、継続sessionはPythonへ暗黙に
 fallbackせず、session作成時に明示エラーにする。
 
+`f64_source()`はscalar列だけでなく、明示interval、status、Diagnosticを持つEmission列も
+受理する。Cython Stageは値、論理時刻、sequence、`OK/DEGRADED/INVALID`、Diagnosticを
+SoA bufferで運び、Python objectはcollector境界でだけ復元する。`INPUT_OVERRUN`を伴う
+gap resetはまだ未対応であり、明示エラーにする。
+
 ```python
 source = cw.Flow(cw.f64_source([1.0, 2.0, 3.0]))
 frames = source.rate(2).frame(2).map(cw.identity_f64())
