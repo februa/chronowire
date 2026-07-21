@@ -195,6 +195,8 @@ runtime buffer分類:
 - RealtimeIngressBuffer
 - OutputCollector
 
+`FrameHistoryBuffer`と`LatestStateBuffer`は、通常Portのfan-out寿命を持つ`PortBuffer`とは別のrun-local実体とする。Python ExecutorはPortablePlanIRの`owner_node_id`、`owner_input_index`、capacity、reclaim policyから生成し、FRAME履歴やlatest確定値を汎用queueへ暗黙に混在させない。
+
 OutputCollectorは`NoCollect`、`Latest`、`Bounded`、`Sink`のいずれかとし、無制限保持を標準機能にしない。
 
 基本interface:

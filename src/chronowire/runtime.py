@@ -67,7 +67,7 @@ from .plan_ir import (
     TimeDescriptor,
     TriggerDescriptor,
 )
-from .runtime_buffer import CursorQueue, PortBuffer
+from .runtime_buffer import CursorQueue, FrameHistoryBuffer, LatestStateBuffer, PortBuffer
 from .source import Source, SourceRequest
 
 T = TypeVar("T")
@@ -111,7 +111,7 @@ class RunResult:
 
 @dataclass
 class _FrameState:
-    items: list[Emission[object]]
+    history: FrameHistoryBuffer[Emission[object]]
     skip_remaining: int = 0
 
 
@@ -427,23 +427,92 @@ def _portable_plan_ir(
         )
         for node in nodes
     )
-    buffers = tuple(
+    port_buffers = tuple(
         BufferDescriptor(
-            node.output_port,
-            "port_shared",
-            node.output_port,
-            tuple(cursors_by_port[node.output_port]),
-            buffer_plans[node.output_port].max_items,
-            None,
-            buffer_plans[node.output_port].capacity_reasons,
-            buffer_plans[node.output_port].high_watermark,
-            buffer_plans[node.output_port].low_watermark,
-            "fail",
-            "all_consumers_advanced",
-            True,
+            buffer_id=node.output_port,
+            kind="port_shared",
+            producer_port_id=node.output_port,
+            owner_node_id=None,
+            owner_input_index=None,
+            consumer_cursor_ids=tuple(cursors_by_port[node.output_port]),
+            max_items=buffer_plans[node.output_port].max_items,
+            max_bytes=None,
+            capacity_reasons=buffer_plans[node.output_port].capacity_reasons,
+            high_watermark=buffer_plans[node.output_port].high_watermark,
+            low_watermark=buffer_plans[node.output_port].low_watermark,
+            overflow_policy="fail",
+            reclaim_policy="all_consumers_advanced",
+            read_only=True,
+            device="cpu",
+            alignment_bytes=None,
+            ownership="executor",
+            copy_policy="shared_reference",
         )
         for node in nodes
     )
+    edge_by_input = {(edge.target_node_id, edge.target_input_index): edge for edge in edges}
+    next_buffer_id = max((node.output_port for node in nodes), default=-1) + 1
+    internal_buffers: list[BufferDescriptor] = []
+    for node in nodes:
+        if node.kind is NodeKind.FRAME:
+            if node.frame_size is None or node.frame_hop is None:
+                raise RuntimeError("FRAME Node lacks size or hop")
+            edge = edge_by_input[(node.id, 0)]
+            internal_buffers.append(
+                BufferDescriptor(
+                    buffer_id=next_buffer_id,
+                    kind="frame_history",
+                    producer_port_id=node.inputs[0].source_port,
+                    owner_node_id=node.id,
+                    owner_input_index=0,
+                    consumer_cursor_ids=(edge.cursor_id,),
+                    max_items=node.frame_size,
+                    max_bytes=None,
+                    capacity_reasons=(
+                        f"frame_history:node={node.id}:size={node.frame_size}:hop={node.frame_hop}",
+                    ),
+                    high_watermark=node.frame_size,
+                    low_watermark=max(0, node.frame_size - 1),
+                    overflow_policy="fail",
+                    reclaim_policy="frame_hop",
+                    read_only=True,
+                    device="cpu",
+                    alignment_bytes=None,
+                    ownership="executor",
+                    copy_policy="shared_reference",
+                )
+            )
+            next_buffer_id += 1
+        for input_index, input_spec in enumerate(node.inputs):
+            if input_spec.semantics is not InputSemantics.LATEST:
+                continue
+            edge = edge_by_input[(node.id, input_index)]
+            internal_buffers.append(
+                BufferDescriptor(
+                    buffer_id=next_buffer_id,
+                    kind="latest_state",
+                    producer_port_id=input_spec.source_port,
+                    owner_node_id=node.id,
+                    owner_input_index=input_index,
+                    consumer_cursor_ids=(edge.cursor_id,),
+                    max_items=1,
+                    max_bytes=None,
+                    capacity_reasons=(
+                        f"latest_state:node={node.id}:input={input_index}:max_items=1",
+                    ),
+                    high_watermark=1,
+                    low_watermark=0,
+                    overflow_policy="replace_oldest",
+                    reclaim_policy="replace_on_newer",
+                    read_only=True,
+                    device="cpu",
+                    alignment_bytes=None,
+                    ownership="executor",
+                    copy_policy="shared_reference",
+                )
+            )
+            next_buffer_id += 1
+    buffers = port_buffers + tuple(internal_buffers)
     times = tuple(
         TimeDescriptor(
             node.output_port,
@@ -852,12 +921,17 @@ class _PlanRuntime:
         signatures = _time_signature(plan._nodes)
         self.node_max_items = {node.id: _node_max_items(node, signatures) for node in plan._nodes}
         buffer_descriptors = {item.buffer_id: item for item in plan._portable_ir.buffers}
+        port_buffer_descriptors = {
+            item.producer_port_id: item
+            for item in plan._portable_ir.buffers
+            if item.kind == "port_shared"
+        }
         self.port_buffers: dict[int, PortBuffer[Emission[object]]] = {
             node.output_port: PortBuffer(
                 node.output_port,
                 max_items=self._required_buffer_capacity(
                     node.output_port,
-                    buffer_descriptors[node.output_port].max_items,
+                    port_buffer_descriptors[node.output_port].max_items,
                 ),
             )
             for node in plan._nodes
@@ -870,8 +944,32 @@ class _PlanRuntime:
                 buffer.register_consumer(cursor_id)
                 self.queues[(node.id, input_index)] = CursorQueue(buffer, cursor_id)
                 cursor_id += 1
-        self.latest: dict[tuple[int, int], Emission[object]] = {}
+        self.latest: dict[tuple[int, int], LatestStateBuffer[Emission[object]]] = {}
         self.frames: dict[int, _FrameState] = {}
+        for descriptor in buffer_descriptors.values():
+            owner = (descriptor.owner_node_id, descriptor.owner_input_index)
+            if descriptor.kind == "frame_history":
+                if descriptor.owner_node_id is None:
+                    raise RuntimeError(
+                        f"buffer {descriptor.buffer_id} FRAME_HISTORY lacks owner node"
+                    )
+                capacity = self._required_buffer_capacity(
+                    descriptor.producer_port_id,
+                    descriptor.max_items,
+                )
+                self.frames[descriptor.owner_node_id] = _FrameState(
+                    FrameHistoryBuffer(descriptor.buffer_id, capacity)
+                )
+            elif descriptor.kind == "latest_state":
+                if owner[0] is None or owner[1] is None:
+                    raise RuntimeError(
+                        f"buffer {descriptor.buffer_id} LATEST_STATE lacks owner input"
+                    )
+                if descriptor.max_items != 1:
+                    raise RuntimeError(
+                        f"buffer {descriptor.buffer_id} LATEST_STATE requires max_items=1"
+                    )
+                self.latest[(owner[0], owner[1])] = LatestStateBuffer(descriptor.buffer_id)
         self.rates: dict[int, _RateState] = {}
         self.port_sequences: dict[int, int] = defaultdict(int)
         self.published_counts: Counter[int] = Counter()
@@ -1201,24 +1299,24 @@ class _PlanRuntime:
             queue = self.queues[(node.id, input_index)]
             consumed = False
             while queue and queue[0].interval.start <= main.interval.start:
-                self.latest[(node.id, input_index)] = queue.popleft()
+                self.latest[(node.id, input_index)].replace(queue.popleft())
                 consumed = True
             if consumed:
                 return True
             if queue:
-                if (node.id, input_index) in self.latest:
+                if self.latest[(node.id, input_index)].has_value:
                     continue
                 self._stall_latest(node, input_index, main.interval)
                 return True
             frontier = self.port_frontiers.get(input_spec.source_port)
             if frontier is not None and frontier > main.interval.start.as_fraction():
-                if (node.id, input_index) in self.latest:
+                if self.latest[(node.id, input_index)].has_value:
                     continue
                 self._stall_latest(node, input_index, main.interval)
                 return True
             if input_spec.source_port not in self.exhausted_ports:
                 return self._advance_port(input_spec.source_port)
-            if (node.id, input_index) not in self.latest:
+            if not self.latest[(node.id, input_index)].has_value:
                 self._stall_latest(node, input_index, main.interval)
                 return True
         return None
@@ -1310,30 +1408,34 @@ class _PlanRuntime:
         queue = self.queues[(node.id, 0)]
         if not queue:
             return False
-        state = self.frames.setdefault(node.id, _FrameState([]))
+        state = self.frames[node.id]
         emission = queue.popleft()
         if state.skip_remaining:
             state.skip_remaining -= 1
             self._advance_frontier(node.output_port, emission.interval.end.as_fraction())
             return True
-        state.items.append(emission)
+        state.history.append(emission)
         if node.frame_size is None or node.frame_hop is None:
             raise RuntimeError("FRAME Node lacks size or hop")
-        if len(state.items) < node.frame_size:
+        if len(state.history) < node.frame_size:
+            first = state.history.first
+            if first is None:
+                raise RuntimeError(f"FRAME Node {node.id} lost non-empty history")
             self._advance_frontier(
                 node.output_port,
-                state.items[0].interval.start.as_fraction(),
+                first.interval.start.as_fraction(),
             )
             return True
-        self._emit_frame(node, state.items[: node.frame_size])
-        if node.frame_hop <= len(state.items):
-            del state.items[: node.frame_hop]
+        self._emit_frame(node, state.history.snapshot(node.frame_size))
+        if node.frame_hop <= len(state.history):
+            state.history.discard_prefix(node.frame_hop)
         else:
-            state.items.clear()
+            state.history.clear()
             state.skip_remaining = node.frame_hop - node.frame_size
+        first = state.history.first
         next_start = (
-            state.items[0].interval.start.as_fraction()
-            if state.items
+            first.interval.start.as_fraction()
+            if first is not None
             else emission.interval.end.as_fraction()
         )
         self._advance_frontier(node.output_port, next_start)
@@ -1358,9 +1460,9 @@ class _PlanRuntime:
         if not node.pad_end:
             return False
         state = self.frames.get(node.id)
-        if state is None or not state.items or node.frame_size is None:
+        if state is None or not len(state.history) or node.frame_size is None:
             return False
-        items = list(state.items)
+        items = list(state.history.snapshot())
         last = items[-1]
         padding_count = node.frame_size - len(items)
         item_duration = last.interval.end.as_fraction() - last.interval.start.as_fraction()
@@ -1386,7 +1488,7 @@ class _PlanRuntime:
                 )
             )
         self._emit_frame(node, items)
-        state.items.clear()
+        state.history.clear()
         self._advance_frontier(node.output_port, items[-1].interval.end.as_fraction())
         return True
 
@@ -1438,8 +1540,8 @@ class _PlanRuntime:
                 continue
             queue = self.queues[(node.id, index)]
             while queue and queue[0].interval.start <= main.interval.start:
-                self.latest[(node.id, index)] = queue.popleft()
-            if (node.id, index) not in self.latest:
+                self.latest[(node.id, index)].replace(queue.popleft())
+            if not self.latest[(node.id, index)].has_value:
                 return False
         return True
 
@@ -1461,7 +1563,7 @@ class _PlanRuntime:
             emission = (
                 self.queues[(node.id, index)].popleft()
                 if input_spec.semantics is InputSemantics.SYNCHRONOUS
-                else self.latest[(node.id, index)]
+                else self.latest[(node.id, index)].get()
             )
             inputs.append(emission)
 

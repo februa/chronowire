@@ -2,7 +2,12 @@
 
 import pytest
 
-from chronowire.runtime_buffer import CursorQueue, PortBuffer
+from chronowire.runtime_buffer import (
+    CursorQueue,
+    FrameHistoryBuffer,
+    LatestStateBuffer,
+    PortBuffer,
+)
 
 
 def test_fan_out_keeps_one_shared_item_until_all_consumers_advance() -> None:
@@ -99,3 +104,35 @@ def test_closing_stalled_cursor_reclaims_shared_prefix() -> None:
 
     assert buffer.retained_count == 0
     assert not stalled
+
+
+def test_frame_history_has_explicit_capacity_and_hop_reclaim() -> None:
+    """FRAME履歴はPlan容量を越えず、hop prefixだけを解放する。"""
+
+    history = FrameHistoryBuffer[int](buffer_id=20, max_items=3)
+    history.append(1)
+    history.append(2)
+    history.append(3)
+
+    assert history.snapshot() == (1, 2, 3)
+    assert history.high_watermark == 3
+    with pytest.raises(BufferError, match="capacity 3"):
+        history.append(4)
+
+    history.discard_prefix(2)
+    assert history.snapshot() == (3,)
+
+
+def test_latest_state_replaces_old_value_without_queue_growth() -> None:
+    """LATEST_STATEは確定値一件だけを置換保持する。"""
+
+    state = LatestStateBuffer[int](buffer_id=21)
+    assert not state.has_value
+    with pytest.raises(LookupError, match="has no value"):
+        state.get()
+
+    state.replace(1)
+    state.replace(2)
+
+    assert state.has_value
+    assert state.get() == 2

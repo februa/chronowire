@@ -253,6 +253,8 @@ class BufferDescriptor:
     buffer_id: int
     kind: str
     producer_port_id: int
+    owner_node_id: int | None
+    owner_input_index: int | None
     consumer_cursor_ids: tuple[int, ...]
     max_items: int | None
     max_bytes: int | None
@@ -262,18 +264,28 @@ class BufferDescriptor:
     overflow_policy: str
     reclaim_policy: str
     read_only: bool
+    device: str
+    alignment_bytes: int | None
+    ownership: str
+    copy_policy: str
 
     def __post_init__(self) -> None:
         if self.max_items is not None and self.max_items < 0:
             raise ValueError("buffer max_items must not be negative")
         if self.max_bytes is not None and self.max_bytes < 0:
             raise ValueError("buffer max_bytes must not be negative")
+        if (self.owner_node_id is None) != (self.owner_input_index is None):
+            raise ValueError("buffer owner node and input index must be specified together")
+        if self.owner_input_index is not None and self.owner_input_index < 0:
+            raise ValueError("buffer owner input index must not be negative")
         if self.high_watermark <= 0:
             raise ValueError("buffer high_watermark must be positive")
         if self.low_watermark < 0 or self.low_watermark >= self.high_watermark:
             raise ValueError("buffer low_watermark must be below high_watermark")
         if self.max_items is not None and self.high_watermark > self.max_items:
             raise ValueError("buffer high_watermark must not exceed max_items")
+        if self.alignment_bytes is not None and self.alignment_bytes <= 0:
+            raise ValueError("buffer alignment_bytes must be positive")
 
     @classmethod
     def from_dict(cls, value: object) -> BufferDescriptor:
@@ -284,6 +296,8 @@ class BufferDescriptor:
             _integer(data, "buffer_id"),
             _string(data, "kind"),
             _integer(data, "producer_port_id"),
+            _optional_integer(data, "owner_node_id"),
+            _optional_integer(data, "owner_input_index"),
             _integer_tuple(data, "consumer_cursor_ids"),
             _optional_integer(data, "max_items"),
             _optional_integer(data, "max_bytes"),
@@ -293,6 +307,10 @@ class BufferDescriptor:
             _string(data, "overflow_policy"),
             _string(data, "reclaim_policy"),
             _boolean(data, "read_only"),
+            _string(data, "device"),
+            _optional_integer(data, "alignment_bytes"),
+            _string(data, "ownership"),
+            _string(data, "copy_policy"),
         )
 
 

@@ -208,3 +208,109 @@ class CursorQueue(Generic[T]):
             return
         self._buffer.unregister_consumer(self._cursor_id)
         self._closed = True
+
+
+class FrameHistoryBuffer(Generic[T]):
+    """一つのFRAME Nodeが未確定入力履歴を保持するrun-local buffer。
+
+    Args:
+        buffer_id: PortablePlanIRの`FRAME_HISTORY` buffer ID。
+        max_items: frame sizeと一致する正の保持上限。
+
+    境界条件:
+        item参照はcopyせず、frame確定またはhop前進時だけ明示的に解放する。
+
+    Raises:
+        BufferError: compile済みcapacityを越えて履歴を追加した場合。
+    """
+
+    def __init__(self, buffer_id: int, max_items: int) -> None:
+        if max_items <= 0:
+            raise ValueError("FrameHistoryBuffer max_items must be positive")
+        self.buffer_id = buffer_id
+        self.max_items = max_items
+        self._items: list[T] = []
+        self._high_watermark = 0
+
+    def append(self, item: T) -> None:
+        """一件を履歴末尾へ追加する。"""
+
+        if len(self._items) >= self.max_items:
+            raise BufferError(
+                f"frame history buffer {self.buffer_id} capacity {self.max_items} would be exceeded"
+            )
+        self._items.append(item)
+        self._high_watermark = max(self._high_watermark, len(self._items))
+
+    def snapshot(self, count: int | None = None) -> tuple[T, ...]:
+        """現在の履歴prefixを不変tupleとして返す。"""
+
+        return tuple(self._items if count is None else self._items[:count])
+
+    def discard_prefix(self, count: int) -> None:
+        """hopで不要になったprefixを解放する。"""
+
+        if count < 0:
+            raise ValueError("discard count must not be negative")
+        del self._items[:count]
+
+    def clear(self) -> None:
+        """欠落、EOF flush、またはrun終了境界で全履歴を解放する。"""
+
+        self._items.clear()
+
+    @property
+    def first(self) -> T | None:
+        """最古itemを返し、空ならNoneを返す。"""
+
+        return self._items[0] if self._items else None
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    @property
+    def high_watermark(self) -> int:
+        """このrunで保持した最大item数を返す。"""
+
+        return self._high_watermark
+
+
+class LatestStateBuffer(Generic[T]):
+    """一つのLATEST入力について確定済み最新値一件を保持するbuffer。
+
+    Args:
+        buffer_id: PortablePlanIRの`LATEST_STATE` buffer ID。
+
+    境界条件:
+        新しい確定値は古い値を置換し、future pendingは共有PortBuffer側に残す。
+    """
+
+    def __init__(self, buffer_id: int) -> None:
+        self.buffer_id = buffer_id
+        self._value: T | None = None
+        self._has_value = False
+
+    def replace(self, item: T) -> None:
+        """確定済み最新値を一件で置換する。"""
+
+        self._value = item
+        self._has_value = True
+
+    @property
+    def has_value(self) -> bool:
+        """一件以上の確定値を保持している場合にTrueを返す。"""
+
+        return self._has_value
+
+    def get(self) -> T:
+        """確定済み最新値を返す。
+
+        Raises:
+            LookupError: まだ値が確定していない場合。
+        """
+
+        if not self._has_value:
+            raise LookupError(f"latest state buffer {self.buffer_id} has no value")
+        value = self._value
+        assert value is not None
+        return value

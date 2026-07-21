@@ -6,6 +6,16 @@ from pathlib import Path
 import chronowire as cw
 
 
+def _port_capacities(plan: cw.ExecutionPlan) -> dict[int, int | None]:
+    """PORT_SHAREDだけをproducer Port別capacityへ整理する。"""
+
+    return {
+        buffer.producer_port_id: buffer.max_items
+        for buffer in plan.portable_ir.buffers
+        if buffer.kind == "port_shared"
+    }
+
+
 def test_graph_info_and_export_include_edges(tmp_path: Path) -> None:
     """Flow引数によるデータ移動がGraphInfoとJSONに残ることを確認する。"""
 
@@ -94,7 +104,7 @@ def test_frame_structure_increases_planned_buffer_capacity() -> None:
     merged = source.map(lambda value, *, frame: (value, frame), frame=framed)
     plan = cw.compile([merged])
 
-    capacities = {buffer.producer_port_id: buffer.max_items for buffer in plan.portable_ir.buffers}
+    capacities = _port_capacities(plan)
     assert capacities == {source.port_id: 4, framed.port_id: 1, merged.port_id: 1}
     source_buffer = plan.portable_ir.buffers[source.port_id]
     assert source_buffer.high_watermark == 4
@@ -112,7 +122,7 @@ def test_emit_many_capacity_is_local_to_producer_port() -> None:
     expanded = source.map(lambda value: cw.emit_many([value] * 3), max_items=3)
     plan = cw.compile([expanded])
 
-    capacities = {buffer.producer_port_id: buffer.max_items for buffer in plan.portable_ir.buffers}
+    capacities = _port_capacities(plan)
     assert capacities == {source.port_id: 1, expanded.port_id: 3}
 
 
@@ -125,7 +135,7 @@ def test_nested_frame_demand_is_multiplied_only_on_shared_ancestor() -> None:
     merged = source.map(lambda value, *, frame: (value, frame), frame=nested)
     plan = cw.compile([merged])
 
-    capacities = {buffer.producer_port_id: buffer.max_items for buffer in plan.portable_ir.buffers}
+    capacities = _port_capacities(plan)
     assert capacities == {
         source.port_id: 6,
         first.port_id: 1,
@@ -146,7 +156,7 @@ def test_merge_capacity_rounds_up_to_atomic_producer_burst() -> None:
     merged = expanded.map(lambda value, *, frame: (value, frame), frame=framed)
     plan = cw.compile([merged])
 
-    capacities = {buffer.producer_port_id: buffer.max_items for buffer in plan.portable_ir.buffers}
+    capacities = _port_capacities(plan)
     assert capacities == {
         source.port_id: 1,
         expanded.port_id: 6,
@@ -156,3 +166,29 @@ def test_merge_capacity_rounds_up_to_atomic_producer_burst() -> None:
     result = plan.run()
     assert any(item.code == "STALLED_EXACT_MERGE" for item in result.diagnostics)
     assert not any(item.code == "SCHEDULER_DEADLOCK" for item in result.diagnostics)
+
+
+def test_frame_and_latest_internal_buffers_round_trip() -> None:
+    """FRAME_HISTORYとLATEST_STATEの所有者・上限・解放規則を保持する。"""
+
+    source = cw.Flow(range(6))
+    framed = source.frame(3, hop=2)
+    merged = framed.map(lambda frame, *, latest: (frame, latest), latest=source.latest())
+    plan = cw.compile([merged])
+
+    restored = cw.PortablePlanIR.from_json(plan.portable_ir.to_json())
+    frame_buffer = next(item for item in restored.buffers if item.kind == "frame_history")
+    latest_buffer = next(item for item in restored.buffers if item.kind == "latest_state")
+
+    assert frame_buffer.owner_node_id == 1
+    assert frame_buffer.owner_input_index == 0
+    assert frame_buffer.max_items == 3
+    assert frame_buffer.reclaim_policy == "frame_hop"
+    assert frame_buffer.device == "cpu"
+    assert frame_buffer.ownership == "executor"
+    assert latest_buffer.owner_node_id == 2
+    assert latest_buffer.owner_input_index == 1
+    assert latest_buffer.max_items == 1
+    assert latest_buffer.overflow_policy == "replace_oldest"
+    assert latest_buffer.reclaim_policy == "replace_on_newer"
+    assert plan.run().outputs[0].received_count == 1
