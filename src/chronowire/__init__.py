@@ -25,6 +25,7 @@ from .errors import (
     SourceExecutionError,
     SynchronizationError,
 )
+from .executor import Executor, ExecutorPlanSession, ExecutorSession, PythonExecutor
 from .extension import (
     Always,
     Every,
@@ -126,6 +127,9 @@ __all__ = [
     "ExecutionBindingError",
     "ExecutionBindings",
     "ExecutionSession",
+    "Executor",
+    "ExecutorPlanSession",
+    "ExecutorSession",
     "Extension",
     "ExtensionBindingError",
     "ExtensionExecutionError",
@@ -156,6 +160,7 @@ __all__ = [
     "PlanSession",
     "PlanSessionError",
     "PlanSessionState",
+    "PythonExecutor",
     "PortablePlanIR",
     "PythonBackend",
     "RatePolicy",

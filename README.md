@@ -62,6 +62,26 @@ bound = cw.bind_plan(ir, cw.ExecutionBindings(values=slot_bindings, configs=conf
 result = bound.run(options=cw.RuntimeOptions(profiler_enabled=True))
 ```
 
+## v0.3 development
+
+`0.3.0.dev0`ではNative Executorのsemantic prototypeへ進む。既存runtimeは
+`PythonExecutor`として選択可能な境界へ分離し、PortablePlanIR schema 0.3は
+`StageDescriptor`、`ValueSchemaDescriptor`、実験的`KernelAbiDescriptor`を持つ。
+現時点のPort値は`python_opaque`、Kernel ABIは`python-v1`かつnative非互換と明記し、
+Native側がdtype、shape、workspaceを推測しない。
+
+```python
+result = plan.run(executor=cw.PythonExecutor())
+```
+
+sample粒度と4-sample block粒度の固定CBFについて、値、interval、sequence、status、
+Diagnosticを同一traceで比較し、Kernel呼出し回数、Scheduler step、Kernel実行時間、
+buffer high-watermarkを測定できる。
+
+```bash
+uv run python -m examples.native_executor_baseline
+```
+
 ## 実行例
 
 chunk入力をsampleへ展開し、rate、frame、EOF padding、固定CBFへ流す例を実行できる。
@@ -102,4 +122,4 @@ uv sync --extra dev --extra docs
 
 設計の正本は[doc/chronowire_design/README.md](doc/chronowire_design/README.md)を参照する。
 
-v0.1とv0.2のrelease gateは[doc/chronowire_design/12_v0.1_v0.2リリース方針.md](doc/chronowire_design/12_v0.1_v0.2リリース方針.md)に定める。Native Executorはv0.3以降とする。
+v0.1とv0.2のrelease gateは[doc/chronowire_design/12_v0.1_v0.2リリース方針.md](doc/chronowire_design/12_v0.1_v0.2リリース方針.md)に定める。Native Executorの準備実装はv0.3で開始している。

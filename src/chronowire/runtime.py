@@ -24,6 +24,7 @@ from .errors import (
     PlanSessionError,
     SourceExecutionError,
 )
+from .executor import Executor, ExecutorPlanSession, ExecutorSession, PythonExecutor
 from .extension import (
     Always,
     Every,
@@ -72,6 +73,7 @@ from .plan_ir import (
     BufferDescriptor,
     EdgeDescriptor,
     ExtensionDescriptor,
+    KernelAbiDescriptor,
     NodeDescriptor,
     OutputDescriptor,
     PlanDiagnosticDescriptor,
@@ -79,8 +81,10 @@ from .plan_ir import (
     PortDescriptor,
     RationalDescriptor,
     SourceDescriptor,
+    StageDescriptor,
     TimeDescriptor,
     TriggerDescriptor,
+    ValueSchemaDescriptor,
 )
 from .runtime_buffer import (
     CursorQueue,
@@ -612,6 +616,61 @@ def _input_tolerance_descriptor(input_spec: InputSpec) -> RationalDescriptor | N
     return None if tolerance is None else RationalDescriptor.from_fraction(tolerance)
 
 
+def _stage_descriptors(
+    nodes: tuple[NodeSpec, ...],
+    node_backend_names: Mapping[int, str],
+    boundary_ports: set[int],
+) -> tuple[StageDescriptor, ...]:
+    """Python callbackと観測境界を越えない最小Stage列を作る。"""
+
+    stages: list[StageDescriptor] = []
+    pending: list[int] = []
+    pending_domain: str | None = None
+
+    def finish(*reasons: str) -> None:
+        nonlocal pending, pending_domain
+        if not pending or pending_domain is None:
+            return
+        stages.append(
+            StageDescriptor(
+                len(stages),
+                tuple(pending),
+                pending_domain,
+                tuple(dict.fromkeys(reasons or (pending_domain,))),
+            )
+        )
+        pending = []
+        pending_domain = None
+
+    for node in nodes:
+        if node.kind is NodeKind.SOURCE:
+            finish("execution_domain_change")
+            pending = [node.id]
+            pending_domain = "python_source"
+            reasons = ["python_source"]
+            if any(port in boundary_ports for port in node.output_ports):
+                reasons.append("observation_boundary")
+            finish(*reasons)
+            continue
+        if node.kind is NodeKind.MAP:
+            finish("execution_domain_change")
+            pending = [node.id]
+            pending_domain = node_backend_names[node.id]
+            reasons = ["python_callback" if pending_domain == "python" else "kernel_binding"]
+            if any(port in boundary_ports for port in node.output_ports):
+                reasons.append("observation_boundary")
+            finish(*reasons)
+            continue
+        if pending_domain != "executor_opcode":
+            finish("execution_domain_change")
+            pending_domain = "executor_opcode"
+        pending.append(node.id)
+        if any(port in boundary_ports for port in node.output_ports):
+            finish("observation_boundary")
+    finish("plan_end")
+    return tuple(stages)
+
+
 def _portable_plan_ir(
     *,
     nodes: tuple[NodeSpec, ...],
@@ -694,6 +753,17 @@ def _portable_plan_ir(
         )
         for node in nodes
         for output_index, output_port in enumerate(node.output_ports)
+    )
+    value_schemas = (
+        ValueSchemaDescriptor(
+            "python:opaque",
+            "python_opaque",
+            None,
+            None,
+            None,
+            "cpu",
+            True,
+        ),
     )
     port_buffers = tuple(
         BufferDescriptor(
@@ -936,11 +1006,33 @@ def _portable_plan_ir(
             for extension in extension_descriptors
         ]
     )
+    boundary_ports = {item.flow.port_id for item in outputs} | {
+        item.observed_port_id for item in extension_descriptors
+    }
+    stages = _stage_descriptors(nodes, node_backend_names, boundary_ports)
+    kernel_abis = tuple(
+        KernelAbiDescriptor(
+            node.id,
+            f"kernel:{node.id}",
+            "python-v1",
+            "python_object",
+            None,
+            None,
+            False,
+            True,
+            False,
+        )
+        for node in nodes
+        if node.kind is NodeKind.MAP
+    )
     return PortablePlanIR(
-        schema_version="0.2",
+        schema_version="0.3",
         kind="execution_plan",
         backend=backend_name,
         nodes=plan_nodes,
+        value_schemas=value_schemas,
+        stages=stages,
+        kernel_abis=kernel_abis,
         ports=ports,
         edges=edges,
         buffers=buffers,
@@ -1136,28 +1228,32 @@ class ExecutionPlan:
         *,
         duration: float | None = None,
         options: RuntimeOptions | None = None,
+        executor: str | Executor = "python",
     ) -> RunResult:
         """単一threadの決定的SchedulerでPlanを実行する。
 
         Args:
             duration: Sourceの論理時間上限。Noneではfinite SourceのEOFまで実行。
             options: Source chunk、watermark、budget、profiler設定。
+            executor: 実行sessionを生成するExecutor名または実体。
 
         Returns:
             collector結果、Diagnostic、status件数を持つRunResult。
         """
 
-        return self.create_session().run(duration=duration, options=options)
+        return self.create_session(executor=executor).run(duration=duration, options=options)
 
     def create_session(
         self,
         *,
         extension_bindings: Mapping[str, Extension] | None = None,
-    ) -> ExecutionSession:
+        executor: str | Executor = "python",
+    ) -> ExecutorSession:
         """process-local Extension実体を検証して実行instanceを生成する。
 
         Args:
             extension_bindings: extension_idからExtension factoryへの完全な対応。
+            executor: 実行sessionを生成するExecutor名または実体。
 
         Returns:
             同じPlanをrun-local状態で実行するExecutionSession。
@@ -1165,6 +1261,14 @@ class ExecutionPlan:
         Raises:
             ExtensionBindingError: binding不足、未知ID、種別、ABI不整合の場合。
         """
+
+        return self._resolve_executor(executor).create_session(self, extension_bindings)
+
+    def _create_python_session(
+        self,
+        extension_bindings: Mapping[str, Extension] | None,
+    ) -> ExecutionSession:
+        """検証済みExtensionを持つPython実行sessionを生成する。"""
 
         bindings = {} if extension_bindings is None else dict(extension_bindings)
         required = {item.extension_id: item for item in self._observations}
@@ -1209,12 +1313,14 @@ class ExecutionPlan:
         *,
         extension_bindings: Mapping[str, Extension] | None = None,
         options: RuntimeOptions | None = None,
-    ) -> PlanSession:
+        executor: str | Executor = "python",
+    ) -> ExecutorPlanSession:
         """v0.2の継続実行状態を持つPlanSessionを生成する。
 
         Args:
             extension_bindings: extension_idからrun-local Extension factoryへの完全な対応。
             options: session全体へ適用するruntime調整値。
+            executor: 継続sessionを生成するExecutor名または実体。
 
         Returns:
             `start()`前の新しいPlanSession。
@@ -1223,8 +1329,33 @@ class ExecutionPlan:
             ExtensionBindingError: binding不足、未知ID、種別、ABI不整合の場合。
         """
 
-        one_shot = self.create_session(extension_bindings=extension_bindings)
+        return self._resolve_executor(executor).create_plan_session(
+            self,
+            extension_bindings,
+            options,
+        )
+
+    def _create_python_plan_session(
+        self,
+        extension_bindings: Mapping[str, Extension] | None,
+        options: RuntimeOptions | None,
+    ) -> PlanSession:
+        """検証済みExtensionを持つPython継続sessionを生成する。"""
+
+        one_shot = self._create_python_session(extension_bindings)
         return PlanSession(self, one_shot._extensions, options or RuntimeOptions())
+
+    @staticmethod
+    def _resolve_executor(executor: str | Executor) -> Executor:
+        """公開指定を検証済みExecutorへ正規化する。"""
+
+        if executor == "python":
+            return PythonExecutor()
+        if isinstance(executor, str):
+            raise ValueError(f"unsupported executor {executor!r}")
+        if not isinstance(executor, Executor):
+            raise TypeError("executor must implement the Executor protocol")
+        return executor
 
     def export(self, path: str | Path) -> None:
         """required Node、output、compile DiagnosticをJSONまたはDOTへ出力する。

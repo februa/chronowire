@@ -234,12 +234,18 @@ Native Executorはv0.2の必須範囲には含めない。[12_v0.1_v0.2リリー
 - sample単位版とのdispatch回数と処理時間を比較する
 - 値と論理時間の基準結果を固定する
 
+v0.3開始時点で`examples/native_executor_baseline.py`にsample粒度と4-sample block粒度の固定CBFを実装した。値、interval、sequence、status、Diagnosticの一致をtestし、Kernel呼出し回数、Scheduler step、Kernel実行時間、buffer high-watermarkを意味論traceと分離して測定する。wall-clock値は環境依存なのでgolden値にはしない。
+
 ### Phase 2: conformance traceと最小IR/ABI
 
 - RATE、FRAME、status、Diagnostic、metadata、sequenceの基準traceを固定する
 - SOURCE、RATE、FRAME、単一MAP、collectorに限定したPortablePlanIRを定義する
 - BufferView、ItemBatch、Kernel ABIの実験版を定義する
 - Extension、collector、consumerの配送順を固定する
+
+PortablePlanIR schema 0.3は最小`StageDescriptor`、`ValueSchemaDescriptor`、実験的`KernelAbiDescriptor`を追加する。現Python Portは`python_opaque`、現Kernelは`python-v1`かつnative非互換、workspace未宣言と記録する。未確定情報をNative Executorが推測してはならない。
+
+`ExecutionPlan.run()`、`create_session()`、`create_plan_session()`は`Executor`を選択でき、既存runtimeを`PythonExecutor`として使用する。これはExecutor差し替え境界の固定であり、まだNative実行を意味しない。
 
 ### Phase 3: 最小Cython Executor
 

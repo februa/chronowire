@@ -47,7 +47,7 @@ def test_bind_plan_replays_v02_portable_ir_with_explicit_slots() -> None:
     rebound = cw.bind_plan(restored_ir, bindings)
 
     assert _values(rebound.run()) == [3, 7]
-    assert rebound.portable_ir.schema_version == "0.2"
+    assert rebound.portable_ir.schema_version == "0.3"
 
 
 def test_bind_plan_reads_v01_descriptor_without_v02_optional_fields() -> None:

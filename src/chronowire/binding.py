@@ -11,6 +11,7 @@ from typing import Any
 from .collector import Collector
 from .config import Config
 from .errors import ExecutionBindingError
+from .executor import Executor, ExecutorPlanSession
 from .extension import (
     Always,
     Every,
@@ -23,7 +24,7 @@ from .extension import (
 from .graph import Flow, Graph, InputSemantics, InputSpec, MissingInputPolicy, NodeKind, RatePolicy
 from .kernel import Backend, CompileContext, CompiledKernel, GapPolicy, Kernel
 from .plan_ir import NodeDescriptor, PortablePlanIR, RationalDescriptor, TriggerDescriptor
-from .runtime import ExecutionPlan, PlanSession, RunResult, RuntimeOptions, compile, output
+from .runtime import ExecutionPlan, RunResult, RuntimeOptions, compile, output
 from .source import RealtimeSource, Source
 
 
@@ -71,27 +72,38 @@ class BoundExecutionPlan:
         *,
         duration: float | None = None,
         options: RuntimeOptions | None = None,
+        executor: str | Executor = "python",
     ) -> RunResult:
         """検証済みbindingで一回実行する。
 
         Args:
             duration: 非finite pull Sourceの論理時間上限。
             options: Configと分離したruntime調整値。
+            executor: 実行sessionを生成するExecutor名または実体。
 
         Returns:
             collector、Diagnostic、任意profileを含むRunResult。
         """
 
-        return self._plan.create_session(extension_bindings=self._extensions).run(
+        return self._plan.create_session(
+            extension_bindings=self._extensions,
+            executor=executor,
+        ).run(
             duration=duration,
             options=options,
         )
 
-    def create_plan_session(self, *, options: RuntimeOptions | None = None) -> PlanSession:
+    def create_plan_session(
+        self,
+        *,
+        options: RuntimeOptions | None = None,
+        executor: str | Executor = "python",
+    ) -> ExecutorPlanSession:
         """検証済みbindingから継続PlanSessionを生成する。
 
         Args:
             options: session全体へ適用するruntime調整値。
+            executor: 継続sessionを生成するExecutor名または実体。
 
         Returns:
             CREATED状態の新しいPlanSession。
@@ -100,6 +112,7 @@ class BoundExecutionPlan:
         return self._plan.create_plan_session(
             extension_bindings=self._extensions,
             options=options,
+            executor=executor,
         )
 
 
@@ -175,7 +188,7 @@ def bind_plan(
     """PortablePlanIRを検証済みprocess-local実体へbindする。
 
     Args:
-        ir: schema 0.1または0.2のportable plan。
+        ir: schema 0.1、0.2、0.3のportable plan。
         bindings: slotとConfig scopeの完全なprocess-local対応。
         backend: KernelをcompileするBackend。既定はPython。
 
@@ -186,7 +199,7 @@ def bind_plan(
         ExecutionBindingError: schema、slot集合、型、Config scope、Graph IDが不整合な場合。
     """
 
-    if ir.schema_version not in {"0.1", "0.2"}:
+    if ir.schema_version not in {"0.1", "0.2", "0.3"}:
         raise ExecutionBindingError(
             f"unsupported PortablePlanIR schema_version={ir.schema_version!r}"
         )

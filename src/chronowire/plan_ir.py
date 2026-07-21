@@ -74,6 +74,16 @@ def _integer_tuple(data: Mapping[str, object], key: str) -> tuple[int, ...]:
     return tuple(result)
 
 
+def _optional_integer_tuple(
+    data: Mapping[str, object],
+    key: str,
+) -> tuple[int, ...] | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    return _integer_tuple(data, key)
+
+
 def _string_tuple(data: Mapping[str, object], key: str) -> tuple[str, ...]:
     values = _items(data.get(key), key)
     result: list[str] = []
@@ -175,6 +185,34 @@ class TimeDescriptor:
         """schema 0.1/0.2利用者向けにoffsetを旧名称で返す。"""
 
         return self.offset
+
+
+@dataclass(frozen=True)
+class ValueSchemaDescriptor:
+    """Port valueのnative表現可否を決める固定schema。"""
+
+    value_schema_id: str
+    representation: str
+    dtype: str | None
+    shape: tuple[int, ...] | None
+    strides: tuple[int, ...] | None
+    device: str
+    read_only: bool
+
+    @classmethod
+    def from_dict(cls, value: object) -> ValueSchemaDescriptor:
+        """JSON objectからvalue schemaを復元する。"""
+
+        data = _mapping(value, "value schema descriptor")
+        return cls(
+            _string(data, "value_schema_id"),
+            _string(data, "representation"),
+            _optional_string(data, "dtype"),
+            _optional_integer_tuple(data, "shape"),
+            _optional_integer_tuple(data, "strides"),
+            _string(data, "device"),
+            _boolean(data, "read_only"),
+        )
 
 
 @dataclass(frozen=True)
@@ -426,6 +464,70 @@ class BindingDescriptor:
 
 
 @dataclass(frozen=True)
+class StageDescriptor:
+    """同一Executor領域で連続実行できるNode列を表す。"""
+
+    stage_id: int
+    node_ids: tuple[int, ...]
+    execution_domain: str
+    boundary_reasons: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.node_ids:
+            raise ValueError("stage must contain at least one node")
+
+    @classmethod
+    def from_dict(cls, value: object) -> StageDescriptor:
+        """JSON objectからStage descriptorを復元する。"""
+
+        data = _mapping(value, "stage descriptor")
+        return cls(
+            _integer(data, "stage_id"),
+            _integer_tuple(data, "node_ids"),
+            _string(data, "execution_domain"),
+            _string_tuple(data, "boundary_reasons"),
+        )
+
+
+@dataclass(frozen=True)
+class KernelAbiDescriptor:
+    """MAP Node bindingが提供する実験的Kernel ABI契約。"""
+
+    node_id: int
+    binding_slot: str
+    abi_version: str
+    process_model: str
+    workspace_size_bytes: int | None
+    workspace_alignment_bytes: int | None
+    supports_flush: bool
+    session_local: bool
+    native_compatible: bool
+
+    def __post_init__(self) -> None:
+        if self.workspace_size_bytes is not None and self.workspace_size_bytes < 0:
+            raise ValueError("kernel workspace size must not be negative")
+        if self.workspace_alignment_bytes is not None and self.workspace_alignment_bytes <= 0:
+            raise ValueError("kernel workspace alignment must be positive")
+
+    @classmethod
+    def from_dict(cls, value: object) -> KernelAbiDescriptor:
+        """JSON objectからKernel ABI descriptorを復元する。"""
+
+        data = _mapping(value, "kernel ABI descriptor")
+        return cls(
+            _integer(data, "node_id"),
+            _string(data, "binding_slot"),
+            _string(data, "abi_version"),
+            _string(data, "process_model"),
+            _optional_integer(data, "workspace_size_bytes"),
+            _optional_integer(data, "workspace_alignment_bytes"),
+            _boolean(data, "supports_flush"),
+            _boolean(data, "session_local"),
+            _boolean(data, "native_compatible"),
+        )
+
+
+@dataclass(frozen=True)
 class OutputDescriptor:
     """観測終端とcollectorのportable設定を表す。"""
 
@@ -552,14 +654,17 @@ class PortablePlanIR:
     """Executorと言語に依存しないserialization可能なExecutionPlan。
 
     Python callable、collector instance、pointer、allocatorは含めず、安定IDと
-    descriptorだけを保持する。schema 0.1/0.2の読込みとround-tripを保証し、
-    v0.2ではExecutionBindingsによるprocess-local binding実行を提供する。
+    descriptorだけを保持する。schema 0.1/0.2/0.3の読込みとround-tripを保証し、
+    v0.3ではStage、value schema、実験的Kernel ABIを追加する。
     """
 
     schema_version: str
     kind: str
     backend: str
     nodes: tuple[NodeDescriptor, ...]
+    value_schemas: tuple[ValueSchemaDescriptor, ...]
+    stages: tuple[StageDescriptor, ...]
+    kernel_abis: tuple[KernelAbiDescriptor, ...]
     ports: tuple[PortDescriptor, ...]
     edges: tuple[EdgeDescriptor, ...]
     buffers: tuple[BufferDescriptor, ...]
@@ -602,6 +707,17 @@ class PortablePlanIR:
             backend=_string(data, "backend"),
             nodes=tuple(
                 NodeDescriptor.from_dict(item) for item in _items(data.get("nodes"), "nodes")
+            ),
+            value_schemas=tuple(
+                ValueSchemaDescriptor.from_dict(item)
+                for item in _items(data.get("value_schemas", ()), "value_schemas")
+            ),
+            stages=tuple(
+                StageDescriptor.from_dict(item) for item in _items(data.get("stages", ()), "stages")
+            ),
+            kernel_abis=tuple(
+                KernelAbiDescriptor.from_dict(item)
+                for item in _items(data.get("kernel_abis", ()), "kernel_abis")
             ),
             ports=tuple(
                 PortDescriptor.from_dict(item) for item in _items(data.get("ports"), "ports")
