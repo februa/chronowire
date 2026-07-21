@@ -122,6 +122,18 @@ RATE/FRAMEをbatch化してCython CBFへ一回で渡す。EmissionごとのPytho
 CBF出力shapeもcompile時に`beams × frame_size`へ固定される。Python callbackを含む混在Planは
 引き続きPython ExecutorがStage境界を管理する。
 
+C++ Executor移行判断用benchmarkは、Plan全体、Source/tick packing、RATE/FRAME、CBF、collector
+復元を分離して測定し、copy byteとPython/native境界数をJSONへ保存する。
+
+```bash
+uv run python -m benchmarks.native_executor_cpp_gate \
+  --sample-count 8192 --block-sizes 64 256 1024 4096 \
+  --channels 4 --beams 2 --warmups 5 --repeats 20
+```
+
+初回測定とCppExecutorが所有すべき境界は
+[13_CppExecutor移行測定.md](doc/chronowire_design/13_CppExecutor移行測定.md)に記録している。
+
 ## 実行例
 
 chunk入力をsampleへ展開し、rate、frame、EOF padding、固定CBFへ流す例を実行できる。
