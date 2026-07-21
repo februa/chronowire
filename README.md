@@ -29,6 +29,22 @@ v0.1のmergeは完全interval一致とlatest stateに限定する。不一致の
 
 同一EmissionはExtension、観測終端collector、下流consumerの順で配送する。collector overflow時も、Extensionは対象Emissionを先に保存できる。
 
+## v0.2 development
+
+`0.2.0.dev0`では、同じrun-local状態を論理時間境界ごとに継続する`PlanSession`の実装を開始した。
+
+```python
+session = plan.create_plan_session()
+session.start()
+partial = session.run_until(10)
+continued = session.run_until(20)
+final = session.close()
+```
+
+同一`PlanSession`ではKernel session、FRAME/RATE履歴、buffer、collector、Extension triggerを保持する。別の`PlanSession`は新しいrun-local状態から開始する。`run_until()`は境界外のSource Emissionを失わず保留し、結果はsession開始時からの累積snapshotとして返す。`cancel()`はpending状態をdrainせず破棄し、`SESSION_CANCELLED` Diagnosticを残す。
+
+現在の`flush()`と`close()`によるdrainはfinite Sourceが対象である。RealtimeSource lifecycle、拡張同期、複数output Port、PortablePlanIRからの明示binding、profilerはv0.2の残件であり、`0.2.0`確定前にrelease gateを満たす。
+
 ## 実行例
 
 chunk入力をsampleへ展開し、rate、frame、EOF padding、固定CBFへ流す例を実行できる。

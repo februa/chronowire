@@ -86,7 +86,7 @@ Python callableは実行時の特別分岐で直接呼ばず、`CompiledKernelSe
 - snapshot可否
 - run間の状態継続可否
 
-v0.1ではrun開始時にsessionを生成し、前回runの状態を構造的に参照できないようにする。継続状態はv0.2の`PlanSession`が所有する。
+v0.1の`ExecutionSession.run()`はrun開始時にsessionを生成し、前回runの状態を構造的に参照できないようにする。v0.2の`PlanSession`は`start()`時に一度だけ`CompiledKernelSession`を生成し、複数の`run_until()`間で同じinstanceを保持する。`close()`、`cancel()`、または実行失敗後にそのinstanceを再利用せず、同じExecutionPlanから作る次のPlanSessionは必ず新しいKernel sessionを得る。
 
 ## 1.4 複数出力Kernel
 

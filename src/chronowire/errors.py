@@ -39,3 +39,7 @@ class KernelExecutionError(ChronowireError):
 
 class SynchronizationError(ChronowireError):
     """runtimeの同期契約自体が破損した場合の例外。"""
+
+
+class PlanSessionError(ChronowireError):
+    """PlanSessionの状態遷移または継続実行契約違反。"""

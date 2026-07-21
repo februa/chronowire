@@ -1,4 +1,4 @@
-"""Chronowireのv0.1公開API。"""
+"""Chronowireの公開API。"""
 
 from .collector import (
     Bounded,
@@ -19,6 +19,7 @@ from .errors import (
     GraphError,
     KernelExecutionError,
     MissingConfigError,
+    PlanSessionError,
     SynchronizationError,
 )
 from .extension import (
@@ -61,6 +62,8 @@ from .runtime import (
     ExecutionSession,
     OutputResult,
     OutputSpec,
+    PlanSession,
+    PlanSessionState,
     RunResult,
     compile,
     output,
@@ -118,6 +121,9 @@ __all__ = [
     "OutputSpec",
     "OverflowPolicy",
     "PlanContext",
+    "PlanSession",
+    "PlanSessionError",
+    "PlanSessionState",
     "PortablePlanIR",
     "PythonBackend",
     "RatePolicy",

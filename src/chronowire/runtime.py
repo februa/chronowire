@@ -6,6 +6,7 @@ import inspect
 from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Generic, TypeVar
@@ -19,6 +20,7 @@ from .errors import (
     ExtensionExecutionError,
     KernelExecutionError,
     MissingConfigError,
+    PlanSessionError,
 )
 from .extension import (
     Always,
@@ -84,6 +86,7 @@ from .source import (
 )
 
 T = TypeVar("T")
+_SOURCE_BOUNDARY = object()
 
 
 @dataclass(frozen=True)
@@ -949,6 +952,26 @@ class ExecutionPlan:
             bound.append(_BoundExtension(item, binding))
         return ExecutionSession(self, tuple(bound))
 
+    def create_plan_session(
+        self,
+        *,
+        extension_bindings: Mapping[str, Extension] | None = None,
+    ) -> PlanSession:
+        """v0.2の継続実行状態を持つPlanSessionを生成する。
+
+        Args:
+            extension_bindings: extension_idからrun-local Extension factoryへの完全な対応。
+
+        Returns:
+            `start()`前の新しいPlanSession。
+
+        Raises:
+            ExtensionBindingError: binding不足、未知ID、種別、ABI不整合の場合。
+        """
+
+        one_shot = self.create_session(extension_bindings=extension_bindings)
+        return PlanSession(self, one_shot._extensions)
+
     def export(self, path: str | Path) -> None:
         """required Node、output、compile DiagnosticをJSONまたはDOTへ出力する。
 
@@ -1015,15 +1038,181 @@ class ExecutionSession:
         return runtime.run()
 
 
+class PlanSessionState(StrEnum):
+    """PlanSessionの公開lifecycle状態。"""
+
+    CREATED = "created"
+    RUNNING = "running"
+    CLOSED = "closed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+class PlanSession:
+    """一つのExecutionPlanを論理時間境界ごとに継続実行するsession。
+
+    Kernel、FRAME、RATE、buffer、collector、Extensionの状態はsession終了まで保持し、
+    別のPlanSessionとは共有しない。
+    """
+
+    def __init__(
+        self,
+        plan: ExecutionPlan,
+        extensions: tuple[_BoundExtension, ...],
+    ) -> None:
+        self._plan = plan
+        self._extensions = extensions
+        self._runtime: _PlanRuntime | None = None
+        self._state = PlanSessionState.CREATED
+        self._logical_end: Fraction | None = None
+
+    @property
+    def state(self) -> PlanSessionState:
+        """現在のlifecycle状態を返す。"""
+
+        return self._state
+
+    def start(self) -> None:
+        """run-local resourceを生成して継続実行を開始する。
+
+        Raises:
+            PlanSessionError: CREATED以外から開始しようとした場合。
+        """
+
+        if self._state is not PlanSessionState.CREATED:
+            raise PlanSessionError(
+                f"PlanSession.start requires state=created; actual={self._state.value}"
+            )
+        runtime = _PlanRuntime(self._plan, None, self._extensions, continuous=True)
+        try:
+            runtime.start()
+        except Exception as error:
+            self._fail_and_finish(runtime, error)
+            raise
+        self._runtime = runtime
+        self._state = PlanSessionState.RUNNING
+
+    def run_until(
+        self,
+        logical_end: LogicalTime | Fraction | int | float,
+    ) -> RunResult:
+        """session状態を保持したまま指定論理時刻まで進める。
+
+        Args:
+            logical_end: Emission終端の論理時間上限。前回指定値より大きい正数。
+
+        Returns:
+            session開始時から現在境界までの累積RunResult snapshot。
+
+        Raises:
+            PlanSessionError: 未開始、終了済み、または境界が単調増加でない場合。
+        """
+
+        runtime = self._running_runtime("run_until")
+        target = self._logical_time_fraction(logical_end)
+        if target <= 0 or (self._logical_end is not None and target <= self._logical_end):
+            raise PlanSessionError(
+                "PlanSession.run_until requires a positive, strictly increasing logical_end"
+            )
+        try:
+            result = runtime.run_until(target)
+        except Exception as error:
+            self._fail_and_finish(runtime, error)
+            raise
+        self._logical_end = target
+        return result
+
+    def flush(self) -> RunResult:
+        """有限SourceをEOFまで進め、FRAME等のpending状態をdrainする。
+
+        Returns:
+            flush後の累積RunResult snapshot。
+
+        Raises:
+            PlanSessionError: sessionがRUNNINGでない場合、または無限Sourceを含む場合。
+        """
+
+        runtime = self._running_runtime("flush")
+        try:
+            return runtime.flush()
+        except PlanSessionError:
+            raise
+        except Exception as error:
+            self._fail_and_finish(runtime, error)
+            raise
+
+    def close(self) -> RunResult:
+        """pending有限入力をflushし、全run-local resourceを解放する。
+
+        Returns:
+            resource解放直前の最終RunResult。
+        """
+
+        runtime = self._running_runtime("close")
+        try:
+            result = runtime.flush()
+            runtime.finish()
+        except Exception as error:
+            self._fail_and_finish(runtime, error)
+            raise
+        self._state = PlanSessionState.CLOSED
+        return result
+
+    def cancel(self) -> RunResult:
+        """pending値をflushせずsessionを打ち切り、resourceを解放する。
+
+        Returns:
+            `SESSION_CANCELLED` Diagnosticを含む累積RunResult。
+        """
+
+        runtime = self._running_runtime("cancel")
+        try:
+            result = runtime.cancel()
+            runtime.finish()
+        except Exception as error:
+            self._fail_and_finish(runtime, error)
+            raise
+        self._state = PlanSessionState.CANCELLED
+        return result
+
+    def _running_runtime(self, operation: str) -> _PlanRuntime:
+        if self._state is not PlanSessionState.RUNNING or self._runtime is None:
+            raise PlanSessionError(
+                f"PlanSession.{operation} requires state=running; actual={self._state.value}"
+            )
+        return self._runtime
+
+    def _fail_and_finish(self, runtime: _PlanRuntime, error: Exception) -> None:
+        """元の失敗を保持したまま全resourceの解放を試みる。"""
+
+        self._state = PlanSessionState.FAILED
+        try:
+            runtime.finish()
+        except Exception as cleanup_error:
+            error.add_note(f"PlanSession resource cleanup also failed: {cleanup_error}")
+
+    @staticmethod
+    def _logical_time_fraction(value: LogicalTime | Fraction | int | float) -> Fraction:
+        if isinstance(value, LogicalTime):
+            return value.as_fraction()
+        try:
+            return Fraction(str(value)) if isinstance(value, float) else Fraction(value)
+        except (TypeError, ValueError, ZeroDivisionError) as error:
+            raise PlanSessionError("logical_end must be a finite rational value") from error
+
+
 class _PlanRuntime:
     def __init__(
         self,
         plan: ExecutionPlan,
         duration: float | None,
         extensions: tuple[_BoundExtension, ...],
+        *,
+        continuous: bool = False,
     ) -> None:
         self.plan = plan
         self.duration = None if duration is None else Fraction(str(duration))
+        self.continuous = continuous
         self.nodes_by_port = {node.output_port: node for node in plan._nodes}
         self.nodes_by_id = {node.id: node for node in plan._nodes}
         signatures = _time_signature(plan._nodes)
@@ -1086,6 +1275,8 @@ class _PlanRuntime:
         self.exhausted_ports: set[int] = set()
         self.stalled_nodes: set[int] = set()
         self.source_indexes: dict[int, int] = defaultdict(int)
+        self.source_pending: dict[int, Emission[object]] = {}
+        self.boundary_blocked_ports: set[int] = set()
         source_nodes = tuple(node for node in plan._nodes if node.kind is NodeKind.SOURCE)
         self.source_iterators = {
             node.id: iter(self._source_values(node))
@@ -1126,6 +1317,15 @@ class _PlanRuntime:
         self.extensions = tuple(self._create_extension_runtime(item) for item in extensions)
         self.output_ports = set(self.collectors)
         self.root_ports: set[int] = set()
+        self._context = PlanContext(required_node_count=len(self.plan._nodes))
+        self._initialized_extensions: list[_ExtensionRuntime] = []
+        self._roots: tuple[int, ...] = ()
+        self._seen_counts: Counter[int] = Counter()
+        self._active: set[int] = set()
+        self._started = False
+        self._finished = False
+        self._cancelled = False
+        self._reported_unmatched = False
 
     @staticmethod
     def _required_buffer_capacity(port_id: int, max_items: int | None) -> int:
@@ -1156,50 +1356,128 @@ class _PlanRuntime:
         )
 
     def run(self) -> RunResult:
-        context = PlanContext(required_node_count=len(self.plan._nodes))
-        initialized: list[_ExtensionRuntime] = []
-        try:
-            for extension in self.extensions:
-                self._initialize_extension(extension, context)
-                initialized.append(extension)
-            self._start_realtime_sources()
-            roots = tuple(
-                dict.fromkeys(
-                    [item.flow.port_id for item in self.plan._outputs]
-                    + [extension.observation.flow.port_id for extension in self.extensions]
-                )
-            )
-            self.root_ports = set(roots)
-            seen_counts: Counter[int] = Counter()
-            active = set(roots)
-            while active:
-                progressed = False
-                for port_id in roots:
-                    if port_id not in active:
-                        continue
-                    if seen_counts[port_id] < self.published_counts[port_id]:
-                        seen_counts[port_id] += 1
-                        progressed = True
-                        continue
-                    if port_id in self.exhausted_ports:
-                        active.remove(port_id)
-                        continue
-                    if self._advance_port(port_id):
-                        progressed = True
-                    elif port_id in self.exhausted_ports:
-                        active.remove(port_id)
-                if active and not progressed:
-                    self._report_scheduler_deadlock(active)
-                    break
+        """v0.1互換の一回実行をlifecycle primitiveで完了する。"""
 
-            self._report_unmatched_inputs()
+        try:
+            self.start()
+            self._drive()
+            if not self._active:
+                self._report_unmatched_once()
             return self._result()
         finally:
-            for session in self.realtime_sessions.values():
+            self.finish()
+
+    def start(self) -> None:
+        """ExtensionとRealtime Sourceを開始し、root需要状態を初期化する。"""
+
+        if self._started:
+            raise RuntimeError("Plan runtime is already started")
+        for extension in self.extensions:
+            self._initialize_extension(extension, self._context)
+            self._initialized_extensions.append(extension)
+        self._start_realtime_sources()
+        self._roots = tuple(
+            dict.fromkeys(
+                [item.flow.port_id for item in self.plan._outputs]
+                + [extension.observation.flow.port_id for extension in self.extensions]
+            )
+        )
+        self.root_ports = set(self._roots)
+        self._active = set(self._roots)
+        self._started = True
+
+    def run_until(self, logical_end: Fraction) -> RunResult:
+        """状態を保持したまま排他的な論理時間上限まで進める。"""
+
+        self.duration = logical_end
+        self.boundary_blocked_ports.clear()
+        self._drive()
+        if not self._active:
+            self._report_unmatched_once()
+        return self._result()
+
+    def flush(self) -> RunResult:
+        """有限SourceをEOFまで進めてpending runtime stateをdrainする。"""
+
+        non_finite = [item.node_id for item in self.plan._portable_ir.sources if not item.is_finite]
+        if non_finite:
+            raise PlanSessionError(
+                f"PlanSession.flush requires closed finite Sources in this v0.2 baseline; "
+                f"non_finite_nodes={non_finite}"
+            )
+        self.duration = None
+        self.boundary_blocked_ports.clear()
+        self._drive()
+        if not self._active:
+            self._report_unmatched_once()
+        return self._result()
+
+    def cancel(self) -> RunResult:
+        """pending処理を破棄したことをDiagnosticへ記録する。"""
+
+        diagnostic = Diagnostic(
+            Severity.WARNING,
+            "SESSION_CANCELLED",
+            "PlanSession was cancelled without flushing pending state",
+            details={"active_ports": sorted(self._active)},
+        )
+        self.diagnostics.append(diagnostic)
+        self._notify_diagnostic(diagnostic)
+        self._cancelled = True
+        return self._result()
+
+    def finish(self) -> None:
+        """run-local SourceとExtension resourceを一度だけ解放する。"""
+
+        if self._finished:
+            return
+        self._finished = True
+        first_error: Exception | None = None
+        for session in self.realtime_sessions.values():
+            try:
                 session.stop()
-            # collectorやKernelが失敗しても、Extensionが外部資源を閉じられるようにする。
-            for extension in reversed(initialized):
-                self._finalize_extension(extension, context)
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        for extension in reversed(self._initialized_extensions):
+            try:
+                self._finalize_extension(extension, self._context)
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+    def _drive(self) -> None:
+        """active rootを境界、EOF、stallのいずれかまで決定的に進める。"""
+
+        while self._active:
+            progressed = False
+            for port_id in self._roots:
+                if port_id not in self._active:
+                    continue
+                if self._seen_counts[port_id] < self.published_counts[port_id]:
+                    self._seen_counts[port_id] += 1
+                    progressed = True
+                    continue
+                if port_id in self.exhausted_ports:
+                    self._active.remove(port_id)
+                    continue
+                if self._advance_port(port_id):
+                    progressed = True
+                elif port_id in self.exhausted_ports:
+                    self._active.remove(port_id)
+            if self._active and not progressed:
+                if self.boundary_blocked_ports:
+                    break
+                self._report_scheduler_deadlock(self._active)
+                break
+
+    def _report_unmatched_once(self) -> None:
+        if self._reported_unmatched:
+            return
+        self._report_unmatched_inputs()
+        self._reported_unmatched = True
 
     def _initialize_extension(
         self,
@@ -1283,12 +1561,15 @@ class _PlanRuntime:
         if not isinstance(source, Source):
             yield from source
             return
-        if not source.is_finite and self.duration is None:
+        if not source.is_finite and self.duration is None and not self.continuous:
             raise ValueError("generated Source requires run(duration=...)")
 
         logical_start = LogicalTime(0)
         while True:
             if self.duration is not None and logical_start.as_fraction() >= self.duration:
+                if self.continuous:
+                    yield _SOURCE_BOUNDARY
+                    continue
                 return
             request_duration = self.plan._source_request_periods.get(node.id, Fraction(1))
             batch = source.read(SourceRequest(logical_start, request_duration), node.config)
@@ -1348,6 +1629,10 @@ class _PlanRuntime:
     def _advance_source(self, node: NodeSpec) -> bool:
         """需要があるSourceから一件だけpublishする。"""
 
+        pending = self.source_pending.get(node.id)
+        if pending is not None:
+            return self._publish_source_at_boundary(node, pending)
+
         ingress = self.realtime_ingresses.get(node.id)
         if ingress is not None:
             record = ingress.take()
@@ -1358,23 +1643,33 @@ class _PlanRuntime:
                 self._record_source_gap(node, record)
                 return True
             emission = self._degrade_after_source_gap(node, record)
-            if self.duration is not None and emission.interval.end.as_fraction() > self.duration:
-                self.exhausted_ports.add(node.output_port)
-                return True
-            self._publish(node.output_port, emission)
-            self._advance_frontier(node.output_port, emission.interval.end.as_fraction())
-            return True
+            return self._publish_source_at_boundary(node, emission)
 
         try:
             value = next(self.source_iterators[node.id])
         except StopIteration:
             self.exhausted_ports.add(node.output_port)
             return True
+        if value is _SOURCE_BOUNDARY:
+            self.boundary_blocked_ports.add(node.output_port)
+            return False
         emission = self._source_emission(value, self.source_indexes[node.id])
         self.source_indexes[node.id] += 1
+        return self._publish_source_at_boundary(node, emission)
+
+    def _publish_source_at_boundary(
+        self,
+        node: NodeSpec,
+        emission: Emission[object],
+    ) -> bool:
+        """境界外Emissionを失わず次のrun_untilまで保留する。"""
+
         if self.duration is not None and emission.interval.end.as_fraction() > self.duration:
-            self.exhausted_ports.add(node.output_port)
-            return True
+            self.source_pending[node.id] = emission
+            self.boundary_blocked_ports.add(node.output_port)
+            return False
+        self.source_pending.pop(node.id, None)
+        self.boundary_blocked_ports.discard(node.output_port)
         self._publish(node.output_port, emission)
         self._advance_frontier(node.output_port, emission.interval.end.as_fraction())
         return True
@@ -2031,5 +2326,7 @@ class _PlanRuntime:
             completed=(
                 not self.stalled_nodes
                 and not any(item.code == "SCHEDULER_DEADLOCK" for item in self.diagnostics)
+                and not self._cancelled
+                and (not self.continuous or not self._active)
             ),
         )
