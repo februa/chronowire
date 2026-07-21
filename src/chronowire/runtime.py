@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import inspect
-import json
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
-from .collector import Collector, CollectorSession, NoCollect
+from .collector import Bounded, Collector, CollectorSession, Latest, NoCollect, Sink
 from .errors import DuplicateOutputError, KernelExecutionError, MissingConfigError
 from .extension import Extension, OutputEvent, PlanContext
 from .graph import Flow, Graph, InputSemantics, NodeKind, NodeSpec, RatePolicy
@@ -35,6 +34,20 @@ from .model import (
     Severity,
     Skip,
 )
+from .plan_ir import (
+    BindingDescriptor,
+    BufferDescriptor,
+    EdgeDescriptor,
+    NodeDescriptor,
+    OutputDescriptor,
+    PlanDiagnosticDescriptor,
+    PortablePlanIR,
+    PortDescriptor,
+    RationalDescriptor,
+    SourceDescriptor,
+    TimeDescriptor,
+)
+from .runtime_buffer import CursorQueue, PortBuffer
 from .source import Source, SourceRequest
 
 T = TypeVar("T")
@@ -187,6 +200,199 @@ def _source_request_periods(nodes: Sequence[NodeSpec]) -> dict[int, Fraction]:
     return periods
 
 
+def _node_max_items(
+    node: NodeSpec,
+    signatures: dict[int, tuple[Fraction, Fraction]],
+) -> int:
+    """一回のNode処理で生成し得るEmission件数上限を求める。"""
+
+    if node.kind is not NodeKind.RATE:
+        return node.max_items
+    if node.rate_period is None:
+        raise RuntimeError("RATE Node lacks period")
+    input_duration = signatures[node.inputs[0].source_port][0]
+    ratio = input_duration / node.rate_period
+    return max(1, -(-ratio.numerator // ratio.denominator))
+
+
+def _collector_descriptor(index: int, item: OutputSpec[Any]) -> OutputDescriptor:
+    """collector instanceをportableな終端descriptorへ変換する。"""
+
+    collector = item.collector
+    if isinstance(collector, Bounded):
+        kind, max_items, overflow = (
+            "bounded",
+            collector.max_items,
+            collector.overflow.value,
+        )
+    elif isinstance(collector, Latest):
+        kind, max_items, overflow = "latest", 1, None
+    elif isinstance(collector, NoCollect):
+        kind, max_items, overflow = "none", 0, None
+    elif isinstance(collector, Sink):
+        kind, max_items, overflow = "sink", None, None
+    else:
+        kind, max_items, overflow = "bound_collector", None, None
+    return OutputDescriptor(
+        index,
+        item.flow.port_id,
+        kind,
+        max_items,
+        overflow,
+        f"collector:{index}",
+    )
+
+
+def _portable_plan_ir(
+    *,
+    nodes: tuple[NodeSpec, ...],
+    outputs: tuple[OutputSpec[Any], ...],
+    extensions: tuple[Extension, ...],
+    diagnostics: tuple[Diagnostic, ...],
+    backend_name: str,
+    node_backend_names: dict[int, str],
+    source_request_periods: dict[int, Fraction],
+) -> PortablePlanIR:
+    """compile済みPython実体からportable descriptorだけを抽出する。"""
+
+    signatures = _time_signature(nodes)
+    edge_rows = tuple(
+        (node, input_index) for node in nodes for input_index, _ in enumerate(node.inputs)
+    )
+    edges = tuple(
+        EdgeDescriptor(
+            edge_id,
+            node.inputs[input_index].source_port,
+            node.id,
+            input_index,
+            node.inputs[input_index].semantics.value,
+            node.inputs[input_index].keyword,
+            node.inputs[input_index].source_port,
+            edge_id,
+        )
+        for edge_id, (node, input_index) in enumerate(edge_rows)
+    )
+    cursors_by_port: dict[int, list[int]] = defaultdict(list)
+    for edge in edges:
+        cursors_by_port[edge.source_port_id].append(edge.cursor_id)
+
+    plan_nodes = tuple(
+        NodeDescriptor(
+            node.id,
+            node.kind.value,
+            tuple(item.source_port for item in node.inputs),
+            (node.output_port,),
+            node.config.scope_id,
+            node_backend_names[node.id],
+            (
+                f"source:{node.id}"
+                if node.kind is NodeKind.SOURCE
+                else f"kernel:{node.id}"
+                if node.kind is NodeKind.MAP
+                else None
+            ),
+            node.accepts_invalid,
+            node.output_port,
+            _node_max_items(node, signatures),
+        )
+        for node in nodes
+    )
+    ports = tuple(
+        PortDescriptor(
+            node.output_port,
+            node.id,
+            0,
+            "python:opaque",
+            node.output_port,
+            f"port:{node.output_port}",
+            node.output_port,
+        )
+        for node in nodes
+    )
+    buffers = tuple(
+        BufferDescriptor(
+            node.output_port,
+            "port_shared",
+            node.output_port,
+            tuple(cursors_by_port[node.output_port]),
+            None,
+            None,
+            "fail",
+            "all_consumers_advanced",
+            True,
+        )
+        for node in nodes
+    )
+    times = tuple(
+        TimeDescriptor(
+            node.output_port,
+            RationalDescriptor(1, 1),
+            RationalDescriptor.from_fraction(signatures[node.output_port][0]),
+            RationalDescriptor.from_fraction(signatures[node.output_port][1]),
+            RationalDescriptor(0, 1),
+            node.kind.value,
+        )
+        for node in nodes
+    )
+    sources = tuple(
+        SourceDescriptor(
+            node.id,
+            "pull_controlled",
+            node.source.is_finite if isinstance(node.source, Source) else True,
+            RationalDescriptor.from_fraction(source_request_periods[node.id]),
+            None,
+            None,
+        )
+        for node in nodes
+        if node.kind is NodeKind.SOURCE
+    )
+    bindings = tuple(
+        [
+            BindingDescriptor(f"source:{node.id}", "source", node.id, node.output_port, "python-v1")
+            for node in nodes
+            if node.kind is NodeKind.SOURCE
+        ]
+        + [
+            BindingDescriptor(f"kernel:{node.id}", "kernel", node.id, node.output_port, "python-v1")
+            for node in nodes
+            if node.kind is NodeKind.MAP
+        ]
+        + [
+            BindingDescriptor(
+                f"collector:{index}",
+                "collector",
+                None,
+                item.flow.port_id,
+                "collector-v1",
+            )
+            for index, item in enumerate(outputs)
+        ]
+        + [
+            BindingDescriptor(f"extension:{index}", "extension", None, None, "extension-v1")
+            for index, _ in enumerate(extensions)
+        ]
+    )
+    return PortablePlanIR(
+        "0.1",
+        "execution_plan",
+        backend_name,
+        plan_nodes,
+        ports,
+        edges,
+        buffers,
+        times,
+        sources,
+        bindings,
+        tuple(_collector_descriptor(index, item) for index, item in enumerate(outputs)),
+        tuple(
+            PlanDiagnosticDescriptor(
+                item.severity.value, item.code, item.message, item.node_id, item.port_id
+            )
+            for item in diagnostics
+        ),
+    )
+
+
 def compile(
     outputs: Sequence[Flow[Any] | OutputSpec[Any]],
     *,
@@ -265,16 +471,28 @@ def compile(
             )
         compiled_kernels[node.id] = compiled
         node_backend_names[node.id] = selected_backend.name
+    source_request_periods = _source_request_periods(nodes)
+    sorted_extensions = tuple(sorted(extensions, key=lambda item: item.priority))
+    portable_ir = _portable_plan_ir(
+        nodes=nodes,
+        outputs=tuple(normalized),
+        extensions=sorted_extensions,
+        diagnostics=diagnostics,
+        backend_name=backend_instance.name,
+        node_backend_names=node_backend_names,
+        source_request_periods=source_request_periods,
+    )
     return ExecutionPlan(
         graph=graph,
         nodes=nodes,
         outputs=tuple(normalized),
-        extensions=tuple(sorted(extensions, key=lambda item: item.priority)),
+        extensions=sorted_extensions,
         compile_diagnostics=diagnostics,
         compiled_kernels=compiled_kernels,
         backend_name=backend_instance.name,
         node_backend_names=node_backend_names,
-        source_request_periods=_source_request_periods(nodes),
+        source_request_periods=source_request_periods,
+        portable_ir=portable_ir,
     )
 
 
@@ -296,6 +514,7 @@ class ExecutionPlan:
         backend_name: str,
         node_backend_names: dict[int, str],
         source_request_periods: dict[int, Fraction],
+        portable_ir: PortablePlanIR,
     ) -> None:
         self._graph = graph
         self._nodes = nodes
@@ -306,12 +525,19 @@ class ExecutionPlan:
         self._backend_name = backend_name
         self._node_backend_names = node_backend_names
         self._source_request_periods = source_request_periods
+        self._portable_ir = portable_ir
 
     @property
     def diagnostics(self) -> tuple[Diagnostic, ...]:
         """compile時に生成したwarningを返す。"""
 
         return self._compile_diagnostics
+
+    @property
+    def portable_ir(self) -> PortablePlanIR:
+        """Executor非依存の不変なExecutionPlan descriptorを返す。"""
+
+        return self._portable_ir
 
     def run(self, *, duration: float | None = None) -> RunResult:
         """単一threadの決定的SchedulerでPlanを実行する。
@@ -335,48 +561,7 @@ class ExecutionPlan:
 
         output_path = Path(path)
         if output_path.suffix == ".json":
-            payload = {
-                "schema_version": "0.1",
-                "kind": "execution_plan",
-                "backend": self._backend_name,
-                "source_request_periods": {
-                    str(node_id): str(period)
-                    for node_id, period in self._source_request_periods.items()
-                },
-                "nodes": [
-                    {
-                        "id": node.id,
-                        "kind": node.kind.value,
-                        "output_port": node.output_port,
-                        "config_scope_id": node.config.scope_id,
-                        "rate_period": str(node.rate_period) if node.rate_period else None,
-                        "execution_domain": self._node_backend_names[node.id],
-                    }
-                    for node in self._nodes
-                ],
-                "outputs": [
-                    {
-                        "index": index,
-                        "port_id": item.flow.port_id,
-                        "collector": type(item.collector).__name__,
-                    }
-                    for index, item in enumerate(self._outputs)
-                ],
-                "diagnostics": [
-                    {
-                        "severity": item.severity.value,
-                        "code": item.code,
-                        "message": item.message,
-                        "node_id": item.node_id,
-                        "port_id": item.port_id,
-                    }
-                    for item in self._compile_diagnostics
-                ],
-            }
-            output_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
+            output_path.write_text(self._portable_ir.to_json(), encoding="utf-8")
             return
         if output_path.suffix == ".dot":
             required = {node.id for node in self._nodes}
@@ -401,11 +586,17 @@ class _PlanRuntime:
         self.duration = None if duration is None else Fraction(str(duration))
         self.nodes_by_port = {node.output_port: node for node in plan._nodes}
         self.nodes_by_id = {node.id: node for node in plan._nodes}
-        self.consumers: dict[int, list[tuple[NodeSpec, int]]] = defaultdict(list)
+        self.port_buffers: dict[int, PortBuffer[Emission[object]]] = {
+            node.output_port: PortBuffer(node.output_port) for node in plan._nodes
+        }
+        self.queues: dict[tuple[int, int], CursorQueue[Emission[object]]] = {}
+        cursor_id = 0
         for node in plan._nodes:
-            for index, item in enumerate(node.inputs):
-                self.consumers[item.source_port].append((node, index))
-        self.queues: dict[tuple[int, int], deque[Emission[object]]] = defaultdict(deque)
+            for input_index, item in enumerate(node.inputs):
+                buffer = self.port_buffers[item.source_port]
+                buffer.register_consumer(cursor_id)
+                self.queues[(node.id, input_index)] = CursorQueue(buffer, cursor_id)
+                cursor_id += 1
         self.latest: dict[tuple[int, int], Emission[object]] = {}
         self.frames: dict[int, _FrameState] = {}
         self.rates: dict[int, _RateState] = {}
@@ -506,8 +697,7 @@ class _PlanRuntime:
                 extension.on_output(event)
         if port_id in self.output_ports:
             self.collectors[port_id].add(emission)
-        for node, input_index in self.consumers.get(port_id, ()):
-            self.queues[(node.id, input_index)].append(emission)
+        self.port_buffers[port_id].publish(emission)
 
     def _drain_ready_nodes(self) -> None:
         while True:
@@ -712,7 +902,9 @@ class _PlanRuntime:
         for emission in self._normalize_result(
             result,
             main.interval,
+            node.id,
             node.output_port,
+            node.max_items,
             inherited_status,
             inherited_diagnostics,
         ):
@@ -728,13 +920,20 @@ class _PlanRuntime:
         self,
         result: object,
         interval: LogicalInterval,
+        node_id: int,
         port_id: int,
+        max_items: int,
         inherited_status: EmissionStatus,
         inherited_diagnostics: tuple[Diagnostic, ...],
     ) -> tuple[Emission[object], ...]:
         if isinstance(result, Skip):
             return ()
         values = result.values if isinstance(result, EmitMany) else (result,)
+        if len(values) > max_items:
+            raise KernelExecutionError(
+                f"node {node_id} port {port_id} interval {interval} emitted "
+                f"{len(values)} items; contract max_items={max_items}"
+            )
         normalized: list[Emission[object]] = []
         for value in values:
             sequence = self._next_sequence(port_id)

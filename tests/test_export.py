@@ -37,9 +37,10 @@ def test_plan_export_contains_outputs_and_compile_warning(tmp_path: Path) -> Non
     plan.export(dot_path)
     payload = json.loads(json_path.read_text(encoding="utf-8"))
 
-    assert payload["outputs"][0]["collector"] == "Latest"
+    assert payload["outputs"][0]["collector_kind"] == "latest"
     assert payload["diagnostics"][0]["code"] == "POSSIBLE_INTERVAL_MISMATCH"
     assert payload["nodes"][-1]["execution_domain"] == "python"
+    assert payload["buffers"][0]["reclaim_policy"] == "all_consumers_advanced"
     assert "digraph chronowire_plan" in dot_path.read_text(encoding="utf-8")
 
 
@@ -56,5 +57,26 @@ def test_rate_period_is_exported_in_graph_and_plan(tmp_path: Path) -> None:
     plan_payload = json.loads(plan_path.read_text(encoding="utf-8"))
     assert graph_payload["nodes"][-1]["rate_period"] == "1/4"
     assert graph_payload["nodes"][-1]["rate_policy"] == "hold"
-    assert plan_payload["nodes"][-1]["rate_period"] == "1/4"
-    assert plan_payload["source_request_periods"] == {"0": "1/4"}
+    assert plan_payload["times"][-1]["period"] == {"numerator": 1, "denominator": 4}
+    assert plan_payload["sources"][0]["request_duration"] == {
+        "numerator": 1,
+        "denominator": 4,
+    }
+
+
+def test_portable_plan_round_trip_preserves_edges_buffers_and_time() -> None:
+    """Plan JSONがPython実体なしで同じportable descriptorへ復元できる。"""
+
+    source = cw.Flow([1, 2])
+    left = source.map(lambda value: value + 1)
+    right = source.map(lambda value: value * 2)
+    joined = left.map(lambda value, *, other: value + other, other=right)
+    plan = cw.compile([cw.output(joined, collector=cw.Latest())])
+
+    restored = cw.PortablePlanIR.from_json(plan.portable_ir.to_json())
+
+    assert restored == plan.portable_ir
+    assert restored.buffers[0].read_only
+    assert restored.buffers[0].consumer_cursor_ids == (0, 1)
+    assert restored.buffers[0].reclaim_policy == "all_consumers_advanced"
+    assert all(binding.abi_version for binding in restored.bindings)

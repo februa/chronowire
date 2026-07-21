@@ -39,6 +39,7 @@ from .model import (
     emit_many,
     skip,
 )
+from .plan_ir import PortablePlanIR
 from .runtime import ExecutionPlan, OutputResult, OutputSpec, RunResult, compile, output
 from .source import Source, SourceBatch, SourceRequest
 
@@ -76,6 +77,7 @@ __all__ = [
     "OutputSpec",
     "OverflowPolicy",
     "PlanContext",
+    "PortablePlanIR",
     "PythonBackend",
     "RatePolicy",
     "RunResult",

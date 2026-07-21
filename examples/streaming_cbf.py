@@ -139,6 +139,7 @@ def run_example() -> tuple[BeamFrame, ...]:
     samples = cw.Flow(chunks, config).map(
         ChunkSamplesKernel(),
         config_paths=("stream.sample_rate_hz",),
+        max_items=3,
     )
     frames = samples.rate(4).frame(4, pad_end=True)
     beams = frames.map(FixedCbfKernel(weights=((0.5, 0.5),)))

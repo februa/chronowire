@@ -2,6 +2,8 @@
 
 from fractions import Fraction
 
+import pytest
+
 import chronowire as cw
 
 
@@ -78,10 +80,26 @@ def test_zero_one_many_emission_contract() -> None:
             return [10, 11]
         return cw.emit_many([20, 21])
 
-    expanded = source.map(expand)
+    expanded = source.map(expand, max_items=2)
     result = cw.compile([cw.output(expanded, collector=cw.Bounded(3))]).run()
 
     assert _values(result.outputs[0]) == [[10, 11], 20, 21]
+
+
+def test_emit_many_must_fit_declared_max_items() -> None:
+    """宣言上限を超える複数Emissionを配送前に拒否する。"""
+
+    expanded = cw.Flow([1]).map(lambda value: cw.emit_many([value, value + 1]))
+
+    with pytest.raises(cw.KernelExecutionError, match="contract max_items=1"):
+        cw.compile([expanded]).run()
+
+
+def test_map_rejects_nonpositive_max_items() -> None:
+    """生成件数上限はGraph構築時から正の整数に限定する。"""
+
+    with pytest.raises(ValueError, match="max_items must be positive"):
+        cw.Flow([1]).map(lambda value: value, max_items=0)
 
 
 def test_frame_overlap_preserves_intervals() -> None:

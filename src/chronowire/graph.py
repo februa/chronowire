@@ -68,6 +68,7 @@ class NodeSpec:
     pad_end: bool = False
     rate_period: Fraction | None = None
     rate_policy: RatePolicy | None = None
+    max_items: int = 1
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,7 @@ class Graph:
         pad_end: bool = False,
         rate_period: Fraction | None = None,
         rate_policy: RatePolicy | None = None,
+        max_items: int = 1,
     ) -> int:
         """Nodeを追加し、新しいoutput Port IDを返す。"""
 
@@ -164,6 +166,7 @@ class Graph:
             pad_end=pad_end,
             rate_period=rate_period,
             rate_policy=rate_policy,
+            max_items=max_items,
         )
         self._nodes.append(node)
         self._port_to_node[port_id] = node_id
@@ -316,6 +319,7 @@ class Flow(Generic[T]):
         *,
         config_paths: tuple[str, ...] | None = None,
         accepts_invalid: bool = False,
+        max_items: int = 1,
         **arguments: object,
     ) -> Flow[U]:
         """Python callableをMAP NodeとしてGraphへ登録する。
@@ -324,11 +328,15 @@ class Flow(Generic[T]):
             operation: 主入力値と追加引数を受け取る処理。
             config_paths: callableが参照するConfig属性path。Noneはscope全体への依存。
             accepts_invalid: INVALID入力でもcallableを実行する場合にTrue。
+            max_items: 一回のKernel呼出しが生成できるEmission上限。
             arguments: 定数、同期Flow、またはlatest StateFlow。
 
         Raises:
-            ValueError: 異なるGraphのFlowを入力した場合。
+            ValueError: 異なるGraphのFlowを入力した場合、またはmax_itemsが正でない場合。
         """
+
+        if max_items <= 0:
+            raise ValueError("map max_items must be positive")
 
         inputs = [InputSpec(self._port_id, InputSemantics.SYNCHRONOUS)]
         constants: dict[str, object] = {}
@@ -354,6 +362,7 @@ class Flow(Generic[T]):
             constants=constants,
             config_paths=config_paths,
             accepts_invalid=accepts_invalid,
+            max_items=max_items,
         )
         return self._from_port(self._graph, port_id, self._config)
 
