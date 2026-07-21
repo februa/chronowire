@@ -132,7 +132,7 @@ class TimeDescriptor:
     timebase: RationalDescriptor
     duration: RationalDescriptor
     period: RationalDescriptor
-    phase: RationalDescriptor
+    offset: RationalDescriptor
     transform: str
     exact: bool
     finite: bool
@@ -143,12 +143,23 @@ class TimeDescriptor:
         """JSON objectから時間descriptorを復元する。"""
 
         data = _mapping(value, "time descriptor")
+        offset_value = data.get("offset")
+        legacy_value = data.get("phase")
+        if offset_value is None and legacy_value is None:
+            raise ValueError("time descriptor offset must be present")
+        offset = RationalDescriptor.from_dict(
+            offset_value if offset_value is not None else legacy_value
+        )
+        if legacy_value is not None:
+            legacy_offset = RationalDescriptor.from_dict(legacy_value)
+            if legacy_offset != offset:
+                raise ValueError("time descriptor offset conflicts with legacy phase")
         return cls(
             _integer(data, "time_descriptor_id"),
             RationalDescriptor.from_dict(data.get("timebase")),
             RationalDescriptor.from_dict(data.get("duration")),
             RationalDescriptor.from_dict(data.get("period")),
-            RationalDescriptor.from_dict(data.get("phase")),
+            offset,
             _string(data, "transform"),
             _boolean(data, "exact"),
             _boolean(data, "finite"),
@@ -158,6 +169,12 @@ class TimeDescriptor:
                 else RationalDescriptor.from_dict(data.get("generation_end"))
             ),
         )
+
+    @property
+    def phase(self) -> RationalDescriptor:
+        """schema 0.1/0.2利用者向けにoffsetを旧名称で返す。"""
+
+        return self.offset
 
 
 @dataclass(frozen=True)
@@ -441,7 +458,7 @@ class TriggerDescriptor:
     kind: str
     count: int | None
     period: RationalDescriptor | None
-    phase: RationalDescriptor | None
+    offset: RationalDescriptor | None
 
     @classmethod
     def from_dict(cls, value: object) -> TriggerDescriptor:
@@ -449,13 +466,31 @@ class TriggerDescriptor:
 
         data = _mapping(value, "trigger descriptor")
         period = data.get("period")
-        phase = data.get("phase")
+        offset_value = data.get("offset")
+        legacy_value = data.get("phase")
+        offset = (
+            None
+            if offset_value is None and legacy_value is None
+            else RationalDescriptor.from_dict(
+                offset_value if offset_value is not None else legacy_value
+            )
+        )
+        if legacy_value is not None and offset is not None:
+            legacy_offset = RationalDescriptor.from_dict(legacy_value)
+            if legacy_offset != offset:
+                raise ValueError("trigger descriptor offset conflicts with legacy phase")
         return cls(
             _string(data, "kind"),
             _optional_integer(data, "count"),
             None if period is None else RationalDescriptor.from_dict(period),
-            None if phase is None else RationalDescriptor.from_dict(phase),
+            offset,
         )
+
+    @property
+    def phase(self) -> RationalDescriptor | None:
+        """schema 0.1/0.2利用者向けにoffsetを旧名称で返す。"""
+
+        return self.offset
 
 
 @dataclass(frozen=True)
@@ -538,7 +573,14 @@ class PortablePlanIR:
     def to_dict(self) -> dict[str, object]:
         """JSON encoderへ渡せるdictへ変換する。"""
 
-        return asdict(self)
+        payload = asdict(self)
+        # schema 0.1/0.2 readerはphaseを要求するため、移行期間はoffsetと同値で併記する。
+        for descriptor in payload["times"]:
+            descriptor["phase"] = descriptor["offset"]
+        for extension in payload["extensions"]:
+            trigger = extension["trigger"]
+            trigger["phase"] = trigger["offset"]
+        return payload
 
     def to_json(self) -> str:
         """UTF-8保存用の整形済みJSON文字列を返す。"""

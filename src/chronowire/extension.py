@@ -111,9 +111,9 @@ def _fraction(value: int | float | Fraction, field: str) -> Fraction:
 
 
 class _EveryLogicalTimeSession:
-    def __init__(self, period: Fraction, phase: Fraction) -> None:
+    def __init__(self, period: Fraction, offset: Fraction) -> None:
         self._period = period
-        self._next_boundary = phase
+        self._next_boundary = offset
 
     def should_fire(self, emission: Emission[object]) -> bool:
         start = emission.interval.start.as_fraction()
@@ -137,32 +137,46 @@ class EveryLogicalTime:
 
     Args:
         period: 正の論理時間周期。
-        phase: 最初の境界。periodで正規化する。
+        offset: 論理時間0から最初の境界までのずれ。periodで正規化する。
+        phase: `offset`の旧名称。既存コードとの互換目的だけに受理する。
 
     Raises:
         ValueError: periodが正でない、または有限な有理数へ変換できない場合。
     """
 
     period: Fraction
-    phase: Fraction = Fraction(0)
+    offset: Fraction = Fraction(0)
     kind = "every_logical_time"
 
     def __init__(
         self,
         period: int | float | Fraction,
-        phase: int | float | Fraction = 0,
+        offset: int | float | Fraction = 0,
+        *,
+        phase: int | float | Fraction | None = None,
     ) -> None:
         normalized_period = _fraction(period, "trigger period")
-        normalized_phase = _fraction(phase, "trigger phase")
+        if phase is not None:
+            normalized_offset = _fraction(offset, "trigger offset")
+            if normalized_offset != 0:
+                raise ValueError("trigger offset and legacy phase must not both be specified")
+            offset = phase
+        normalized_offset = _fraction(offset, "trigger offset")
         if normalized_period <= 0:
             raise ValueError("trigger period must be positive")
         object.__setattr__(self, "period", normalized_period)
-        object.__setattr__(self, "phase", normalized_phase % normalized_period)
+        object.__setattr__(self, "offset", normalized_offset % normalized_period)
+
+    @property
+    def phase(self) -> Fraction:
+        """既存コード向けにoffsetを旧名称で返す。"""
+
+        return self.offset
 
     def create_session(self) -> TriggerSession:
         """次の論理境界を保持するrun-local sessionを返す。"""
 
-        return _EveryLogicalTimeSession(self.period, self.phase)
+        return _EveryLogicalTimeSession(self.period, self.offset)
 
 
 class ExtensionFailurePolicy(StrEnum):

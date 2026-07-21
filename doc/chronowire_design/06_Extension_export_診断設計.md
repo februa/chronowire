@@ -46,7 +46,7 @@ result = session.run()
 
 ## 1.3 Trigger
 
-v0.1は`Always`、event件数に基づく`Every`、論理時間に基づく`EveryLogicalTime(period, phase=0)`を提供する。`EveryLogicalTime`の境界は半開区間`[interval.start, interval.end)`へ所属する。境界が前Emissionの`end`と次Emissionの`start`に一致する場合は次Emissionだけが発火する。overlapするEmissionが同じ境界を覆っても、一つの観測契約ではその境界を最初に処理したEmissionだけが発火する。一つのEmission内に複数境界がある場合もcallbackは一回とし、次の未処理境界まで進める。
+v0.1は`Always`、event件数に基づく`Every`、論理時間に基づく`EveryLogicalTime(period, offset=0)`を提供する。`offset`は論理時間0から最初の境界までのずれであり、信号位相ではない。`EveryLogicalTime`の境界は半開区間`[interval.start, interval.end)`へ所属する。境界が前Emissionの`end`と次Emissionの`start`に一致する場合は次Emissionだけが発火する。overlapするEmissionが同じ境界を覆っても、一つの観測契約ではその境界を最初に処理したEmissionだけが発火する。一つのEmission内に複数境界がある場合もcallbackは一回とし、次の未処理境界まで進める。既存Python APIの`phase=`とPortablePlanIR schema 0.1/0.2の`phase` fieldは、`offset`と同値の読込み互換aliasとしてのみ残す。
 
 Extensionはcollectorと独立する。output collectorが`NoCollect`でもExtensionは対象PortのEmissionを観測できる。`Snapshot(include_degraded=True)`は`DEGRADED`および`INVALID`なEmission、対応Diagnostic、論理時間区間を保存する。
 

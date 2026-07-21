@@ -113,8 +113,8 @@ def _trigger(value: TriggerDescriptor) -> Always | Every | EveryLogicalTime:
     if value.kind == "every" and value.count is not None:
         return Every(value.count)
     if value.kind == "every_logical_time" and value.period is not None:
-        phase = RationalDescriptor(0, 1) if value.phase is None else value.phase
-        return EveryLogicalTime(_fraction(value.period), _fraction(phase))
+        offset = RationalDescriptor(0, 1) if value.offset is None else value.offset
+        return EveryLogicalTime(_fraction(value.period), _fraction(offset))
     raise ExecutionBindingError(f"unsupported trigger descriptor kind={value.kind!r}")
 
 

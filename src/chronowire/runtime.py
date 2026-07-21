@@ -597,7 +597,7 @@ def _trigger_descriptor(observation: ObservationSpec) -> TriggerDescriptor:
             trigger.kind,
             None,
             RationalDescriptor.from_fraction(trigger.period),
-            RationalDescriptor.from_fraction(trigger.phase),
+            RationalDescriptor.from_fraction(trigger.offset),
         )
     raise TypeError(
         f"extension_id {observation.extension_id!r} port {observation.flow.port_id} "

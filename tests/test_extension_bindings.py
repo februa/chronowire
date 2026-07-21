@@ -225,7 +225,7 @@ def test_extension_descriptor_round_trip_preserves_trigger_and_slot() -> None:
     observation = cw.observe(
         source,
         extension_id="spectrum_snapshot",
-        trigger=cw.EveryLogicalTime(Fraction(5), phase=1),
+        trigger=cw.EveryLogicalTime(Fraction(5), offset=1),
         priority=3,
     )
     plan = cw.compile([source], extensions=[observation])
@@ -240,5 +240,49 @@ def test_extension_descriptor_round_trip_preserves_trigger_and_slot() -> None:
     assert descriptor.trigger.kind == "every_logical_time"
     assert descriptor.trigger.period is not None
     assert descriptor.trigger.period.numerator == 5
-    assert descriptor.trigger.phase is not None
-    assert descriptor.trigger.phase.numerator == 1
+    assert descriptor.trigger.offset is not None
+    assert descriptor.trigger.offset.numerator == 1
+
+
+def test_logical_time_trigger_accepts_legacy_phase_without_using_it_in_new_ir() -> None:
+    """既存phase keywordをoffset互換aliasとして読める。"""
+
+    trigger = cw.EveryLogicalTime(5, phase=1)
+
+    assert trigger.offset == 1
+    assert trigger.phase == trigger.offset
+    with pytest.raises(ValueError, match="must not both be specified"):
+        cw.EveryLogicalTime(5, offset=2, phase=1)
+
+
+def test_portable_ir_reads_legacy_phase_and_rejects_conflicting_aliases() -> None:
+    """旧schemaのphaseを読み、新旧fieldの矛盾は明示的に拒否する。"""
+
+    source = cw.Flow([1])
+    observation = cw.observe(
+        source,
+        extension_id="snapshot",
+        trigger=cw.EveryLogicalTime(5, offset=1),
+    )
+    payload = cw.compile([source], extensions=[observation]).portable_ir.to_dict()
+    times = payload["times"]
+    extensions = payload["extensions"]
+    assert isinstance(times, tuple)
+    assert isinstance(extensions, tuple)
+    time = times[0]
+    extension = extensions[0]
+    assert isinstance(time, dict)
+    assert isinstance(extension, dict)
+    trigger = extension["trigger"]
+    assert isinstance(trigger, dict)
+
+    del time["offset"]
+    del trigger["offset"]
+    restored = cw.PortablePlanIR.from_dict(payload)
+    assert restored.times[0].offset.numerator == 0
+    assert restored.extensions[0].trigger.offset is not None
+    assert restored.extensions[0].trigger.offset.numerator == 1
+
+    time["offset"] = {"numerator": 1, "denominator": 1}
+    with pytest.raises(ValueError, match="offset conflicts with legacy phase"):
+        cw.PortablePlanIR.from_dict(payload)

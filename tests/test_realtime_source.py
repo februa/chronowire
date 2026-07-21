@@ -266,8 +266,8 @@ def test_frame_discards_pre_gap_history() -> None:
     assert result.outputs[0].emissions[0].status is cw.EmissionStatus.DEGRADED
 
 
-def test_rate_reestablishes_phase_from_first_post_gap_interval() -> None:
-    """RATEは欠落前の次回発火位相を持ち越さない。"""
+def test_rate_reestablishes_offset_from_first_post_gap_interval() -> None:
+    """RATEは欠落前の次回発火offsetを持ち越さない。"""
 
     values = [
         cw.Emission(
