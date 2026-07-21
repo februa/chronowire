@@ -78,17 +78,81 @@ def test_portable_plan_round_trip_preserves_edges_buffers_and_time() -> None:
     assert restored == plan.portable_ir
     assert restored.buffers[0].read_only
     assert restored.buffers[0].max_items == 1
+    assert restored.buffers[0].high_watermark == 1
+    assert restored.buffers[0].low_watermark == 0
+    assert restored.buffers[0].capacity_reasons[0].startswith("producer_burst:")
     assert restored.buffers[0].consumer_cursor_ids == (0, 1)
     assert restored.buffers[0].reclaim_policy == "all_consumers_advanced"
     assert all(binding.abi_version for binding in restored.bindings)
 
 
 def test_frame_structure_increases_planned_buffer_capacity() -> None:
-    """frame需要を満たす静的capacityがPortablePlanIRへ記録される。"""
+    """共有祖先だけにframe分岐需要の静的capacityを割り当てる。"""
 
     source = cw.Flow(range(8))
     framed = source.frame(4)
     merged = source.map(lambda value, *, frame: (value, frame), frame=framed)
     plan = cw.compile([merged])
 
-    assert {buffer.max_items for buffer in plan.portable_ir.buffers} == {4}
+    capacities = {buffer.producer_port_id: buffer.max_items for buffer in plan.portable_ir.buffers}
+    assert capacities == {source.port_id: 4, framed.port_id: 1, merged.port_id: 1}
+    source_buffer = plan.portable_ir.buffers[source.port_id]
+    assert source_buffer.high_watermark == 4
+    assert source_buffer.low_watermark == 3
+    assert (
+        "shared_merge_demand:node=2:max_items=4:structural_items=4:producer_burst=1"
+        in source_buffer.capacity_reasons
+    )
+
+
+def test_emit_many_capacity_is_local_to_producer_port() -> None:
+    """Kernel burst上限を無関係な上流Portへ伝播しない。"""
+
+    source = cw.Flow([1])
+    expanded = source.map(lambda value: cw.emit_many([value] * 3), max_items=3)
+    plan = cw.compile([expanded])
+
+    capacities = {buffer.producer_port_id: buffer.max_items for buffer in plan.portable_ir.buffers}
+    assert capacities == {source.port_id: 1, expanded.port_id: 3}
+
+
+def test_nested_frame_demand_is_multiplied_only_on_shared_ancestor() -> None:
+    """nested frameの一件生成需要を共有Sourceまで逆伝播する。"""
+
+    source = cw.Flow(range(12))
+    first = source.frame(2)
+    nested = first.frame(3)
+    merged = source.map(lambda value, *, frame: (value, frame), frame=nested)
+    plan = cw.compile([merged])
+
+    capacities = {buffer.producer_port_id: buffer.max_items for buffer in plan.portable_ir.buffers}
+    assert capacities == {
+        source.port_id: 6,
+        first.port_id: 1,
+        nested.port_id: 1,
+        merged.port_id: 1,
+    }
+    result = plan.run()
+    assert any(item.code == "STALLED_EXACT_MERGE" for item in result.diagnostics)
+    assert not any(item.code == "SCHEDULER_DEADLOCK" for item in result.diagnostics)
+
+
+def test_merge_capacity_rounds_up_to_atomic_producer_burst() -> None:
+    """frame需要を満たすcapacityをproducerの原子的burst単位へ切り上げる。"""
+
+    source = cw.Flow([1, 2])
+    expanded = source.map(lambda value: cw.emit_many([value] * 3), max_items=3)
+    framed = expanded.frame(4)
+    merged = expanded.map(lambda value, *, frame: (value, frame), frame=framed)
+    plan = cw.compile([merged])
+
+    capacities = {buffer.producer_port_id: buffer.max_items for buffer in plan.portable_ir.buffers}
+    assert capacities == {
+        source.port_id: 1,
+        expanded.port_id: 6,
+        framed.port_id: 1,
+        merged.port_id: 1,
+    }
+    result = plan.run()
+    assert any(item.code == "STALLED_EXACT_MERGE" for item in result.diagnostics)
+    assert not any(item.code == "SCHEDULER_DEADLOCK" for item in result.diagnostics)

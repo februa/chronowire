@@ -138,6 +138,8 @@ compile時に以下を解析する。
 - backend workspace
 - in-place可否
 
+`PORT_SHARED`はproducer burstを下限に、exact merge分岐が共有する祖先へだけFRAME等の構造需要を逆伝播してPort別capacityを求める。Compilerはcapacity値だけでなく、producer burst、merge Node、分岐需要をPortablePlanIRの`capacity_reasons`へ残す。Python runtimeはこのdescriptor値からPortBufferを生成し、独自に別の上限を再計算しない。
+
 fan-outでは一つの読み取り専用`PortBuffer`を共有し、consumerごとのcursorが通過した時点でitemを解放する。dtype、layout、device変換が必要なEdgeだけ`EdgeAdapterBuffer`を持つ。
 
 静的に決められない場合は、明示`max_items`またはbackpressureを持つbounded dynamic bufferを使う。通常の計算Portは暗黙dropを禁止し、overflow policyを`FAIL`とする。制御不能なリアルタイム入力だけは専用ingress bufferで明示的dropを許可する。完全な分類とdescriptorは[11_Buffer_Scheduler_PortablePlanIR設計.md](11_Buffer_Scheduler_PortablePlanIR設計.md)に定める。

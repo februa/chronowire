@@ -74,6 +74,16 @@ def _integer_tuple(data: Mapping[str, object], key: str) -> tuple[int, ...]:
     return tuple(result)
 
 
+def _string_tuple(data: Mapping[str, object], key: str) -> tuple[str, ...]:
+    values = _items(data.get(key), key)
+    result: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError(f"{key} values must be strings")
+        result.append(value)
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class RationalDescriptor:
     """PortablePlanIRで有理数を正規化して保持する。
@@ -246,6 +256,9 @@ class BufferDescriptor:
     consumer_cursor_ids: tuple[int, ...]
     max_items: int | None
     max_bytes: int | None
+    capacity_reasons: tuple[str, ...]
+    high_watermark: int
+    low_watermark: int
     overflow_policy: str
     reclaim_policy: str
     read_only: bool
@@ -255,6 +268,12 @@ class BufferDescriptor:
             raise ValueError("buffer max_items must not be negative")
         if self.max_bytes is not None and self.max_bytes < 0:
             raise ValueError("buffer max_bytes must not be negative")
+        if self.high_watermark <= 0:
+            raise ValueError("buffer high_watermark must be positive")
+        if self.low_watermark < 0 or self.low_watermark >= self.high_watermark:
+            raise ValueError("buffer low_watermark must be below high_watermark")
+        if self.max_items is not None and self.high_watermark > self.max_items:
+            raise ValueError("buffer high_watermark must not exceed max_items")
 
     @classmethod
     def from_dict(cls, value: object) -> BufferDescriptor:
@@ -268,6 +287,9 @@ class BufferDescriptor:
             _integer_tuple(data, "consumer_cursor_ids"),
             _optional_integer(data, "max_items"),
             _optional_integer(data, "max_bytes"),
+            _string_tuple(data, "capacity_reasons"),
+            _integer(data, "high_watermark"),
+            _integer(data, "low_watermark"),
             _string(data, "overflow_policy"),
             _string(data, "reclaim_policy"),
             _boolean(data, "read_only"),

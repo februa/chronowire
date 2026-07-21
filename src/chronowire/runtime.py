@@ -235,30 +235,80 @@ def _node_max_items(
     return max(1, -(-ratio.numerator // ratio.denominator))
 
 
-def _planned_buffer_capacity(
+@dataclass(frozen=True)
+class _BufferPlan:
+    """一つのPORT_SHARED bufferについてcompileした上限と根拠。"""
+
+    max_items: int
+    high_watermark: int
+    low_watermark: int
+    capacity_reasons: tuple[str, ...]
+
+
+def _planned_port_buffers(
     nodes: Sequence[NodeSpec],
     signatures: dict[int, tuple[Fraction, Fraction]],
-) -> int:
-    """一回の終端需要を満たす構造上の最大pull burstを保守的に求める。"""
+) -> dict[int, _BufferPlan]:
+    """merge分岐の共有祖先需要からPort別の保持上限を証明する。"""
 
-    demand_by_port: dict[int, int] = {}
-    maximum = 1
-    for node in nodes:
-        node_items = _node_max_items(node, signatures)
-        if node.kind is NodeKind.SOURCE:
-            demand = 1
-        elif node.kind is NodeKind.FRAME:
+    nodes_by_port = {node.output_port: node for node in nodes}
+    capacities = {node.output_port: _node_max_items(node, signatures) for node in nodes}
+    reasons: dict[int, list[str]] = {
+        node.output_port: [
+            f"producer_burst:node={node.id}:max_items={capacities[node.output_port]}"
+        ]
+        for node in nodes
+    }
+    consumer_counts: Counter[int] = Counter(
+        input_spec.source_port for node in nodes for input_spec in node.inputs
+    )
+    demand_cache: dict[int, dict[int, int]] = {}
+
+    def ancestor_demands(port_id: int) -> dict[int, int]:
+        cached = demand_cache.get(port_id)
+        if cached is not None:
+            return cached
+        node = nodes_by_port[port_id]
+        demands = {port_id: 1}
+        multiplier = 1
+        if node.kind is NodeKind.FRAME:
             if node.frame_size is None:
                 raise RuntimeError("FRAME Node lacks size")
-            demand = demand_by_port[node.inputs[0].source_port] * node.frame_size
-        else:
-            demand = max(
-                (demand_by_port[item.source_port] for item in node.inputs),
-                default=1,
+            multiplier = node.frame_size
+        for input_spec in node.inputs:
+            for ancestor, count in ancestor_demands(input_spec.source_port).items():
+                demands[ancestor] = max(demands.get(ancestor, 0), count * multiplier)
+        demand_cache[port_id] = demands
+        return demands
+
+    for node in nodes:
+        if node.kind is not NodeKind.MAP or len(node.inputs) < 2:
+            continue
+        branch_demands = [ancestor_demands(item.source_port) for item in node.inputs]
+        occurrence: Counter[int] = Counter(
+            ancestor for branch in branch_demands for ancestor in branch
+        )
+        for ancestor, branch_count in occurrence.items():
+            if branch_count < 2 or consumer_counts[ancestor] < 2:
+                continue
+            structural_required = max(branch.get(ancestor, 0) for branch in branch_demands)
+            producer_burst = _node_max_items(nodes_by_port[ancestor], signatures)
+            required = -(-structural_required // producer_burst) * producer_burst
+            capacities[ancestor] = max(capacities[ancestor], required)
+            reasons[ancestor].append(
+                f"shared_merge_demand:node={node.id}:max_items={required}:"
+                f"structural_items={structural_required}:producer_burst={producer_burst}"
             )
-        demand_by_port[node.output_port] = demand
-        maximum = max(maximum, demand, node_items)
-    return maximum
+
+    return {
+        port_id: _BufferPlan(
+            max_items=capacity,
+            high_watermark=capacity,
+            low_watermark=max(0, capacity - 1),
+            capacity_reasons=tuple(dict.fromkeys(reasons[port_id])),
+        )
+        for port_id, capacity in capacities.items()
+    }
 
 
 def _collector_descriptor(index: int, item: OutputSpec[Any]) -> OutputDescriptor:
@@ -323,7 +373,7 @@ def _portable_plan_ir(
     """compile済みPython実体からportable descriptorだけを抽出する。"""
 
     signatures = _time_signature(nodes)
-    buffer_capacity = _planned_buffer_capacity(nodes, signatures)
+    buffer_plans = _planned_port_buffers(nodes, signatures)
     edge_rows = tuple(
         (node, input_index) for node in nodes for input_index, _ in enumerate(node.inputs)
     )
@@ -383,8 +433,11 @@ def _portable_plan_ir(
             "port_shared",
             node.output_port,
             tuple(cursors_by_port[node.output_port]),
-            buffer_capacity,
+            buffer_plans[node.output_port].max_items,
             None,
+            buffer_plans[node.output_port].capacity_reasons,
+            buffer_plans[node.output_port].high_watermark,
+            buffer_plans[node.output_port].low_watermark,
             "fail",
             "all_consumers_advanced",
             True,
@@ -798,11 +851,14 @@ class _PlanRuntime:
         self.nodes_by_id = {node.id: node for node in plan._nodes}
         signatures = _time_signature(plan._nodes)
         self.node_max_items = {node.id: _node_max_items(node, signatures) for node in plan._nodes}
-        self.buffer_capacity = _planned_buffer_capacity(plan._nodes, signatures)
+        buffer_descriptors = {item.buffer_id: item for item in plan._portable_ir.buffers}
         self.port_buffers: dict[int, PortBuffer[Emission[object]]] = {
             node.output_port: PortBuffer(
                 node.output_port,
-                max_items=self.buffer_capacity,
+                max_items=self._required_buffer_capacity(
+                    node.output_port,
+                    buffer_descriptors[node.output_port].max_items,
+                ),
             )
             for node in plan._nodes
         }
@@ -819,6 +875,7 @@ class _PlanRuntime:
         self.rates: dict[int, _RateState] = {}
         self.port_sequences: dict[int, int] = defaultdict(int)
         self.published_counts: Counter[int] = Counter()
+        self.port_frontiers: dict[int, Fraction] = {}
         self.exhausted_ports: set[int] = set()
         self.stalled_nodes: set[int] = set()
         self.source_indexes: dict[int, int] = defaultdict(int)
@@ -835,6 +892,16 @@ class _PlanRuntime:
         self.extensions = tuple(self._create_extension_runtime(item) for item in extensions)
         self.output_ports = set(self.collectors)
         self.root_ports: set[int] = set()
+
+    @staticmethod
+    def _required_buffer_capacity(port_id: int, max_items: int | None) -> int:
+        """PortablePlanIRの通常Port capacityが実行可能な正値であることを検証する。"""
+
+        if max_items is None or max_items <= 0:
+            raise RuntimeError(
+                f"port {port_id} PORT_SHARED buffer lacks a positive max_items contract"
+            )
+        return max_items
 
     def _create_extension_runtime(self, bound: _BoundExtension) -> _ExtensionRuntime:
         """binding factoryから型検証済みのrun-local handlerを生成する。"""
@@ -998,6 +1065,13 @@ class _PlanRuntime:
         self.port_buffers[port_id].publish(emission)
         self.published_counts[port_id] += 1
 
+    def _advance_frontier(self, port_id: int, value: Fraction) -> None:
+        """Portが今後生成し得ない過去区間の終端を単調に進める。"""
+
+        current = self.port_frontiers.get(port_id)
+        if current is None or value > current:
+            self.port_frontiers[port_id] = value
+
     def _advance_port(self, port_id: int) -> bool:
         """portの未充足需要へ向けて高々一つの実行単位だけを進める。"""
 
@@ -1030,6 +1104,7 @@ class _PlanRuntime:
             self.exhausted_ports.add(node.output_port)
             return True
         self._publish(node.output_port, emission)
+        self._advance_frontier(node.output_port, emission.interval.end.as_fraction())
         return True
 
     def _advance_frame(self, node: NodeSpec) -> bool:
@@ -1082,7 +1157,17 @@ class _PlanRuntime:
             queue = self.queues[(node.id, input_index)]
             if not queue:
                 if input_spec.source_port in self.exhausted_ports:
-                    self._stall_exact_merge(node, input_index, main.interval, None)
+                    self._stall_exact_merge(node, input_index, main.interval, None, None)
+                    return True
+                frontier = self.port_frontiers.get(input_spec.source_port)
+                if frontier is not None and frontier > main.interval.start.as_fraction():
+                    self._stall_exact_merge(
+                        node,
+                        input_index,
+                        main.interval,
+                        None,
+                        frontier,
+                    )
                     return True
                 return self._advance_port(input_spec.source_port)
             available = queue[0]
@@ -1093,7 +1178,13 @@ class _PlanRuntime:
             if available_start < main_start:
                 queue.popleft()
                 return True
-            self._stall_exact_merge(node, input_index, main.interval, available.interval)
+            self._stall_exact_merge(
+                node,
+                input_index,
+                main.interval,
+                available.interval,
+                self.port_frontiers.get(input_spec.source_port),
+            )
             return True
         return self._process_map_if_ready(node)
 
@@ -1119,6 +1210,12 @@ class _PlanRuntime:
                     continue
                 self._stall_latest(node, input_index, main.interval)
                 return True
+            frontier = self.port_frontiers.get(input_spec.source_port)
+            if frontier is not None and frontier > main.interval.start.as_fraction():
+                if (node.id, input_index) in self.latest:
+                    continue
+                self._stall_latest(node, input_index, main.interval)
+                return True
             if input_spec.source_port not in self.exhausted_ports:
                 return self._advance_port(input_spec.source_port)
             if (node.id, input_index) not in self.latest:
@@ -1132,6 +1229,7 @@ class _PlanRuntime:
         input_index: int,
         required: LogicalInterval,
         available: LogicalInterval | None,
+        producer_frontier: Fraction | None,
     ) -> None:
         """生成不能なexact intervalを診断し、Nodeの全cursorを解除する。"""
 
@@ -1147,6 +1245,9 @@ class _PlanRuntime:
                 "failed_input_index": input_index,
                 "required_interval": str(required),
                 "available_interval": None if available is None else str(available),
+                "producer_frontier": (
+                    None if producer_frontier is None else str(producer_frontier)
+                ),
             },
         )
         self._stop_node(node, diagnostic)
@@ -1213,11 +1314,16 @@ class _PlanRuntime:
         emission = queue.popleft()
         if state.skip_remaining:
             state.skip_remaining -= 1
+            self._advance_frontier(node.output_port, emission.interval.end.as_fraction())
             return True
         state.items.append(emission)
         if node.frame_size is None or node.frame_hop is None:
             raise RuntimeError("FRAME Node lacks size or hop")
         if len(state.items) < node.frame_size:
+            self._advance_frontier(
+                node.output_port,
+                state.items[0].interval.start.as_fraction(),
+            )
             return True
         self._emit_frame(node, state.items[: node.frame_size])
         if node.frame_hop <= len(state.items):
@@ -1225,6 +1331,12 @@ class _PlanRuntime:
         else:
             state.items.clear()
             state.skip_remaining = node.frame_hop - node.frame_size
+        next_start = (
+            state.items[0].interval.start.as_fraction()
+            if state.items
+            else emission.interval.end.as_fraction()
+        )
+        self._advance_frontier(node.output_port, next_start)
         return True
 
     def _emit_frame(self, node: NodeSpec, items: Sequence[Emission[object]]) -> None:
@@ -1275,6 +1387,7 @@ class _PlanRuntime:
             )
         self._emit_frame(node, items)
         state.items.clear()
+        self._advance_frontier(node.output_port, items[-1].interval.end.as_fraction())
         return True
 
     @staticmethod
@@ -1316,6 +1429,7 @@ class _PlanRuntime:
             )
             self._publish(node.output_port, output)
             state.next_fire += period
+        self._advance_frontier(node.output_port, end)
         return True
 
     def _prepare_latest(self, node: NodeSpec, main: Emission[object]) -> bool:
@@ -1373,6 +1487,7 @@ class _PlanRuntime:
                     tuple(item for value in inputs for item in value.diagnostics) + (diagnostic,),
                 ),
             )
+            self._advance_frontier(node.output_port, main.interval.end.as_fraction())
             return True
 
         try:
@@ -1389,7 +1504,7 @@ class _PlanRuntime:
             ) from error
         inherited_status = _combined_status(inputs)
         inherited_diagnostics = tuple(item for value in inputs for item in value.diagnostics)
-        for emission in self._normalize_result(
+        normalized = self._normalize_result(
             result,
             main.interval,
             node.id,
@@ -1397,8 +1512,10 @@ class _PlanRuntime:
             node.max_items,
             inherited_status,
             inherited_diagnostics,
-        ):
+        )
+        for emission in normalized:
             self._publish(node.output_port, emission)
+        self._advance_frontier(node.output_port, main.interval.end.as_fraction())
         return True
 
     def _next_sequence(self, port_id: int) -> int:

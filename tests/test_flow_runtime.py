@@ -176,6 +176,40 @@ def test_stalled_merge_releases_cursors_for_independent_output() -> None:
     assert not any(item.code == "SCHEDULER_DEADLOCK" for item in result.diagnostics)
 
 
+def test_producer_frontier_stalls_merge_after_skip_without_read_ahead() -> None:
+    """Skipで必要intervalを通過した分岐をfrontierから即座に停止する。"""
+
+    values = _CountingIterable(100)
+    source = cw.Flow(values)
+    main = source.map(lambda value: value)
+    skipped = source.map(lambda value: cw.skip())
+    merged = main.map(lambda value, *, other: (value, other), other=skipped)
+
+    result = cw.compile([merged]).run()
+
+    assert values.yielded == 1
+    stalled = next(item for item in result.diagnostics if item.code == "STALLED_EXACT_MERGE")
+    assert stalled.details["producer_frontier"] == "1"
+    assert not any(item.code == "SCHEDULER_DEADLOCK" for item in result.diagnostics)
+
+
+def test_frontier_compares_next_start_not_required_interval_end() -> None:
+    """長いmain intervalでもauxが開始時刻を通過した時点で停止する。"""
+
+    values = _CountingIterable(100)
+    source = cw.Flow(values)
+    main = source.frame(4)
+    skipped = source.map(lambda value: cw.skip())
+    merged = main.map(lambda value, *, other: (value, other), other=skipped)
+
+    result = cw.compile([merged]).run()
+
+    assert values.yielded == 4
+    stalled = next(item for item in result.diagnostics if item.code == "STALLED_EXACT_MERGE")
+    assert stalled.interval == cw.LogicalInterval(cw.LogicalTime(0), cw.LogicalTime(4))
+    assert stalled.details["producer_frontier"] == "1"
+
+
 def test_plan_run_resets_runtime_state() -> None:
     """同じPlanを再実行してもcollectorとframe stateを持ち越さない。"""
 
