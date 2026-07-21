@@ -254,6 +254,17 @@ PortablePlanIR schema 0.3は最小`StageDescriptor`、`ValueSchemaDescriptor`、
 - Stage内ではPython objectを生成しない
 - Python Executorとの意味論一致を試験する
 
+`0.3.0.dev0`の最初の実証では、有限`f64_source`、`RATE(HOLD)`、
+`FRAME(pad_end=False)`、`identity_f64` MAP、一つのcollector終端に対象を限定した。
+RATEとFRAMEは有理数periodを共通分母の整数tickへ変換し、native配列上の`nogil` loopで
+実行する。Pythonの`Emission`はcollector境界でだけ構築する。
+
+この限定経路では値、interval、sequence、OK status集計、空入力、重複frameを
+Python Executorと比較する。Python値、任意callback、Extension、EOF padding、
+`PlanSession`、DEGRADED/INVALIDとDiagnosticを伴う入力は未対応であり、Pythonへ
+暗黙fallbackせず契約名、Node、Portを含むエラーで拒否する。status/Diagnosticを含む
+native item ABIとnative CBFはPhase 4の契約固定後に接続する。
+
 ### Phase 4: portable IRとnative buffer契約の固定
 
 - ExecutionPlan schemaを固定する

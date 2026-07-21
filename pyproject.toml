@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=77", "Cython>=3.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -40,11 +40,15 @@ docs = [
 [tool.setuptools]
 package-dir = { "" = "src" }
 
+[[tool.setuptools.ext-modules]]
+name = "chronowire._cython_executor"
+sources = ["src/chronowire/_cython_executor.pyx"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-chronowire = ["py.typed"]
+chronowire = ["py.typed", "_cython_executor.pyi"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -61,3 +65,8 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 
 [tool.ruff.format]
 quote-style = "double"
+
+[dependency-groups]
+dev = [
+    "cython>=3.0",
+]

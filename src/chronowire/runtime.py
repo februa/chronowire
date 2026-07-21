@@ -68,6 +68,7 @@ from .model import (
     Severity,
     Skip,
 )
+from .native import F64SourceValues, IdentityF64Kernel
 from .plan_ir import (
     BindingDescriptor,
     BufferDescriptor,
@@ -671,6 +672,55 @@ def _stage_descriptors(
     return tuple(stages)
 
 
+def _shape_product(shape: tuple[int, ...]) -> int:
+    """固定shapeの要素数を求める。"""
+
+    result = 1
+    for item in shape:
+        result *= item
+    return result
+
+
+def _value_schema_descriptors(
+    nodes: tuple[NodeSpec, ...],
+) -> tuple[tuple[ValueSchemaDescriptor, ...], dict[int, str]]:
+    """明示native契約だけをPort value schemaへ伝播する。"""
+
+    opaque = ValueSchemaDescriptor("python:opaque", "python_opaque", None, None, None, "cpu", True)
+    descriptors: dict[str, ValueSchemaDescriptor] = {opaque.value_schema_id: opaque}
+    port_schemas: dict[int, str] = {}
+    for node in nodes:
+        schema = opaque
+        if node.kind is NodeKind.SOURCE and isinstance(node.source, F64SourceValues):
+            schema = ValueSchemaDescriptor(
+                "native:f64:scalar", "contiguous_f64", "float64", (), (), "cpu", True
+            )
+        elif node.kind in {NodeKind.RATE, NodeKind.MAP}:
+            input_schema = descriptors[port_schemas[node.inputs[0].source_port]]
+            if node.kind is NodeKind.RATE or isinstance(node.operation, IdentityF64Kernel):
+                schema = input_schema
+        elif node.kind is NodeKind.FRAME:
+            input_schema = descriptors[port_schemas[node.inputs[0].source_port]]
+            if input_schema.representation == "contiguous_f64" and node.frame_size is not None:
+                shape = (node.frame_size, *(input_schema.shape or ()))
+                strides = tuple(
+                    8 * _shape_product(shape[index + 1 :]) for index in range(len(shape))
+                )
+                schema = ValueSchemaDescriptor(
+                    "native:f64:" + "x".join(str(item) for item in shape),
+                    "contiguous_f64",
+                    "float64",
+                    shape,
+                    strides,
+                    "cpu",
+                    True,
+                )
+        descriptors.setdefault(schema.value_schema_id, schema)
+        for output_port in node.output_ports:
+            port_schemas[output_port] = schema.value_schema_id
+    return tuple(descriptors.values()), port_schemas
+
+
 def _portable_plan_ir(
     *,
     nodes: tuple[NodeSpec, ...],
@@ -741,29 +791,19 @@ def _portable_plan_ir(
         )
         for node in nodes
     )
+    value_schemas, port_schema_ids = _value_schema_descriptors(nodes)
     ports = tuple(
         PortDescriptor(
             output_port,
             node.id,
             output_index,
-            "python:opaque",
+            port_schema_ids[output_port],
             output_port,
             f"port:{output_port}",
             output_port,
         )
         for node in nodes
         for output_index, output_port in enumerate(node.output_ports)
-    )
-    value_schemas = (
-        ValueSchemaDescriptor(
-            "python:opaque",
-            "python_opaque",
-            None,
-            None,
-            None,
-            "cpu",
-            True,
-        ),
     )
     port_buffers = tuple(
         BufferDescriptor(
@@ -981,7 +1021,17 @@ def _portable_plan_ir(
             if node.kind is NodeKind.SOURCE
         ]
         + [
-            BindingDescriptor(f"kernel:{node.id}", "kernel", node.id, node.output_port, "python-v1")
+            BindingDescriptor(
+                f"kernel:{node.id}",
+                "kernel",
+                node.id,
+                node.output_port,
+                (
+                    node.operation.abi_version
+                    if isinstance(node.operation, IdentityF64Kernel)
+                    else "python-v1"
+                ),
+            )
             for node in nodes
             if node.kind is NodeKind.MAP
         ]
@@ -1014,13 +1064,21 @@ def _portable_plan_ir(
         KernelAbiDescriptor(
             node.id,
             f"kernel:{node.id}",
-            "python-v1",
-            "python_object",
-            None,
-            None,
+            (
+                node.operation.abi_version
+                if isinstance(node.operation, IdentityF64Kernel)
+                else "python-v1"
+            ),
+            (
+                node.operation.process_model
+                if isinstance(node.operation, IdentityF64Kernel)
+                else "python_object"
+            ),
+            0 if isinstance(node.operation, IdentityF64Kernel) else None,
+            8 if isinstance(node.operation, IdentityF64Kernel) else None,
             False,
             True,
-            False,
+            isinstance(node.operation, IdentityF64Kernel),
         )
         for node in nodes
         if node.kind is NodeKind.MAP
@@ -1154,7 +1212,9 @@ def compile(
                 f"CompiledKernel for node {node.id}"
             )
         compiled_kernels[node.id] = compiled
-        node_backend_names[node.id] = selected_backend.name
+        node_backend_names[node.id] = (
+            "native_kernel" if isinstance(operation, IdentityF64Kernel) else selected_backend.name
+        )
     source_request_periods = _source_request_periods(nodes)
     sorted_extensions = tuple(sorted(extensions, key=lambda item: item.priority))
     portable_ir = _portable_plan_ir(

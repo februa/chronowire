@@ -67,11 +67,26 @@ result = bound.run(options=cw.RuntimeOptions(profiler_enabled=True))
 `0.3.0.dev0`ではNative Executorのsemantic prototypeへ進む。既存runtimeは
 `PythonExecutor`として選択可能な境界へ分離し、PortablePlanIR schema 0.3は
 `StageDescriptor`、`ValueSchemaDescriptor`、実験的`KernelAbiDescriptor`を持つ。
-現時点のPort値は`python_opaque`、Kernel ABIは`python-v1`かつnative非互換と明記し、
-Native側がdtype、shape、workspaceを推測しない。
+通常のPython値は`python_opaque`、Kernel ABIは`python-v1`かつnative非互換と明記し、
+Native側がdtype、shape、workspaceを推測しない。明示的な`f64_source()`と
+`identity_f64()`だけは、限定Cython Executorで実行可能なschemaとABIを宣言する。
 
 ```python
 result = plan.run(executor=cw.PythonExecutor())
+```
+
+最小Cython経路は`SOURCE → RATE(HOLD) → FRAME(pad_end=False) → identity_f64 → collector`
+だけを受理する。未対応Node、Python callback、Extension、継続sessionはPythonへ暗黙に
+fallbackせず、session作成時に明示エラーにする。
+
+```python
+source = cw.Flow(cw.f64_source([1.0, 2.0, 3.0]))
+frames = source.rate(2).frame(2).map(cw.identity_f64())
+plan = cw.compile([cw.output(frames, collector=cw.Bounded(8))])
+
+python_result = plan.run(executor=cw.PythonExecutor())
+cython_result = plan.run(executor=cw.CythonExecutor())
+assert cython_result == python_result
 ```
 
 sample粒度と4-sample block粒度の固定CBFについて、値、interval、sequence、status、

@@ -125,3 +125,39 @@ class PythonExecutor:
         """既存Python runtimeを所有する継続sessionを生成する。"""
 
         return plan._create_python_plan_session(extension_bindings, options)
+
+
+@dataclass(frozen=True)
+class CythonExecutor:
+    """schema 0.3の限定f64 Stageを選択するsemantic prototype。"""
+
+    name: str = "cython"
+
+    def create_session(
+        self,
+        plan: ExecutionPlan,
+        extension_bindings: Mapping[str, Extension] | None,
+    ) -> ExecutorSession:
+        """STRICT検証済みのCython一回実行sessionを生成する。"""
+
+        if extension_bindings:
+            raise ValueError("CythonExecutor prototype does not support Extension bindings")
+        from .cython_executor import CythonExecutionSession
+
+        return CythonExecutionSession(plan)
+
+    def create_plan_session(
+        self,
+        plan: ExecutionPlan,
+        extension_bindings: Mapping[str, Extension] | None,
+        options: RuntimeOptions | None,
+    ) -> ExecutorPlanSession:
+        """未実装の継続Cython sessionを暗黙fallbackせず拒否する。"""
+
+        del plan, extension_bindings, options
+        from .errors import PlanSessionError
+
+        raise PlanSessionError(
+            "CythonExecutor prototype does not support PlanSession; "
+            "contract=cython_continuous_session"
+        )

@@ -25,7 +25,7 @@ from .errors import (
     SourceExecutionError,
     SynchronizationError,
 )
-from .executor import Executor, ExecutorPlanSession, ExecutorSession, PythonExecutor
+from .executor import CythonExecutor, Executor, ExecutorPlanSession, ExecutorSession, PythonExecutor
 from .extension import (
     Always,
     Every,
@@ -74,6 +74,7 @@ from .model import (
     kernel_outputs,
     skip,
 )
+from .native import F64SourceValues, IdentityF64Kernel, f64_source, identity_f64
 from .plan_ir import PortablePlanIR
 from .runtime import (
     BufferProfile,
@@ -115,6 +116,7 @@ __all__ = [
     "CompiledKernel",
     "CompiledKernelSession",
     "Config",
+    "CythonExecutor",
     "Diagnostic",
     "DuplicateExtensionIdError",
     "DuplicateOutputError",
@@ -137,6 +139,7 @@ __all__ = [
     "ExtensionOverflowPolicy",
     "ExtensionSession",
     "Flow",
+    "F64SourceValues",
     "GraphError",
     "GraphInfo",
     "GapPolicy",
@@ -144,6 +147,7 @@ __all__ = [
     "KernelOutputs",
     "KernelProfile",
     "InputSemantics",
+    "IdentityF64Kernel",
     "Kernel",
     "Latest",
     "LogicalInterval",
@@ -187,6 +191,8 @@ __all__ = [
     "bind_plan",
     "callable_kernel",
     "emit_many",
+    "f64_source",
+    "identity_f64",
     "kernel_outputs",
     "observe",
     "output",

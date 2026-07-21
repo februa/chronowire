@@ -272,6 +272,11 @@ PortablePlanIR schema 0.3は次を追加する。
 
 Python objectのdtypeやshapeを値の実行結果から推測しない。宣言がないPortは`python_opaque`とし、Native Stageへ入れない。現行Python Kernelは`python-v1`、`python_object` process model、native非互換、workspace未宣言としてexportする。将来のnative Kernelだけがversion付きABIとworkspaceを明示する。
 
+`0.3.0.dev0`の限定実証では`f64_source`がscalar `float64` schemaを宣言し、RATEは
+そのschemaを保存し、FRAMEは先頭へ固定frame sizeを加えたcontiguous schemaを生成する。
+`identity_f64`だけがversion付き実験ABI、workspace 0 byte、alignment 8 byte、
+native互換を宣言する。通常のIterableやPython callableからdtype/shapeを推測しない。
+
 StageはPython Source、Python callback、Backend変更、観測Portで分割する。連続するRATE/FRAMEは`executor_opcode` Stageへまとめてよいが、観測Portを越えてまとめない。schema 0.1/0.2ではこれら三descriptorが存在しないため空tupleとして読み込む。
 
 ## 8. compile時のbuffer planning
