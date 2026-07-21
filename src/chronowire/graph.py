@@ -12,7 +12,7 @@ from typing import Any, Generic, TypeVar
 
 from .config import Config
 from .kernel import Kernel
-from .source import Source
+from .source import RealtimeSource, Source
 
 T = TypeVar("T")
 U = TypeVar("U")
@@ -62,7 +62,7 @@ class NodeSpec:
     constants: Mapping[str, object] | None = None
     config_paths: tuple[str, ...] | None = None
     accepts_invalid: bool = False
-    source: Iterable[object] | Source[object] | None = None
+    source: Iterable[object] | Source[object] | RealtimeSource[object] | None = None
     frame_size: int | None = None
     frame_hop: int | None = None
     pad_end: bool = False
@@ -138,7 +138,7 @@ class Graph:
         constants: Mapping[str, object] | None = None,
         config_paths: tuple[str, ...] | None = None,
         accepts_invalid: bool = False,
-        source: Iterable[object] | Source[object] | None = None,
+        source: Iterable[object] | Source[object] | RealtimeSource[object] | None = None,
         frame_size: int | None = None,
         frame_hop: int | None = None,
         pad_end: bool = False,
@@ -274,7 +274,11 @@ class Flow(Generic[T]):
 
     __slots__ = ("_config", "_graph", "_port_id")
 
-    def __init__(self, source: Iterable[T] | Source[T], config: Config | None = None) -> None:
+    def __init__(
+        self,
+        source: Iterable[T] | Source[T] | RealtimeSource[T],
+        config: Config | None = None,
+    ) -> None:
         self._graph = Graph()
         self._config = config if config is not None else Config()
         self._port_id = self._graph.add_node(

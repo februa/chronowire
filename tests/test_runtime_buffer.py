@@ -2,11 +2,14 @@
 
 import pytest
 
+import chronowire as cw
 from chronowire.runtime_buffer import (
     CursorQueue,
     FrameHistoryBuffer,
+    GapMarker,
     LatestStateBuffer,
     PortBuffer,
+    RealtimeIngressBuffer,
 )
 
 
@@ -136,3 +139,58 @@ def test_latest_state_replaces_old_value_without_queue_growth() -> None:
 
     assert state.has_value
     assert state.get() == 2
+
+
+def _emission(index: int) -> cw.Emission[int]:
+    return cw.Emission(
+        index,
+        cw.LogicalInterval(cw.LogicalTime(index), cw.LogicalTime(index + 1)),
+        index,
+    )
+
+
+def test_realtime_ingress_drop_oldest_coalesces_gap_before_retained_items() -> None:
+    """DROP_OLDESTが連続欠落を失わず、保持itemより先に配送する。"""
+
+    ingress = RealtimeIngressBuffer[int](
+        30,
+        0,
+        0,
+        2,
+        cw.RealtimeOverflowPolicy.DROP_OLDEST,
+    )
+    for index in range(4):
+        ingress.publish(_emission(index))
+    ingress.close()
+
+    gap = ingress.take()
+    assert isinstance(gap, GapMarker)
+    assert gap.interval == cw.LogicalInterval(cw.LogicalTime(0), cw.LogicalTime(2))
+    assert gap.dropped_count == 2
+    assert gap.total_dropped_count == 2
+    assert ingress.take() == _emission(2)
+    assert ingress.take() == _emission(3)
+    assert ingress.take() is None
+
+
+def test_realtime_ingress_drop_newest_preserves_buffered_items() -> None:
+    """DROP_NEWESTは既存itemを保持し、後続欠落を末尾へ記録する。"""
+
+    ingress = RealtimeIngressBuffer[int](
+        31,
+        0,
+        0,
+        2,
+        cw.RealtimeOverflowPolicy.DROP_NEWEST,
+    )
+    for index in range(4):
+        ingress.publish(_emission(index))
+    ingress.close()
+
+    assert ingress.take() == _emission(0)
+    assert ingress.take() == _emission(1)
+    gap = ingress.take()
+    assert isinstance(gap, GapMarker)
+    assert gap.interval == cw.LogicalInterval(cw.LogicalTime(2), cw.LogicalTime(4))
+    assert gap.dropped_count == 2
+    assert ingress.take() is None

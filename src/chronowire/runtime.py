@@ -67,8 +67,21 @@ from .plan_ir import (
     TimeDescriptor,
     TriggerDescriptor,
 )
-from .runtime_buffer import CursorQueue, FrameHistoryBuffer, LatestStateBuffer, PortBuffer
-from .source import Source, SourceRequest
+from .runtime_buffer import (
+    CursorQueue,
+    FrameHistoryBuffer,
+    GapMarker,
+    LatestStateBuffer,
+    PortBuffer,
+    RealtimeIngressBuffer,
+)
+from .source import (
+    RealtimeOverflowPolicy,
+    RealtimeSource,
+    RealtimeSourceSession,
+    Source,
+    SourceRequest,
+)
 
 T = TypeVar("T")
 
@@ -132,6 +145,12 @@ def _status_rank(status: EmissionStatus) -> int:
 
 def _combined_status(emissions: Sequence[Emission[object]]) -> EmissionStatus:
     return max((item.status for item in emissions), key=_status_rank, default=EmissionStatus.OK)
+
+
+def _has_input_overrun(emission: Emission[object]) -> bool:
+    """Emissionがrealtime欠落境界直後の値ならTrueを返す。"""
+
+    return any(item.code == "INPUT_OVERRUN" for item in emission.diagnostics)
 
 
 def _required_nodes(graph: Graph, root_ports: Sequence[int]) -> tuple[NodeSpec, ...]:
@@ -454,6 +473,46 @@ def _portable_plan_ir(
     next_buffer_id = max((node.output_port for node in nodes), default=-1) + 1
     internal_buffers: list[BufferDescriptor] = []
     for node in nodes:
+        if node.kind is NodeKind.SOURCE and isinstance(node.source, RealtimeSource):
+            if (
+                isinstance(node.source.max_items, bool)
+                or not isinstance(node.source.max_items, int)
+                or node.source.max_items <= 0
+            ):
+                raise CompileError(
+                    f"realtime source node {node.id} port {node.output_port} requires "
+                    "positive max_items"
+                )
+            if not isinstance(node.source.overflow_policy, RealtimeOverflowPolicy):
+                raise CompileError(
+                    f"realtime source node {node.id} port {node.output_port} has invalid "
+                    "overflow_policy; contract=RealtimeOverflowPolicy"
+                )
+            internal_buffers.append(
+                BufferDescriptor(
+                    buffer_id=next_buffer_id,
+                    kind="realtime_ingress",
+                    producer_port_id=node.output_port,
+                    owner_node_id=node.id,
+                    owner_input_index=None,
+                    consumer_cursor_ids=(),
+                    max_items=node.source.max_items,
+                    max_bytes=None,
+                    capacity_reasons=(
+                        f"realtime_ingress:node={node.id}:max_items={node.source.max_items}",
+                    ),
+                    high_watermark=node.source.max_items,
+                    low_watermark=max(0, node.source.max_items - 1),
+                    overflow_policy=node.source.overflow_policy.value,
+                    reclaim_policy="scheduler_take",
+                    read_only=True,
+                    device="cpu",
+                    alignment_bytes=None,
+                    ownership="executor",
+                    copy_policy="shared_reference",
+                )
+            )
+            next_buffer_id += 1
         if node.kind is NodeKind.FRAME:
             if node.frame_size is None or node.frame_hop is None:
                 raise RuntimeError("FRAME Node lacks size or hop")
@@ -524,14 +583,37 @@ def _portable_plan_ir(
         )
         for node in nodes
     )
+    ingress_by_node = {
+        item.owner_node_id: item for item in buffers if item.kind == "realtime_ingress"
+    }
     sources = tuple(
         SourceDescriptor(
-            node.id,
-            "pull_controlled",
-            node.source.is_finite if isinstance(node.source, Source) else True,
-            RationalDescriptor.from_fraction(source_request_periods[node.id]),
-            None,
-            None,
+            node_id=node.id,
+            mode=(
+                "realtime_push" if isinstance(node.source, RealtimeSource) else "pull_controlled"
+            ),
+            is_finite=(
+                False
+                if isinstance(node.source, RealtimeSource)
+                else node.source.is_finite
+                if isinstance(node.source, Source)
+                else True
+            ),
+            request_duration=RationalDescriptor.from_fraction(source_request_periods[node.id]),
+            burst_max_items=(
+                node.source.max_items if isinstance(node.source, RealtimeSource) else None
+            ),
+            ingress_buffer_id=(
+                ingress_by_node[node.id].buffer_id
+                if isinstance(node.source, RealtimeSource)
+                else None
+            ),
+            overflow_policy=(
+                node.source.overflow_policy.value
+                if isinstance(node.source, RealtimeSource)
+                else None
+            ),
+            gap_policy="degrade_next",
         )
         for node in nodes
         if node.kind is NodeKind.SOURCE
@@ -977,8 +1059,35 @@ class _PlanRuntime:
         self.exhausted_ports: set[int] = set()
         self.stalled_nodes: set[int] = set()
         self.source_indexes: dict[int, int] = defaultdict(int)
-        source_nodes = (node for node in plan._nodes if node.kind is NodeKind.SOURCE)
-        self.source_iterators = {node.id: iter(self._source_values(node)) for node in source_nodes}
+        source_nodes = tuple(node for node in plan._nodes if node.kind is NodeKind.SOURCE)
+        self.source_iterators = {
+            node.id: iter(self._source_values(node))
+            for node in source_nodes
+            if not isinstance(node.source, RealtimeSource)
+        }
+        self.realtime_ingresses: dict[int, RealtimeIngressBuffer[object]] = {}
+        for descriptor in buffer_descriptors.values():
+            if descriptor.kind != "realtime_ingress":
+                continue
+            if descriptor.owner_node_id is None or descriptor.max_items is None:
+                raise RuntimeError(
+                    f"buffer {descriptor.buffer_id} REALTIME_INGRESS lacks owner or capacity"
+                )
+            source = self.nodes_by_id[descriptor.owner_node_id].source
+            if not isinstance(source, RealtimeSource):
+                raise RuntimeError(
+                    f"buffer {descriptor.buffer_id} owner node {descriptor.owner_node_id} "
+                    "is not a RealtimeSource"
+                )
+            self.realtime_ingresses[descriptor.owner_node_id] = RealtimeIngressBuffer(
+                descriptor.buffer_id,
+                descriptor.owner_node_id,
+                descriptor.producer_port_id,
+                descriptor.max_items,
+                source.overflow_policy,
+            )
+        self.realtime_sessions: dict[int, RealtimeSourceSession] = {}
+        self.pending_source_gaps: dict[int, list[Diagnostic]] = defaultdict(list)
         self.diagnostics = list(plan._compile_diagnostics)
         self.status_counts: Counter[EmissionStatus] = Counter()
         self.collectors: dict[int, CollectorSession[Any]] = {
@@ -1026,6 +1135,7 @@ class _PlanRuntime:
             for extension in self.extensions:
                 self._initialize_extension(extension, context)
                 initialized.append(extension)
+            self._start_realtime_sources()
             roots = tuple(
                 dict.fromkeys(
                     [item.flow.port_id for item in self.plan._outputs]
@@ -1058,6 +1168,8 @@ class _PlanRuntime:
             self._report_unmatched_inputs()
             return self._result()
         finally:
+            for session in self.realtime_sessions.values():
+                session.stop()
             # collectorやKernelが失敗しても、Extensionが外部資源を閉じられるようにする。
             for extension in reversed(initialized):
                 self._finalize_extension(extension, context)
@@ -1073,6 +1185,22 @@ class _PlanRuntime:
             extension.session.initialize(context)
         except Exception as error:
             raise self._extension_execution_error(extension, "initialize", error) from error
+
+    def _start_realtime_sources(self) -> None:
+        """run-local ingressをbindして外部push受付を開始する。"""
+
+        for node_id, ingress in self.realtime_ingresses.items():
+            node = self.nodes_by_id[node_id]
+            source = node.source
+            if not isinstance(source, RealtimeSource):
+                raise RuntimeError(f"realtime source node {node_id} lost its binding")
+            session = source.start(ingress, node.config)
+            if not isinstance(session, RealtimeSourceSession):
+                raise TypeError(
+                    f"realtime source node {node.id} port {node.output_port} start returned "
+                    "an invalid RealtimeSourceSession"
+                )
+            self.realtime_sessions[node_id] = session
 
     def _finalize_extension(
         self,
@@ -1123,6 +1251,8 @@ class _PlanRuntime:
         source = node.source
         if source is None:
             return
+        if isinstance(source, RealtimeSource):
+            raise RuntimeError("RealtimeSource must be consumed through REALTIME_INGRESS")
         if not isinstance(source, Source):
             yield from source
             return
@@ -1191,6 +1321,23 @@ class _PlanRuntime:
     def _advance_source(self, node: NodeSpec) -> bool:
         """需要があるSourceから一件だけpublishする。"""
 
+        ingress = self.realtime_ingresses.get(node.id)
+        if ingress is not None:
+            record = ingress.take()
+            if record is None:
+                self.exhausted_ports.add(node.output_port)
+                return True
+            if isinstance(record, GapMarker):
+                self._record_source_gap(node, record)
+                return True
+            emission = self._degrade_after_source_gap(node, record)
+            if self.duration is not None and emission.interval.end.as_fraction() > self.duration:
+                self.exhausted_ports.add(node.output_port)
+                return True
+            self._publish(node.output_port, emission)
+            self._advance_frontier(node.output_port, emission.interval.end.as_fraction())
+            return True
+
         try:
             value = next(self.source_iterators[node.id])
         except StopIteration:
@@ -1204,6 +1351,55 @@ class _PlanRuntime:
         self._publish(node.output_port, emission)
         self._advance_frontier(node.output_port, emission.interval.end.as_fraction())
         return True
+
+    def _record_source_gap(self, node: NodeSpec, marker: GapMarker) -> None:
+        """dropを失われないDiagnosticとして記録し、次Emissionへ引き継ぐ。"""
+
+        diagnostic = Diagnostic(
+            Severity.WARNING,
+            "INPUT_OVERRUN",
+            "realtime ingress dropped input emissions",
+            node_id=node.id,
+            port_id=node.output_port,
+            interval=marker.interval,
+            details={
+                "dropped_count": marker.dropped_count,
+                "total_dropped_count": marker.total_dropped_count,
+                "capacity": marker.capacity,
+                "overflow_policy": marker.overflow_policy.value,
+            },
+        )
+        self.pending_source_gaps[node.id].append(diagnostic)
+        self.diagnostics.append(diagnostic)
+        self._advance_frontier(node.output_port, marker.interval.end.as_fraction())
+        self._notify_diagnostic(diagnostic)
+
+    def _degrade_after_source_gap(
+        self,
+        node: NodeSpec,
+        emission: Emission[object],
+    ) -> Emission[object]:
+        """直前のGapMarker群を次の受理Emissionへ付加する。"""
+
+        diagnostics = tuple(self.pending_source_gaps.pop(node.id, ()))
+        if not diagnostics:
+            return emission
+        metadata = dict(emission.metadata)
+        dropped_count = 0
+        for diagnostic in diagnostics:
+            value = diagnostic.details.get("dropped_count")
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise RuntimeError("INPUT_OVERRUN Diagnostic lacks integer dropped_count")
+            dropped_count += value
+        metadata["input_overrun_dropped_count"] = dropped_count
+        return Emission(
+            emission.value,
+            emission.interval,
+            emission.sequence,
+            max((emission.status, EmissionStatus.DEGRADED), key=_status_rank),
+            emission.diagnostics + diagnostics,
+            metadata,
+        )
 
     def _advance_frame(self, node: NodeSpec) -> bool:
         """frame履歴を一件進め、入力EOFでは必要なら一度だけpaddingする。"""
@@ -1410,6 +1606,9 @@ class _PlanRuntime:
             return False
         state = self.frames[node.id]
         emission = queue.popleft()
+        if _has_input_overrun(emission):
+            state.history.clear()
+            state.skip_remaining = 0
         if state.skip_remaining:
             state.skip_remaining -= 1
             self._advance_frontier(node.output_port, emission.interval.end.as_fraction())
@@ -1511,6 +1710,8 @@ class _PlanRuntime:
         start = source.interval.start.as_fraction()
         end = source.interval.end.as_fraction()
         state = self.rates.setdefault(node.id, _RateState())
+        if _has_input_overrun(source):
+            state.next_fire = None
         if state.next_fire is None:
             state.next_fire = start
         while state.next_fire < start:
@@ -1566,6 +1767,12 @@ class _PlanRuntime:
                 else self.latest[(node.id, index)].get()
             )
             inputs.append(emission)
+
+        if any(_has_input_overrun(item) for item in inputs):
+            compiled = self.plan._compiled_kernels.get(node.id)
+            if compiled is None:
+                raise RuntimeError(f"MAP Node {node.id} lacks a CompiledKernel")
+            self.kernel_sessions[node.id] = compiled.create_session()
 
         if (
             any(item.status is EmissionStatus.INVALID for item in inputs)

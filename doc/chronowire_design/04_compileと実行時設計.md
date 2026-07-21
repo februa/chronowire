@@ -184,6 +184,8 @@ SceneRenderer等は`start_time`と`duration`の要求に対して信号を生成
 
 `REALTIME_PUSH`はSource作成時またはbinding時に`max_items`を必須とし、v0.1の既定overflow policyを`DROP_OLDEST`とする。dropは`INPUT_OVERRUN` Diagnosticと欠落intervalを伴う`GapMarker`としてruntimeへ伝える。`BLOCK`はリアルタイムcallbackでは禁止する。
 
+Python Executorは`RealtimeSource.start()`へrun-local `RealtimeIngressBuffer`をreceiverとして渡す。ingressはthread-safeかつnon-blockingで、通常Emissionだけを`max_items`へ数える。dropしたintervalはbuffer容量外のcontrol recordとして連続区間をcoalesceし、次の保持Emissionより前にSchedulerへ渡す。run終了時はSource sessionの`stop()`を必ず呼び、Planへcallback状態を保持しない。
+
 ## 10. Runtime Buffer
 
 runtime buffer分類:

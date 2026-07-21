@@ -65,7 +65,15 @@ from .runtime import (
     compile,
     output,
 )
-from .source import Source, SourceBatch, SourceRequest
+from .source import (
+    RealtimeOverflowPolicy,
+    RealtimeReceiver,
+    RealtimeSource,
+    RealtimeSourceSession,
+    Source,
+    SourceBatch,
+    SourceRequest,
+)
 
 __all__ = [
     "Always",
@@ -113,6 +121,10 @@ __all__ = [
     "PortablePlanIR",
     "PythonBackend",
     "RatePolicy",
+    "RealtimeOverflowPolicy",
+    "RealtimeReceiver",
+    "RealtimeSource",
+    "RealtimeSourceSession",
     "RunResult",
     "RunContext",
     "Severity",

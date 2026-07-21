@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from threading import Condition
 from typing import Generic, TypeVar
+
+from .model import Emission, LogicalInterval
+from .source import RealtimeOverflowPolicy
 
 T = TypeVar("T")
 
@@ -314,3 +318,146 @@ class LatestStateBuffer(Generic[T]):
         value = self._value
         assert value is not None
         return value
+
+
+@dataclass(frozen=True)
+class GapMarker:
+    """Realtime ingressで失われた連続intervalを表す内部control record。"""
+
+    source_node_id: int
+    source_port_id: int
+    interval: LogicalInterval
+    dropped_count: int
+    total_dropped_count: int
+    capacity: int
+    overflow_policy: RealtimeOverflowPolicy
+
+
+class RealtimeIngressBuffer(Generic[T]):
+    """外部callbackとSchedulerを分離するthread-safe bounded ingress。
+
+    Args:
+        buffer_id: PortablePlanIRの`REALTIME_INGRESS` buffer ID。
+        source_node_id: Source Node ID。
+        source_port_id: Source output Port ID。
+        max_items: 通常Emissionの保持上限。
+        overflow_policy: 満杯時の棄却規則。blockingは提供しない。
+
+    境界条件:
+        GapMarkerは通常item数へ数えず、隣接dropをcoalesceして失わない。
+    """
+
+    def __init__(
+        self,
+        buffer_id: int,
+        source_node_id: int,
+        source_port_id: int,
+        max_items: int,
+        overflow_policy: RealtimeOverflowPolicy,
+    ) -> None:
+        if max_items <= 0:
+            raise ValueError("RealtimeIngressBuffer max_items must be positive")
+        self.buffer_id = buffer_id
+        self.source_node_id = source_node_id
+        self.source_port_id = source_port_id
+        self.max_items = max_items
+        self.overflow_policy = overflow_policy
+        self._records: deque[Emission[T] | GapMarker] = deque()
+        self._item_count = 0
+        self._total_dropped = 0
+        self._closed = False
+        self._failure: BaseException | None = None
+        self._condition = Condition()
+
+    def publish(self, emission: Emission[T]) -> None:
+        """一件を非blockingで受理し、満杯ならpolicyに従って棄却する。"""
+
+        if not isinstance(emission, Emission):
+            raise TypeError("realtime receiver accepts only Emission values")
+        with self._condition:
+            if self._closed:
+                return
+            if self._item_count < self.max_items:
+                self._records.append(emission)
+                self._item_count += 1
+            elif self.overflow_policy is RealtimeOverflowPolicy.DROP_NEWEST:
+                self._record_gap(len(self._records), emission)
+            else:
+                oldest_index = next(
+                    index
+                    for index, record in enumerate(self._records)
+                    if isinstance(record, Emission)
+                )
+                dropped = self._records[oldest_index]
+                if not isinstance(dropped, Emission):
+                    raise RuntimeError("realtime ingress lost its oldest Emission")
+                del self._records[oldest_index]
+                self._item_count -= 1
+                self._record_gap(oldest_index, dropped)
+                self._records.append(emission)
+                self._item_count += 1
+            self._condition.notify()
+
+    def close(self) -> None:
+        """受付を正常終了し、残るrecordのdrain後にEOFとする。"""
+
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+    def fail(self, error: BaseException) -> None:
+        """受付を失敗終了し、drain後にSchedulerへ原因を送出する。"""
+
+        with self._condition:
+            self._failure = error
+            self._closed = True
+            self._condition.notify_all()
+
+    def take(self) -> Emission[T] | GapMarker | None:
+        """次recordを待って返す。正常close後のdrain完了時はNoneを返す。"""
+
+        with self._condition:
+            while not self._records and not self._closed:
+                self._condition.wait()
+            if self._records:
+                record = self._records.popleft()
+                if isinstance(record, Emission):
+                    self._item_count -= 1
+                return record
+            if self._failure is not None:
+                raise RuntimeError(
+                    f"realtime source node {self.source_node_id} port {self.source_port_id} failed"
+                ) from self._failure
+            return None
+
+    @property
+    def total_dropped_count(self) -> int:
+        """このrunで棄却したEmission総数を返す。"""
+
+        with self._condition:
+            return self._total_dropped
+
+    def _record_gap(self, index: int, emission: Emission[T]) -> None:
+        self._total_dropped += 1
+        marker = GapMarker(
+            self.source_node_id,
+            self.source_port_id,
+            emission.interval,
+            1,
+            self._total_dropped,
+            self.max_items,
+            self.overflow_policy,
+        )
+        previous = self._records[index - 1] if index > 0 else None
+        if isinstance(previous, GapMarker) and previous.interval.end == marker.interval.start:
+            self._records[index - 1] = GapMarker(
+                previous.source_node_id,
+                previous.source_port_id,
+                LogicalInterval(previous.interval.start, marker.interval.end),
+                previous.dropped_count + 1,
+                marker.total_dropped_count,
+                previous.capacity,
+                previous.overflow_policy,
+            )
+            return
+        self._records.insert(index, marker)

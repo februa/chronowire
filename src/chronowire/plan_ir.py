@@ -274,8 +274,8 @@ class BufferDescriptor:
             raise ValueError("buffer max_items must not be negative")
         if self.max_bytes is not None and self.max_bytes < 0:
             raise ValueError("buffer max_bytes must not be negative")
-        if (self.owner_node_id is None) != (self.owner_input_index is None):
-            raise ValueError("buffer owner node and input index must be specified together")
+        if self.owner_input_index is not None and self.owner_node_id is None:
+            raise ValueError("buffer owner input index requires an owner node")
         if self.owner_input_index is not None and self.owner_input_index < 0:
             raise ValueError("buffer owner input index must not be negative")
         if self.high_watermark <= 0:
@@ -324,6 +324,8 @@ class SourceDescriptor:
     request_duration: RationalDescriptor
     burst_max_items: int | None
     ingress_buffer_id: int | None
+    overflow_policy: str | None
+    gap_policy: str
 
     @classmethod
     def from_dict(cls, value: object) -> SourceDescriptor:
@@ -337,6 +339,8 @@ class SourceDescriptor:
             RationalDescriptor.from_dict(data.get("request_duration")),
             _optional_integer(data, "burst_max_items"),
             _optional_integer(data, "ingress_buffer_id"),
+            _optional_string(data, "overflow_policy"),
+            _string(data, "gap_policy"),
         )
 
 
