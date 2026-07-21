@@ -10,7 +10,21 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "februa" }]
+keywords = ["streaming", "dataflow", "logical-time", "scheduler"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/februa/chronowire"
+Repository = "https://github.com/februa/chronowire"
+Issues = "https://github.com/februa/chronowire/issues"
 
 [project.optional-dependencies]
 dev = [
