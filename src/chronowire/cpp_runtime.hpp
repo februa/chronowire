@@ -7,6 +7,12 @@
 
 namespace chronowire::cpp_runtime {
 
+/**
+ * @brief 一回のC++実行で得たcollector境界と意味論集計を所有する。
+ *
+ * 時刻列は`timebase_denominator`を分母とする論理tick、計測値はnanosecond、
+ * byte集計は8-bit byte単位である。全vectorは戻り値自身が所有する。
+ */
 struct RuntimeResult {
     std::vector<double> values;
     std::vector<std::int64_t> sequences;
@@ -28,8 +34,22 @@ struct RuntimeResult {
     std::uint64_t output_boundary_bytes = 0;
 };
 
+/**
+ * @brief compile済み線形Planのimmutable入力とKernel定数を所有するrun-local session。
+ *
+ * constructorは入力pointer範囲を検証してsession内vectorへcopyするため、callerはconstructor
+ * 完了後に元bufferを解放できる。各`run()`はcursorとcollector状態をlocalに生成し、前回実行の
+ * mutable状態を持ち越さない。契約違反と整数overflowは標準C++例外で報告する。
+ */
 class RuntimeSession {
 public:
+    /**
+     * @brief PortablePlanIR descriptorとprocess-local bindingからsessionを構築する。
+     *
+     * `source_*`と`kernel_parameters`のpointerは対応するbyte長の範囲で呼出し中だけ有効で
+     * なければならない。source tickは`source_timebase_denominator`を分母とし、RATE periodは
+     * numerator/denominatorの論理秒で表す。
+     */
     RuntimeSession(
         const std::string& schema_version,
         const std::vector<int>& opcodes,
@@ -63,6 +83,12 @@ public:
         std::int64_t map_node_id
     );
 
+    /**
+     * @brief RATE、FRAME、固定CBF、collector保持選択をPythonへcallbackせず実行する。
+     * @return 呼出しごとに独立した所有結果。
+     * @throws std::invalid_argument Planまたはruntime契約が不正な場合。
+     * @throws std::overflow_error 論理時刻またはsize計算が表現範囲を超える場合。
+     */
     RuntimeResult run() const;
 
 private:

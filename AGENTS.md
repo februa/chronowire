@@ -42,6 +42,9 @@
 - C++例外を跨ぐ宣言には`except +`を指定し、`nogil`実行中の例外をPython境界で契約名付き例外へ変換する。
 - `.pyx`の公開・Python可視APIを変更した場合は対応する`.pyi`を同時に更新し、Pyrightで利用側の型を検証する。
 - 性能最適化で値、interval、sequence、status、Diagnostic provenanceを省略しない。
+- CythonのコメントはPython/C++間の所有権、borrow/copy、GILを解放できる根拠、pointer・memoryviewの有効期間、shape/stride不変条件を説明する。Cython構文やloopの逐語説明は書かない。
+- `nogil`、raw pointer cast、手動確保、zero-copy viewには、安全性を支える不変条件が型だけで明白でない場合、境界の直前へ設計理由をコメントする。生成後のC/C++行番号には言及しない。
+- Pythonから見えるclass/functionには日本語docstringを付け、責務、入力所有権、戻り値、例外、空bufferを含む境界条件を書く。
 
 ## C++実装規約
 
@@ -54,6 +57,10 @@
 - native runtime内でPython C APIを呼ばない。Python callbackはcompile済みStage境界としてのみ扱い、C++ Stageへ暗黙に混入させない。
 - warningを放置せず、警告抑制attributeやcompiler optionを追加する前に設計上の原因を解消する。
 - 最適化前後とPython/Cython/C++ Executor間で値、interval、sequence、status、Diagnosticを同値に保つ。
+- 公開headerのclass、struct、function、ABI fieldには日本語のDoxygen形式コメントを書き、責務、所有権、単位、thread/session境界、例外、入力pointerの有効期間を記載する。
+- 実装内コメントはownership、buffer寿命、overflow回避、時間格子、status/Diagnostic伝播などの設計理由と不変条件を書く。式やloopを日本語へ逐語変換したコメントは書かない。
+- byte、tick、sample、frame、nanosecondなど単位を取り違え得る値は名前で単位を示し、複数の単位が交わる計算には変換前後の単位をコメントする。
+- `TODO`や`FIXME`を残す場合は未成立の契約、影響範囲、削除条件を併記する。根拠のない将来予定や、危険な処理を正当化するコメントとして使わない。
 
 ## テスト規約
 

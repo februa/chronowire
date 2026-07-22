@@ -112,6 +112,7 @@ cdef class CppNativeSession:
         self._frame_size = frame_size
         for opcode in opcodes:
             native_opcodes.push_back(opcode)
+        # PyBytesのpointerはborrowedだが、constructorが呼出し中に所有vectorへcopyする。
         self._runtime = new RuntimeSession(
             native_schema,
             native_opcodes,
@@ -146,6 +147,7 @@ cdef class CppNativeSession:
         )
 
     def __dealloc__(self):
+        # このCython instanceだけがRuntimeSessionを所有し、Python objectより先に解放する。
         del self._runtime
 
     def run(self):
@@ -163,12 +165,14 @@ cdef class CppNativeSession:
         cdef list status_counts = []
         cdef bytes values
 
+        # RuntimeSessionは入力を所有しPython C APIを呼ばないため、全state machineをnogilで動かせる。
         with nogil:
             result = self._runtime.run()
 
         if result.values.size() == 0:
             values = b""
         else:
+            # C++ collectorが保持した値だけをPython観測境界へ一度copyする。
             values = PyBytes_FromStringAndSize(
                 <const char*>&result.values[0],
                 result.values.size() * sizeof(double),
@@ -179,6 +183,7 @@ cdef class CppNativeSession:
             ends.append(result.ends[index])
             statuses.append(result.statuses[index])
             source_indices = []
+            # provenanceはPython側Diagnostic復元用のSource indexであり、値bufferを所有しない。
             for item_index in range(self._frame_size):
                 source_indices.append(
                     result.provenance[index * self._frame_size + item_index]
