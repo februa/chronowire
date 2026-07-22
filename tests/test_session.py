@@ -1,4 +1,4 @@
-"""v0.2 ContinuousSessionの継続状態とlifecycle契約を検証する。"""
+"""v0.2 Sessionの継続状態とlifecycle契約を検証する。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import chronowire as cw
 
 
 class _CounterState:
-    """ContinuousSession内でだけ状態を保持するtest session。"""
+    """Session内でだけ状態を保持するtest session。"""
 
     def __init__(self) -> None:
         self._count = 0
@@ -85,7 +85,7 @@ def test_continuous_session_preserves_frame_state_across_run_until_boundaries() 
 
     frames = cw.Flow([1, 2, 3, 4]).frame(2)
     plan = cw.compile([cw.output(frames, collector=cw.Bounded(2))])
-    session = plan.create_continuous_session()
+    session = plan.create_session()
 
     assert session.state is cw.SessionState.CREATED
     session.start()
@@ -114,13 +114,13 @@ def test_continuous_session_preserves_kernel_state_but_new_session_resets_it() -
     counted = cw.Flow([10, 20]).map(_CounterKernel())
     plan = cw.compile([cw.output(counted, collector=cw.Bounded(2))])
 
-    first_session = plan.create_continuous_session()
+    first_session = plan.create_session()
     first_session.start()
     assert _values(first_session.run_until(Fraction(1))) == [1]
     assert _values(first_session.run_until(Fraction(2))) == [1, 2]
     first_session.close()
 
-    second_session = plan.create_continuous_session()
+    second_session = plan.create_session()
     second_session.start()
     assert _values(second_session.run_until(1)) == [1]
     second_session.cancel()
@@ -130,7 +130,7 @@ def test_continuous_session_requires_valid_lifecycle_and_monotonic_boundary() ->
     """未開始、二重開始、非単調境界、終了後操作を明示例外にする。"""
 
     plan = cw.compile([cw.output(cw.Flow([1, 2]), collector=cw.Bounded(2))])
-    session = plan.create_continuous_session()
+    session = plan.create_session()
 
     with pytest.raises(cw.SessionError, match="requires state=running"):
         session.run_until(1)
@@ -154,7 +154,7 @@ def test_continuous_session_flushes_finite_source_after_partial_run() -> None:
 
     frames = cw.Flow([1, 2, 3]).frame(2, pad_end=True)
     plan = cw.compile([cw.output(frames, collector=cw.Bounded(2))])
-    session = plan.create_continuous_session()
+    session = plan.create_session()
     session.start()
 
     assert _values(session.run_until(1)) == []
@@ -171,14 +171,14 @@ def test_failed_continuous_session_does_not_poison_plan() -> None:
 
     mapped = cw.Flow([7]).map(_FailFirstKernel())
     plan = cw.compile([cw.output(mapped, collector=cw.Latest())])
-    failed = plan.create_continuous_session()
+    failed = plan.create_session()
     failed.start()
 
     with pytest.raises(cw.KernelExecutionError, match="planned failure"):
         failed.run_until(1)
     assert failed.state is cw.SessionState.FAILED
 
-    recovered = plan.create_continuous_session()
+    recovered = plan.create_session()
     recovered.start()
     assert _values(recovered.run_until(1)) == [7]
     assert recovered.close().completed
@@ -199,7 +199,7 @@ def test_runtime_options_budget_allows_retrying_same_logical_boundary() -> None:
     """budget終了時は同じrun_until境界を再指定して継続できる。"""
 
     plan = cw.compile([cw.output(cw.Flow([1, 2, 3]), collector=cw.Bounded(3))])
-    session = plan.create_continuous_session(options=cw.RuntimeOptions(max_scheduler_steps=1))
+    session = plan.create_session(options=cw.RuntimeOptions(max_scheduler_steps=1))
     session.start()
 
     first = session.run_until(3)
@@ -226,8 +226,6 @@ def test_runtime_options_validates_watermarks_and_budget() -> None:
     source = cw.Flow([1, 2])
     framed = source.frame(2)
     merged = source.map(lambda value, *, frame: (value, frame), frame=framed)
-    session = cw.compile([merged]).create_continuous_session(
-        options=cw.RuntimeOptions(port_high_watermark=1)
-    )
+    session = cw.compile([merged]).create_session(options=cw.RuntimeOptions(port_high_watermark=1))
     with pytest.raises(cw.SessionError, match="below compiled capacity"):
         session.start()

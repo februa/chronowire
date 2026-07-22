@@ -182,7 +182,7 @@ collector復元を引き続き行う。CppExecutorのsession生成込み約0.5 m
 - 同じsessionを再実行してもcursor、status、collector状態を持ち越さない
 
 この測定時点のruntimeは固定CBF ABIを直接認識する最小実証だった。汎用ABI table、複数native
-Kernel chain、ContinuousSession、Extension/Python Stage境界、gap reset、INVALID partition、metadata、
+Kernel chain、Session、Extension/Python Stage境界、gap reset、INVALID partition、metadata、
 fan-out共有寿命は、この結果を基準に第10節のv0.4確定実装へ追加した。
 
 ## 10. v0.4 generic DAG runtime確定後の再測定
@@ -221,7 +221,7 @@ NoCollectのoutput boundaryは0 byte、実行Node数は4だった。generic item
 - 8192 sampleの長時間CBFをPython基準traceと比較する
 - identityと固定CBFを連結し、同じFRAMEから分岐しても共通祖先を一度だけ評価する
 - INPUT_OVERRUN前後のFRAMEを混ぜず、INVALID/DEGRADEDとDiagnosticを保存する
-- 有限ContinuousSessionの単調な論理時間境界、flush、close、cancelを試験する
+- 有限Sessionの単調な論理時間境界、flush、close、cancelを試験する
 - one-shot ExtensionをC++観測境界からPython Stageへ配送する
 - pytest、Pyright、Ruff、Cython lint、C++ `-Werror`、distribution buildをrelease gateとする
 

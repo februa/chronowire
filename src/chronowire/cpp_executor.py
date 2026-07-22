@@ -12,7 +12,7 @@ from typing import Any
 from ._cpp_executor import CppCooperativeStageSession, CppGraphNativeSession
 from .collector import BufferOverflowError
 from .errors import ExtensionExecutionError, KernelExecutionError, SessionError
-from .executor import CppRuntimeMetrics, SessionRunner
+from .executor import CppRuntimeMetrics, RunSessionRunner
 from .extension import ExtensionSession, OutputEvent, PlanContext
 from .graph import InputSemantics, NodeKind, RatePolicy
 from .kernel import NativeRuntimeBindingProvider, RunContext
@@ -34,7 +34,6 @@ from .runtime import (
     Plan,
     RunResult,
     RuntimeOptions,
-    Session,
     SessionState,
     _BoundExtension,
 )
@@ -372,7 +371,7 @@ def _run_python_prefix_stage(
     return batches, counts
 
 
-class CppPythonStageSession(SessionRunner):
+class CppPythonStageSession(RunSessionRunner):
     """all-Python Planを単一の協調的Python islandとして実行する。
 
     Args:
@@ -384,7 +383,7 @@ class CppPythonStageSession(SessionRunner):
         C++側はstage IDのyield/resume状態だけを所有し、Python callbackを保持しない。
     """
 
-    def __init__(self, plan: Plan, python_session: Session) -> None:
+    def __init__(self, plan: Plan, python_session: RunSessionRunner) -> None:
         stages = plan.portable_ir.stages
         if len(stages) != 1 or stages[0].execution_domain != "python":
             stage_ids = tuple(stage.stage_id for stage in stages)
@@ -470,7 +469,7 @@ def _reshape_item(
     )
 
 
-class CppSession(SessionRunner):
+class CppSession(RunSessionRunner):
     """compile済みPlanを所有するrun-local C++実行instance。
 
     Args:
@@ -1063,7 +1062,7 @@ class CppSession(SessionRunner):
         )
 
 
-class CppMixedSession(SessionRunner):
+class CppMixedSession(RunSessionRunner):
     """native prefixから単一Python islandを経由してPlanを運用するmixed session。
 
     Args:
@@ -1403,7 +1402,7 @@ class CppMixedSession(SessionRunner):
         return RunResult(tuple(outputs), self.plan.diagnostics, status_counts, completed=True)
 
 
-class CppPythonPrefixSession(SessionRunner):
+class CppPythonPrefixSession(RunSessionRunner):
     """先頭Python islandのbatchをnative suffixへresumeするmixed session。
 
     Args:
@@ -1601,7 +1600,7 @@ class CppPythonPrefixSession(SessionRunner):
         return replace(result, status_counts=status_counts)
 
 
-class CppMultiIslandSession(SessionRunner):
+class CppMultiIslandSession(RunSessionRunner):
     """複数のPython islandをnative区間間で順次yield/resumeするsession。
 
     Args:
@@ -1988,7 +1987,7 @@ class CppMultiIslandSession(SessionRunner):
         return RunResult(tuple(outputs), self.plan.diagnostics, status_counts, completed=True)
 
 
-class CppContinuousSession:
+class CppIncrementalSession:
     """有限native Planを論理時間境界ごとにC++で継続観測するsession。
 
     v0.4では各境界のsnapshotを同じimmutable C++ Planから決定的に再計算する。Python側は
@@ -2008,7 +2007,7 @@ class CppContinuousSession:
             )
         if options is not None and options != RuntimeOptions():
             raise SessionError(
-                "CppExecutor ContinuousSession supports default RuntimeOptions only; "
+                "CppExecutor incremental Session supports default RuntimeOptions only; "
                 "contract=cpp_runtime_options"
             )
         self._execution = CppSession(plan)
@@ -2032,14 +2031,12 @@ class CppContinuousSession:
         """run-local C++ Plan resourceを開始状態へ遷移させる。"""
 
         if self._state is not SessionState.CREATED:
-            raise SessionError(
-                f"CppContinuousSession.start requires state=created; actual={self._state.value}"
-            )
+            raise SessionError(f"Session.start requires state=created; actual={self._state.value}")
         self._session_diagnostics.append(
             Diagnostic(
                 Severity.INFO,
                 "SESSION_STARTED",
-                "CppContinuousSession acquired run-local resources",
+                "Cpp incremental Session acquired run-local resources",
             )
         )
         self._state = SessionState.RUNNING
@@ -2051,8 +2048,7 @@ class CppContinuousSession:
         target = self._logical_time_fraction(logical_end)
         if target <= 0 or (self._logical_end is not None and target <= self._logical_end):
             raise SessionError(
-                "CppContinuousSession.run_until requires a positive, strictly "
-                "increasing logical_end"
+                "Session.run_until requires a positive, strictly increasing logical_end"
             )
         try:
             result = self._execution.run(duration=target)
@@ -2084,7 +2080,7 @@ class CppContinuousSession:
             Diagnostic(
                 Severity.INFO,
                 "SESSION_CLOSED",
-                "CppContinuousSession drained run-local resources",
+                "Cpp incremental Session drained run-local resources",
             )
         )
         self._state = SessionState.CLOSED
@@ -2099,7 +2095,7 @@ class CppContinuousSession:
             Diagnostic(
                 Severity.WARNING,
                 "SESSION_CANCELLED",
-                "CppContinuousSession was cancelled without flushing pending input",
+                "Cpp incremental Session was cancelled without flushing pending input",
             )
         )
         self._state = SessionState.CANCELLED
@@ -2125,8 +2121,7 @@ class CppContinuousSession:
     def _require_running(self, operation: str) -> None:
         if self._state is not SessionState.RUNNING:
             raise SessionError(
-                f"CppContinuousSession.{operation} requires state=running; "
-                f"actual={self._state.value}"
+                f"Session.{operation} requires state=running; actual={self._state.value}"
             )
 
     @staticmethod

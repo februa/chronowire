@@ -8,12 +8,6 @@ import pytest
 import chronowire as cw
 from chronowire._cpp_executor import CppCooperativeStageSession
 from chronowire.collector import Collector
-from chronowire.cpp_executor import (
-    CppMixedSession,
-    CppPythonPrefixSession,
-    CppPythonStageSession,
-    CppSession,
-)
 from chronowire_reference import CythonCbfBackend, FixedCbfKernel
 
 
@@ -80,7 +74,7 @@ def test_cpp_executor_runs_all_python_plan_as_one_cooperative_island() -> None:
 
     result = session.run()
 
-    assert isinstance(session, CppPythonStageSession)
+    assert isinstance(session, cw.Session)
     assert result == plan.run(executor="python")
     assert [item.value for item in result.outputs[0].emissions] == [3, 5, 7]
     assert len(plan.portable_ir.stages) == 1
@@ -188,7 +182,7 @@ def test_cpp_mixed_native_prefix_dispatches_one_python_island_batch() -> None:
 
     result = session.run()
 
-    assert isinstance(session, CppMixedSession)
+    assert isinstance(session, cw.Session)
     assert calls == {"left": 2, "right": 2}
     assert result == plan.run(executor="python")
     assert result.outputs[0].emissions[0].status is cw.EmissionStatus.DEGRADED
@@ -301,7 +295,7 @@ def test_cpp_python_prefix_resumes_native_cbf_suffix() -> None:
 
     result = session.run()
 
-    assert isinstance(session, CppPythonPrefixSession)
+    assert isinstance(session, cw.Session)
     assert result == plan.run(executor="python")
     assert result.outputs[0].emissions[0].status is cw.EmissionStatus.DEGRADED
     assert result.outputs[0].emissions[0].diagnostics == (diagnostic,)
@@ -363,7 +357,7 @@ def test_cpp_executor_no_collect_avoids_output_value_boundary() -> None:
 
     plan = _plan(collector=cw.NoCollect())
     session = plan.create_session(executor=cw.CppExecutor())
-    assert isinstance(session, CppSession)
+    assert isinstance(session, cw.Session)
 
     result = session.run()
 
@@ -413,7 +407,7 @@ def test_cpp_executor_python_boundary_work_is_bounded_by_collector(
     result = session.run()
 
     assert len(result.outputs[0].emissions) == 2
-    assert isinstance(session, CppSession)
+    assert isinstance(session, cw.Session)
     assert session.last_metrics is not None
     assert session.last_metrics.python_native_transitions == 2
     assert session.last_metrics.public_emission_reconstructions == 2
@@ -476,7 +470,7 @@ def test_cpp_executor_preserves_invalid_partition_and_metadata() -> None:
     assert cpp.outputs[1].emissions[0].diagnostics[-1].code == "INVALID_INPUT_PROPAGATED"
 
 
-def test_cpp_python_stage_continuous_session_is_explicitly_pending() -> None:
+def test_cpp_python_stage_incremental_session_is_explicitly_pending() -> None:
     """未実装の継続実行はPythonへ暗黙fallbackせず契約位置を報告する。"""
 
     mapped = cw.Flow([1, 2]).map(lambda value: value + 1)
@@ -484,9 +478,9 @@ def test_cpp_python_stage_continuous_session_is_explicitly_pending() -> None:
 
     with pytest.raises(
         cw.SessionError,
-        match="contract=python_stage_continuous_session_pending",
+        match="contract=python_stage_incremental_session_pending",
     ) as captured:
-        plan.create_continuous_session(executor="cpp")
+        plan.create_session(executor="cpp").start()
 
     message = str(captured.value)
     assert "stage=" in message
@@ -495,11 +489,11 @@ def test_cpp_python_stage_continuous_session_is_explicitly_pending() -> None:
     assert "binding=" in message
 
 
-def test_cpp_executor_continuous_session_advances_monotonically_and_drains() -> None:
+def test_cpp_executor_session_advances_monotonically_and_drains() -> None:
     """有限native Planを論理時間境界ごとにC++で累積実行する。"""
 
     plan = _plan()
-    session = plan.create_continuous_session(executor=cw.CppExecutor())
+    session = plan.create_session(executor=cw.CppExecutor())
 
     assert session.state is cw.SessionState.CREATED
     session.start()
@@ -515,10 +509,10 @@ def test_cpp_executor_continuous_session_advances_monotonically_and_drains() -> 
     assert session.state is cw.SessionState.CLOSED
 
 
-def test_cpp_executor_continuous_session_cancel_preserves_last_snapshot() -> None:
+def test_cpp_executor_session_cancel_preserves_last_snapshot() -> None:
     """cancelはdrainせず直前snapshotと明示Diagnosticを保持する。"""
 
-    session = _plan().create_continuous_session(executor="cpp")
+    session = _plan().create_session(executor="cpp")
     session.start()
     observed = session.run_until(Fraction(2, 1))
 
@@ -556,7 +550,7 @@ def test_cpp_executor_runs_kernel_chain_and_fanout_ancestor_once() -> None:
     result = session.run()
 
     assert result == plan.run(executor="python")
-    assert isinstance(session, CppSession)
+    assert isinstance(session, cw.Session)
     assert session.last_metrics is not None
     assert session.last_metrics.executed_node_count == len(plan.portable_ir.nodes)
     assert len(plan.portable_ir.kernel_abis) == 3
@@ -671,7 +665,7 @@ def test_cpp_executor_delivers_extension_at_python_stage_boundary() -> None:
 
     assert extension.sessions[0].events == [result.outputs[0].emissions[0]]
     assert extension.sessions[0].finalized
-    assert isinstance(session, CppSession)
+    assert isinstance(session, cw.Session)
     assert session.last_metrics is not None
     assert session.last_metrics.python_free_hot_path
     assert session.last_metrics.public_emission_reconstructions == 4

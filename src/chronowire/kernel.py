@@ -343,11 +343,3 @@ class PythonCallableKernel:
             self.input_keywords,
             self.inject_config,
         )
-
-
-# v0.4公開名からの一時的な型alias。内部実装は正式名称だけを使用する。
-CompiledKernel = Kernel
-CompiledKernelSession = KernelState
-NativeCompiledKernel = NativeKernel
-NativeBatchCompiledKernel = NativeBatchKernel
-NativeBatchKernelSession = NativeBatchKernelState

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import time
-import warnings
 from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import suppress
@@ -30,12 +29,12 @@ from .errors import (
     SourceExecutionError,
 )
 from .executor import (
-    ContinuousSessionRunner,
     CppExecutor,
     CythonExecutor,
     Executor,
+    IncrementalSessionRunner,
     PythonExecutor,
-    SessionRunner,
+    RunSessionRunner,
 )
 from .extension import (
     Always,
@@ -2077,18 +2076,20 @@ class Plan:
             collector結果、Diagnostic、status件数を持つRunResult。
         """
 
-        return self.create_session(executor=executor).run(duration=duration, options=options)
+        return self.create_session(options=options, executor=executor).run(duration=duration)
 
     def create_session(
         self,
         *,
         extension_bindings: Mapping[str, Extension] | None = None,
+        options: RuntimeOptions | None = None,
         executor: str | Executor = "python",
-    ) -> SessionRunner:
+    ) -> Session:
         """process-local Extension実体を検証して実行instanceを生成する。
 
         Args:
             extension_bindings: extension_idからExtension factoryへの完全な対応。
+            options: session全体へ適用するruntime調整値。
             executor: 実行sessionを生成するExecutor名または実体。
 
         Returns:
@@ -2098,13 +2099,18 @@ class Plan:
             ExtensionBindingError: binding不足、未知ID、種別、ABI不整合の場合。
         """
 
-        return self._resolve_executor(executor).create_session(self, extension_bindings)
+        return Session(
+            self,
+            self._bind_extensions(extension_bindings),
+            options or RuntimeOptions(),
+            self._resolve_executor(executor),
+        )
 
-    def _create_python_session(
+    def _bind_extensions(
         self,
         extension_bindings: Mapping[str, Extension] | None,
-    ) -> Session:
-        """検証済みExtensionを持つPython実行sessionを生成する。"""
+    ) -> tuple[_BoundExtension, ...]:
+        """process-local Extension bindingを検証済み不変列へ変換する。"""
 
         bindings = {} if extension_bindings is None else dict(extension_bindings)
         required = {item.extension_id: item for item in self._observations}
@@ -2142,64 +2148,7 @@ class Plan:
                     f"required {item.abi_version!r}; contract=extension_abi"
                 )
             bound.append(_BoundExtension(item, binding))
-        return Session(self, tuple(bound))
-
-    def create_continuous_session(
-        self,
-        *,
-        extension_bindings: Mapping[str, Extension] | None = None,
-        options: RuntimeOptions | None = None,
-        executor: str | Executor = "python",
-    ) -> ContinuousSessionRunner:
-        """v0.2の継続実行状態を持つContinuousSessionを生成する。
-
-        Args:
-            extension_bindings: extension_idからrun-local Extension factoryへの完全な対応。
-            options: session全体へ適用するruntime調整値。
-            executor: 継続sessionを生成するExecutor名または実体。
-
-        Returns:
-            `start()`前の新しいContinuousSession。
-
-        Raises:
-            ExtensionBindingError: binding不足、未知ID、種別、ABI不整合の場合。
-        """
-
-        return self._resolve_executor(executor).create_continuous_session(
-            self,
-            extension_bindings,
-            options,
-        )
-
-    def create_plan_session(
-        self,
-        *,
-        extension_bindings: Mapping[str, Extension] | None = None,
-        options: RuntimeOptions | None = None,
-        executor: str | Executor = "python",
-    ) -> ContinuousSessionRunner:
-        """非推奨名からContinuousSessionを生成する互換入口。"""
-
-        warnings.warn(
-            "Plan.create_plan_session() is deprecated; use create_continuous_session()",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.create_continuous_session(
-            extension_bindings=extension_bindings,
-            options=options,
-            executor=executor,
-        )
-
-    def _create_python_continuous_session(
-        self,
-        extension_bindings: Mapping[str, Extension] | None,
-        options: RuntimeOptions | None,
-    ) -> ContinuousSession:
-        """検証済みExtensionを持つPython継続sessionを生成する。"""
-
-        one_shot = self._create_python_session(extension_bindings)
-        return ContinuousSession(self, one_shot._extensions, options or RuntimeOptions())
+        return tuple(bound)
 
     @staticmethod
     def _resolve_executor(executor: str | Executor) -> Executor:
@@ -2258,50 +2207,8 @@ class _ExtensionRuntime:
     trigger: TriggerSession
 
 
-class Session:
-    """Planと検証済みprocess-local bindingを結ぶ実行instance。"""
-
-    def __init__(
-        self,
-        plan: Plan,
-        extensions: tuple[_BoundExtension, ...],
-    ) -> None:
-        self._plan = plan
-        self._extensions = extensions
-        self._consumed = False
-
-    def run(
-        self,
-        *,
-        duration: float | None = None,
-        options: RuntimeOptions | None = None,
-    ) -> RunResult:
-        """新しいKernel、collector、Extension状態でPlanを一回実行する。
-
-        Args:
-            duration: Sourceの論理時間上限。Noneではfinite SourceのEOFまで実行。
-            options: Source chunk、watermark、budget、profiler設定。
-
-        Returns:
-            collector結果、Diagnostic、status件数を持つRunResult。
-        """
-
-        if self._consumed:
-            raise SessionError(
-                "Session.run may be called only once; create a new Session from the Plan"
-            )
-        self._consumed = True
-        runtime = _PlanRuntime(
-            self._plan,
-            duration,
-            self._extensions,
-            options=options or RuntimeOptions(),
-        )
-        return runtime.run()
-
-
 class SessionState(StrEnum):
-    """ContinuousSessionの公開lifecycle状態。"""
+    """Sessionの公開lifecycle状態。"""
 
     CREATED = "created"
     RUNNING = "running"
@@ -2310,11 +2217,11 @@ class SessionState(StrEnum):
     FAILED = "failed"
 
 
-class ContinuousSession:
-    """一つのPlanを論理時間境界ごとに継続実行するsession。
+class Session:
+    """一括実行と段階実行を同じrun-local状態として扱う公開Session。
 
-    Kernel、FRAME、RATE、buffer、collector、Extensionの状態はsession終了まで保持し、
-    別のContinuousSessionとは共有しない。
+    `run()`を繰り返す場合は呼出しごとにKernelStateとbufferを作り直す。`start()`を選んだ場合は
+    `run_until()`、`flush()`、`close()`、`cancel()`を使用し、状態を終了まで保持する。
     """
 
     def __init__(
@@ -2322,13 +2229,16 @@ class ContinuousSession:
         plan: Plan,
         extensions: tuple[_BoundExtension, ...],
         options: RuntimeOptions,
+        executor: Executor,
     ) -> None:
         self._plan = plan
         self._extensions = extensions
         self._options = options
-        self._runtime: _PlanRuntime | None = None
+        self._executor = executor
         self._state = SessionState.CREATED
-        self._logical_end: Fraction | None = None
+        self._mode: str | None = None
+        self._run_runner: RunSessionRunner | None = None
+        self._incremental_runner: IncrementalSessionRunner | None = None
 
     @property
     def state(self) -> SessionState:
@@ -2336,30 +2246,74 @@ class ContinuousSession:
 
         return self._state
 
+    @property
+    def last_metrics(self) -> Any | None:
+        """Executor固有runnerが公開する直近metricsを返す。"""
+
+        if self._run_runner is not None:
+            return getattr(self._run_runner, "last_metrics", None)
+        if self._incremental_runner is not None:
+            return getattr(self._incremental_runner, "last_metrics", None)
+        return None
+
+    def run(
+        self,
+        *,
+        duration: float | None = None,
+    ) -> RunResult:
+        """Sessionを一括実行し、終了時にrun-local resourceを破棄する。
+
+        Args:
+            duration: Sourceの論理時間上限。Noneではfinite SourceのEOFまで実行。
+
+        Returns:
+            collector結果、Diagnostic、status件数を持つRunResult。
+
+        境界条件:
+            同じSessionから再度呼べるが、KernelState、buffer、collectorは毎回新しく生成する。
+            `start()`で段階実行を開始したSessionでは呼べない。
+        """
+
+        if self._mode == "incremental" or self._state not in {
+            SessionState.CREATED,
+            SessionState.CLOSED,
+        }:
+            raise SessionError(
+                f"Session.run requires reusable run mode; actual={self._state.value}"
+            )
+        self._mode = "run"
+        self._state = SessionState.RUNNING
+        try:
+            runner = self._executor._create_run_session(self._plan, self._extensions)
+            self._run_runner = runner
+            result = runner.run(duration=duration, options=self._options)
+        except Exception:
+            self._state = SessionState.FAILED
+            raise
+        self._state = SessionState.CLOSED
+        return result
+
     def start(self) -> None:
-        """run-local resourceを生成して継続実行を開始する。
+        """run-local resourceを生成して段階実行を開始する。
 
         Raises:
             SessionError: CREATED以外から開始しようとした場合。
         """
 
-        if self._state is not SessionState.CREATED:
-            raise SessionError(
-                f"ContinuousSession.start requires state=created; actual={self._state.value}"
-            )
-        runtime = _PlanRuntime(
-            self._plan,
-            None,
-            self._extensions,
-            continuous=True,
-            options=self._options,
-        )
+        if self._mode is not None or self._state is not SessionState.CREATED:
+            raise SessionError(f"Session.start requires state=created; actual={self._state.value}")
+        self._mode = "incremental"
         try:
-            runtime.start()
-        except Exception as error:
-            self._fail_and_finish(runtime, error)
+            runner = self._executor._create_incremental_session(
+                self._plan,
+                self._extensions,
+                self._options,
+            )
+            self._incremental_runner = runner
+            runner.start()
+        except Exception:
+            self._state = SessionState.FAILED
             raise
-        self._runtime = runtime
         self._state = SessionState.RUNNING
 
     def run_until(
@@ -2378,19 +2332,13 @@ class ContinuousSession:
             SessionError: 未開始、終了済み、または境界が単調増加でない場合。
         """
 
-        runtime = self._running_runtime("run_until")
-        target = self._logical_time_fraction(logical_end)
-        if target <= 0 or (self._logical_end is not None and target <= self._logical_end):
-            raise SessionError(
-                "ContinuousSession.run_until requires a positive, strictly increasing logical_end"
-            )
+        runner = self._running_runner("run_until")
         try:
-            result = runtime.run_until(target)
-        except Exception as error:
-            self._fail_and_finish(runtime, error)
+            result = runner.run_until(logical_end)
+        except Exception:
+            self._state = runner.state
             raise
-        if not runtime.last_budget_exhausted:
-            self._logical_end = target
+        self._state = runner.state
         return result
 
     def flush(self) -> RunResult:
@@ -2403,6 +2351,146 @@ class ContinuousSession:
             SessionError: sessionがRUNNINGでない場合、または無限Sourceを含む場合。
         """
 
+        runner = self._running_runner("flush")
+        try:
+            result = runner.flush()
+        except Exception:
+            self._state = runner.state
+            raise
+        self._state = runner.state
+        return result
+
+    def close(self) -> RunResult:
+        """Source受付を停止してpending入力をdrainし、resourceを解放する。
+
+        Returns:
+            resource解放直前の最終RunResult。
+        """
+
+        runner = self._running_runner("close")
+        try:
+            result = runner.close()
+        except Exception:
+            self._state = runner.state
+            raise
+        self._state = runner.state
+        return result
+
+    def cancel(self) -> RunResult:
+        """pending値をflushせずsessionを打ち切り、resourceを解放する。
+
+        Returns:
+            `SESSION_CANCELLED` Diagnosticを含む累積RunResult。
+        """
+
+        runner = self._running_runner("cancel")
+        try:
+            result = runner.cancel()
+        except Exception:
+            self._state = runner.state
+            raise
+        self._state = runner.state
+        return result
+
+    def _running_runner(self, operation: str) -> IncrementalSessionRunner:
+        if self._state is not SessionState.RUNNING or self._incremental_runner is None:
+            raise SessionError(
+                f"Session.{operation} requires state=running; actual={self._state.value}"
+            )
+        return self._incremental_runner
+
+
+class _PythonRunSession:
+    """Python Executorの一括実行runner。"""
+
+    def __init__(
+        self,
+        plan: Plan,
+        extensions: tuple[_BoundExtension, ...],
+    ) -> None:
+        self._plan = plan
+        self._extensions = extensions
+
+    def run(
+        self,
+        *,
+        duration: float | None = None,
+        options: RuntimeOptions | None = None,
+    ) -> RunResult:
+        """新しいKernelState、collector、Extension状態でPlanを一括実行する。"""
+
+        runtime = _PlanRuntime(
+            self._plan,
+            duration,
+            self._extensions,
+            options=options or RuntimeOptions(),
+        )
+        return runtime.run()
+
+
+class _PythonIncrementalSession:
+    """Python Executorの段階実行runner。"""
+
+    def __init__(
+        self,
+        plan: Plan,
+        extensions: tuple[_BoundExtension, ...],
+        options: RuntimeOptions,
+    ) -> None:
+        self._plan = plan
+        self._extensions = extensions
+        self._options = options
+        self._runtime: _PlanRuntime | None = None
+        self._state = SessionState.CREATED
+        self._logical_end: Fraction | None = None
+
+    @property
+    def state(self) -> SessionState:
+        """現在の内部lifecycle状態を返す。"""
+
+        return self._state
+
+    def start(self) -> None:
+        """run-local resourceを生成して段階実行を開始する。"""
+
+        if self._state is not SessionState.CREATED:
+            raise SessionError(f"Session.start requires state=created; actual={self._state.value}")
+        runtime = _PlanRuntime(
+            self._plan,
+            None,
+            self._extensions,
+            continuous=True,
+            options=self._options,
+        )
+        try:
+            runtime.start()
+        except Exception as error:
+            self._fail_and_finish(runtime, error)
+            raise
+        self._runtime = runtime
+        self._state = SessionState.RUNNING
+
+    def run_until(self, logical_end: LogicalTime | Fraction | int | float) -> RunResult:
+        """状態を保持したまま指定論理時刻まで進める。"""
+
+        runtime = self._running_runtime("run_until")
+        target = self._logical_time_fraction(logical_end)
+        if target <= 0 or (self._logical_end is not None and target <= self._logical_end):
+            raise SessionError(
+                "Session.run_until requires a positive, strictly increasing logical_end"
+            )
+        try:
+            result = runtime.run_until(target)
+        except Exception as error:
+            self._fail_and_finish(runtime, error)
+            raise
+        if not runtime.last_budget_exhausted:
+            self._logical_end = target
+        return result
+
+    def flush(self) -> RunResult:
+        """有限SourceをEOFまで進めてpending状態をdrainする。"""
+
         runtime = self._running_runtime("flush")
         try:
             return runtime.flush()
@@ -2413,11 +2501,7 @@ class ContinuousSession:
             raise
 
     def close(self) -> RunResult:
-        """Source受付を停止してpending入力をdrainし、resourceを解放する。
-
-        Returns:
-            resource解放直前の最終RunResult。
-        """
+        """入力をdrainしてresourceを解放する。"""
 
         runtime = self._running_runtime("close")
         try:
@@ -2430,11 +2514,7 @@ class ContinuousSession:
         return result
 
     def cancel(self) -> RunResult:
-        """pending値をflushせずsessionを打ち切り、resourceを解放する。
-
-        Returns:
-            `SESSION_CANCELLED` Diagnosticを含む累積RunResult。
-        """
+        """pending値を破棄してresourceを解放する。"""
 
         runtime = self._running_runtime("cancel")
         try:
@@ -2449,7 +2529,7 @@ class ContinuousSession:
     def _running_runtime(self, operation: str) -> _PlanRuntime:
         if self._state is not SessionState.RUNNING or self._runtime is None:
             raise SessionError(
-                f"ContinuousSession.{operation} requires state=running; actual={self._state.value}"
+                f"Session.{operation} requires state=running; actual={self._state.value}"
             )
         return self._runtime
 
@@ -2460,7 +2540,7 @@ class ContinuousSession:
         try:
             runtime.finish()
         except Exception as cleanup_error:
-            error.add_note(f"ContinuousSession resource cleanup also failed: {cleanup_error}")
+            error.add_note(f"Session resource cleanup also failed: {cleanup_error}")
 
     @staticmethod
     def _logical_time_fraction(value: LogicalTime | Fraction | int | float) -> Fraction:
@@ -2470,13 +2550,6 @@ class ContinuousSession:
             return Fraction(str(value)) if isinstance(value, float) else Fraction(value)
         except (TypeError, ValueError, ZeroDivisionError) as error:
             raise SessionError("logical_end must be a finite rational value") from error
-
-
-# v0.4公開名からの一時的なclass alias。新規コードは正式名称を使用する。
-ExecutionPlan = Plan
-ExecutionSession = Session
-PlanSession = ContinuousSession
-PlanSessionState = SessionState
 
 
 class _PlanRuntime:
@@ -2703,7 +2776,7 @@ class _PlanRuntime:
             diagnostic = Diagnostic(
                 Severity.INFO,
                 "SESSION_STARTED",
-                "ContinuousSession acquired run-local resources",
+                "Session acquired run-local resources",
                 details={
                     "kernel_states": sorted(self.kernel_states),
                     "realtime_source_sessions": sorted(self.realtime_sessions),
@@ -2736,7 +2809,7 @@ class _PlanRuntime:
         ]
         if open_realtime or non_finite_pull:
             raise SessionError(
-                "ContinuousSession.flush requires finite or already closed Sources; "
+                "Session.flush requires finite or already closed Sources; "
                 f"open_realtime_nodes={open_realtime}; non_finite_pull_nodes={non_finite_pull}"
             )
         self.duration = None
@@ -2757,7 +2830,7 @@ class _PlanRuntime:
         ]
         if non_finite_pull:
             raise SessionError(
-                "ContinuousSession.close cannot infer EOF for non-finite pull Sources; "
+                "Session.close cannot infer EOF for non-finite pull Sources; "
                 f"nodes={non_finite_pull}; call cancel()"
             )
         self.duration = None
@@ -2768,7 +2841,7 @@ class _PlanRuntime:
         diagnostic = Diagnostic(
             Severity.INFO,
             "SESSION_CLOSED",
-            "ContinuousSession stopped Sources and drained run-local resources",
+            "Session stopped Sources and drained run-local resources",
             details={
                 "remaining_active_ports": sorted(self._active),
                 "realtime_pending_items": {
@@ -2791,7 +2864,7 @@ class _PlanRuntime:
         diagnostic = Diagnostic(
             Severity.WARNING,
             "SESSION_CANCELLED",
-            "ContinuousSession was cancelled without flushing pending state",
+            "Session was cancelled without flushing pending state",
             details={
                 "active_ports": sorted(self._active),
                 "discarded_realtime_items": discarded,

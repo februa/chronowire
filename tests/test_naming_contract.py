@@ -50,30 +50,30 @@ class _LifecycleProvider:
         return self.kernel
 
 
-def test_formal_names_and_deprecated_aliases_reference_one_implementation() -> None:
-    """互換aliasが内部実装を二重化せず正式型を参照する。"""
+def test_formal_names_are_the_only_public_runtime_vocabulary() -> None:
+    """Plan、Session、Kernel、KernelStateだけを公開する。"""
 
     plan = cw.compile([cw.Flow([1])])
     session = plan.create_session()
 
     assert type(plan) is cw.Plan
     assert isinstance(session, cw.Session)
-    assert cw.ExecutionPlan is cw.Plan
-    assert cw.ExecutionSession is cw.Session
-    assert cw.PlanSession is cw.ContinuousSession
-    assert cw.CompiledKernel is cw.Kernel
-    assert cw.CompiledKernelSession is cw.KernelState
-
-
-def test_deprecated_continuous_session_factory_warns() -> None:
-    """旧methodは同じ実装へ委譲しつつ移行警告を出す。"""
-
-    plan = cw.compile([cw.Flow([1])])
-
-    with pytest.deprecated_call(match="create_continuous_session"):
-        session = plan.create_plan_session()
-
-    assert isinstance(session, cw.ContinuousSession)
+    for removed_name in (
+        "ExecutionPlan",
+        "ExecutionSession",
+        "PlanSession",
+        "PlanSessionState",
+        "PlanSessionError",
+        "CompiledKernel",
+        "CompiledKernelSession",
+        "BoundExecutionPlan",
+        "NativeCompiledKernel",
+        "NativeBatchCompiledKernel",
+        "NativeBatchKernelSession",
+    ):
+        assert not hasattr(cw, removed_name)
+    assert not hasattr(plan, "create_plan_session")
+    assert not hasattr(plan, "create_continuous_session")
 
 
 def test_plan_is_structurally_immutable() -> None:
@@ -103,12 +103,25 @@ def test_kernel_state_is_closed_after_success_and_failure() -> None:
     assert kernel.states[0] is not kernel.states[1]
 
 
-def test_continuous_session_flush_keeps_state_until_close() -> None:
+def test_repeated_session_run_recreates_kernel_state() -> None:
+    """同じSessionのrun再実行でもKernelStateを共有しない。"""
+
+    kernel = _LifecycleKernel()
+    session = cw.compile([cw.Flow([1]).map(_LifecycleProvider(kernel))]).create_session()
+
+    assert session.run().completed
+    assert session.run().completed
+    assert len(kernel.states) == 2
+    assert kernel.states[0] is not kernel.states[1]
+    assert [state.close_count for state in kernel.states] == [1, 1]
+
+
+def test_session_flush_keeps_state_until_close() -> None:
     """flush後も同じKernelStateを保持し、close時に一度だけ解放する。"""
 
     kernel = _LifecycleKernel()
     mapped = cw.Flow([1]).map(_LifecycleProvider(kernel))
-    session = cw.compile([mapped]).create_continuous_session()
+    session = cw.compile([mapped]).create_session()
 
     session.start()
     assert session.flush().completed
@@ -116,3 +129,5 @@ def test_continuous_session_flush_keeps_state_until_close() -> None:
     assert kernel.states[0].close_count == 0
     assert session.close().completed
     assert kernel.states[0].close_count == 1
+    with pytest.raises(cw.SessionError, match="reusable run mode"):
+        session.run()

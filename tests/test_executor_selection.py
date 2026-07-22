@@ -1,10 +1,10 @@
 """PlanとExecutorの責務境界を検証する。"""
 
-from collections.abc import Mapping
-
 import pytest
 
 import chronowire as cw
+from chronowire.executor import IncrementalSessionRunner, RunSessionRunner
+from chronowire.runtime import _BoundExtension
 
 
 class _RecordingExecutor:
@@ -14,29 +14,29 @@ class _RecordingExecutor:
 
     def __init__(self) -> None:
         self.one_shot_count = 0
-        self.continuous_session_count = 0
+        self.incremental_count = 0
         self._delegate = cw.PythonExecutor()
 
-    def create_session(
+    def _create_run_session(
         self,
         plan: cw.Plan,
-        extension_bindings: Mapping[str, cw.Extension] | None,
-    ) -> cw.Session:
+        extensions: tuple[_BoundExtension, ...],
+    ) -> RunSessionRunner:
         """一回実行境界を記録してPythonExecutorへ委譲する。"""
 
         self.one_shot_count += 1
-        return self._delegate.create_session(plan, extension_bindings)
+        return self._delegate._create_run_session(plan, extensions)
 
-    def create_continuous_session(
+    def _create_incremental_session(
         self,
         plan: cw.Plan,
-        extension_bindings: Mapping[str, cw.Extension] | None,
+        extensions: tuple[_BoundExtension, ...],
         options: cw.RuntimeOptions | None,
-    ) -> cw.ContinuousSession:
-        """継続実行境界を記録してPythonExecutorへ委譲する。"""
+    ) -> IncrementalSessionRunner:
+        """段階実行境界を記録してPythonExecutorへ委譲する。"""
 
-        self.continuous_session_count += 1
-        return self._delegate.create_continuous_session(plan, extension_bindings, options)
+        self.incremental_count += 1
+        return self._delegate._create_incremental_session(plan, extensions, options)
 
 
 def test_plan_selects_executor_without_changing_trace() -> None:
@@ -52,18 +52,18 @@ def test_plan_selects_executor_without_changing_trace() -> None:
     assert executor.one_shot_count == 1
 
 
-def test_continuous_session_selects_executor_at_session_creation() -> None:
-    """継続sessionも同じExecutor選択境界を通る。"""
+def test_incremental_session_selects_executor_when_started() -> None:
+    """段階実行も同じSessionからExecutor境界を通る。"""
 
     plan = cw.compile([cw.output(cw.Flow([1]), collector=cw.Latest())])
     executor = _RecordingExecutor()
 
-    session = plan.create_continuous_session(executor=executor)
+    session = plan.create_session(executor=executor)
     session.start()
     result = session.close()
 
     assert result.completed
-    assert executor.continuous_session_count == 1
+    assert executor.incremental_count == 1
 
 
 def test_unknown_executor_is_rejected_before_runtime_state_creation() -> None:

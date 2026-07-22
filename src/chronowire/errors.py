@@ -53,10 +53,6 @@ class SessionError(ChronowireError):
     """Sessionの再利用またはlifecycle契約違反。"""
 
 
-# v0.4公開名からの一時的な例外alias。
-PlanSessionError = SessionError
-
-
 class SourceExecutionError(ChronowireError):
     """Sourceの開始、受信、停止契約に起因する実行時例外。"""
 

@@ -196,8 +196,8 @@ def test_cython_executor_rejects_implicit_python_values_and_callbacks() -> None:
         plan.run(executor=cw.CythonExecutor())
 
 
-def test_cython_executor_rejects_continuous_session_explicitly() -> None:
-    """未実装ContinuousSessionをPythonへ暗黙fallbackしない。"""
+def test_cython_executor_rejects_incremental_session_explicitly() -> None:
+    """未実装SessionをPythonへ暗黙fallbackしない。"""
 
-    with pytest.raises(cw.SessionError, match="cython_continuous_session"):
-        _plan().create_continuous_session(executor=cw.CythonExecutor())
+    with pytest.raises(cw.SessionError, match="cython_incremental_session"):
+        _plan().create_session(executor=cw.CythonExecutor()).start()

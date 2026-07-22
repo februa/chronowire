@@ -99,14 +99,12 @@ def test_logical_trigger_state_is_reset_for_each_run() -> None:
     assert binding.sessions == [[0, 2], [0, 2]]
 
 
-def test_session_is_single_use_run_local_state() -> None:
-    """一つのSessionを再実行せず、新しいSessionをPlanから生成させる。"""
+def test_session_run_recreates_run_local_state() -> None:
+    """同じSessionの一括再実行でもrun-local状態を持ち越さない。"""
 
     session = cw.compile([cw.Flow([1])]).create_session()
 
-    session.run()
-    with pytest.raises(cw.SessionError, match="only once"):
-        session.run()
+    assert session.run() == session.run()
 
 
 def test_extension_priority_then_registration_order_is_deterministic() -> None:

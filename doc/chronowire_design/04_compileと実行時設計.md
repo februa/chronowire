@@ -311,16 +311,16 @@ plan.run(duration=60.0)
 PlanとKernelはSession間で共有可能な不変情報を保持する。Extension観測も`ObservationSpec`として
 Planへ固定するが、handler実体と可変状態は保持しない。`Plan.create_session()`がprocess-local bindingを
 検証し、Kernelの`create_state()`とExtensionの`create_session()`からrun-local状態を生成する。
-v0.4の`CompiledKernel`はKernelへのdeprecated aliasである。
+開発中に存在した`CompiledKernel`等の旧Python名は正式公開前に削除し、互換aliasを設けない。
 
 観測契約がないPlanでは`plan.run()`を`plan.create_session().run()`の簡略形として使用できる。必須Extension bindingがあるPlanで`plan.run()`を呼んだ場合は、binding不足を暗黙に無視せず明示例外にする。
 
 初期版推奨:
 
-- 各`run()`開始時に新しいsessionを生成
-- 同じSessionを再実行してもExtension triggerとhandler状態をreset
-- v0.2の継続実行は`Plan.create_continuous_session()`で明示的に生成
-- `ContinuousSession.start()`から`close()`または`cancel()`までKernelState、FRAME、RATE、buffer、collector、Extension trigger状態を保持
+- `Plan.create_session()`でSessionを生成する
+- 同じSessionの`run()`を再実行してもKernelState、buffer、collector、Extension状態をreset
+- 段階実行は同じSessionの`start()`で開始する
+- `Session.start()`から`close()`または`cancel()`までKernelState、FRAME、RATE、buffer、collector、Extension trigger状態を保持
 - `run_until(logical_end)`は終端が指定境界以下のEmissionまで進め、境界外の既取得Emissionをsession内に保留
 - `run_until()`が返す`RunResult`はsession開始時からの累積snapshotとし、別sessionへ可変状態を持ち越さない
 

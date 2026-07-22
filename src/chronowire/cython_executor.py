@@ -9,7 +9,7 @@ from fractions import Fraction
 from math import lcm, prod
 
 from ._cython_executor import run_f64_rate_frame, run_f64_vector_rate_frame
-from .executor import SessionRunner
+from .executor import RunSessionRunner
 from .graph import NodeKind, NodeSpec, RatePolicy
 from .kernel import NativeBatchKernel, NativeBatchKernelState
 from .model import Diagnostic, Emission, EmissionStatus, LogicalInterval, LogicalTime, Severity
@@ -79,7 +79,7 @@ def _reshape_f64_item(
 
 
 @dataclass(frozen=True)
-class CythonSession(SessionRunner):
+class CythonSession(RunSessionRunner):
     """限定f64 Planを一回ずつnative loopで実行するsession。"""
 
     plan: Plan

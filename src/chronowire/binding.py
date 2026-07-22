@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from fractions import Fraction
@@ -12,7 +11,7 @@ from typing import Any
 from .collector import Collector
 from .config import Config
 from .errors import ExecutionBindingError
-from .executor import ContinuousSessionRunner, Executor
+from .executor import Executor
 from .extension import (
     Always,
     Every,
@@ -40,7 +39,7 @@ from .plan_ir import (
     RationalDescriptor,
     TriggerDescriptor,
 )
-from .runtime import Plan, RunResult, RuntimeOptions, compile, output
+from .runtime import Plan, RunResult, RuntimeOptions, Session, compile, output
 from .source import RealtimeSource, Source
 
 
@@ -101,50 +100,32 @@ class BoundPlan:
             collector、Diagnostic、任意profileを含むRunResult。
         """
 
-        return self._plan.create_session(
-            extension_bindings=self._extensions,
-            executor=executor,
-        ).run(
-            duration=duration,
+        return self.create_session(
             options=options,
-        )
+            executor=executor,
+        ).run(duration=duration)
 
-    def create_continuous_session(
+    def create_session(
         self,
         *,
         options: RuntimeOptions | None = None,
         executor: str | Executor = "python",
-    ) -> ContinuousSessionRunner:
-        """検証済みbindingから継続ContinuousSessionを生成する。
+    ) -> Session:
+        """検証済みbindingから新しいSessionを生成する。
 
         Args:
             options: session全体へ適用するruntime調整値。
-            executor: 継続sessionを生成するExecutor名または実体。
+            executor: Session runnerを生成するExecutor名または実体。
 
         Returns:
-            CREATED状態の新しいContinuousSession。
+            CREATED状態の新しいSession。
         """
 
-        return self._plan.create_continuous_session(
+        return self._plan.create_session(
             extension_bindings=self._extensions,
             options=options,
             executor=executor,
         )
-
-    def create_plan_session(
-        self,
-        *,
-        options: RuntimeOptions | None = None,
-        executor: str | Executor = "python",
-    ) -> ContinuousSessionRunner:
-        """非推奨名からContinuousSessionを生成する互換入口。"""
-
-        warnings.warn(
-            "BoundPlan.create_plan_session() is deprecated; use create_continuous_session()",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.create_continuous_session(options=options, executor=executor)
 
 
 def _fraction(value: RationalDescriptor) -> Fraction:
@@ -473,7 +454,3 @@ def bind_plan(
         compile(output_specs, backend=backend, extensions=observations),
         extension_bindings,
     )
-
-
-# v0.4公開名からの一時的なclass alias。
-BoundExecutionPlan = BoundPlan

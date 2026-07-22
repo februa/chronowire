@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 import chronowire as cw
-from chronowire.cpp_executor import CppMixedSession, CppMultiIslandSession
 
 _MODULE_SOURCE = r"""
 #include "native_operation_abi.h"
@@ -198,7 +197,7 @@ def test_native_module_binds_without_serializing_library_path(tmp_path: Path) ->
 
 
 def test_native_module_python_executor_destroys_run_local_session(tmp_path: Path) -> None:
-    """PythonExecutorの成功・ContinuousSession closeでC ABI destroyを一度だけ呼ぶ。"""
+    """PythonExecutorの成功・Session closeでC ABI destroyを一度だけ呼ぶ。"""
 
     path = _build_module(tmp_path)
     module = cw.NativeOperationModule(path)
@@ -214,7 +213,7 @@ def test_native_module_python_executor_destroys_run_local_session(tmp_path: Path
     plan.run(executor="python")
     assert active_sessions() == 0
 
-    session = plan.create_continuous_session(executor="python")
+    session = plan.create_session(executor="python")
     session.start()
     assert active_sessions() == 1
     session.close()
@@ -358,7 +357,7 @@ def test_operation_implementation_selection_is_independent_from_executor(
     repeated_session = repeated.create_session(executor="cpp")
     repeated_result = repeated_session.run()
 
-    assert isinstance(repeated_session, CppMultiIslandSession)
+    assert isinstance(repeated_session, cw.Session)
     assert repeated_result == repeated.run(executor="python")
     assert repeated_session.last_metrics is not None
     assert repeated_session.last_metrics.execution_classification == "hybrid"
@@ -439,7 +438,7 @@ def test_cpp_executor_runs_multiple_input_python_stage_boundary(
     )
     terminal_session = terminal_plan.create_session(executor="cpp")
 
-    assert isinstance(terminal_session, CppMixedSession)
+    assert isinstance(terminal_session, cw.Session)
     assert [
         stage.input_port_ids
         for stage in terminal_plan.portable_ir.stages
@@ -467,7 +466,7 @@ def test_cpp_executor_runs_multiple_input_python_stage_boundary(
         (12.0, 24.0),
         (36.0, 48.0),
     ]
-    assert isinstance(cpp_session, CppMultiIslandSession)
+    assert isinstance(cpp_session, cw.Session)
     assert cpp_session.last_metrics is not None
     assert cpp_session.last_metrics.stage_python_dispatches == 2
     assert cpp_session.last_metrics.stage_boundary_batches == 4

@@ -154,7 +154,7 @@ def test_continuous_session_close_stops_and_drains_open_realtime_source() -> Non
 
     source_impl = _OpenRealtimeSource(2, max_items=2)
     plan = cw.compile([cw.output(cw.Flow(source_impl), collector=cw.Bounded(2))])
-    session = plan.create_continuous_session()
+    session = plan.create_session()
     session.start()
 
     result = session.close()
@@ -170,7 +170,7 @@ def test_continuous_session_cancel_discards_realtime_ingress_with_diagnostic() -
 
     source_impl = _OpenRealtimeSource(2, max_items=2)
     plan = cw.compile([cw.output(cw.Flow(source_impl), collector=cw.Bounded(2))])
-    session = plan.create_continuous_session()
+    session = plan.create_session()
     session.start()
 
     result = session.cancel()
@@ -186,14 +186,14 @@ def test_realtime_receiver_failure_is_source_error_and_plan_is_reusable() -> Non
 
     source_impl = _FailingRealtimeSource(1, max_items=1)
     plan = cw.compile([cw.output(cw.Flow(source_impl), collector=cw.Latest())])
-    session = plan.create_continuous_session()
+    session = plan.create_session()
     session.start()
 
     with pytest.raises(cw.SourceExecutionError, match="node 0 port 0.*receive failed"):
         session.run_until(2)
     assert session.state is cw.SessionState.FAILED
 
-    replacement = plan.create_continuous_session()
+    replacement = plan.create_session()
     replacement.start()
     with pytest.raises(cw.SourceExecutionError):
         replacement.run_until(2)

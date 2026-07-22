@@ -14,7 +14,7 @@ cw.Config
 cw.compile
 cw.Plan
 cw.Session
-cw.ContinuousSession
+cw.Session
 cw.OutputSpec
 cw.OutputResult
 cw.RunResult
@@ -318,10 +318,10 @@ result = session.run()
 
 ## v0.2公開API
 
-継続実行は一回実行の`Session`と区別し、次の明示lifecycleを持つ。
+`Session`は別型を設けず、一括実行と段階実行の両方を持つ。段階実行では次の明示lifecycleを使う。
 
 ```python
-session = plan.create_continuous_session(options=cw.RuntimeOptions(max_scheduler_steps=1000))
+session = plan.create_session(options=cw.RuntimeOptions(max_scheduler_steps=1000))
 session.start()
 session.run_until(10)
 session.run_until(20)
@@ -398,9 +398,9 @@ class Plan:
 
 Planはcompile後に不変とする。
 
-`Session`は一回だけ実行できるrun-localな全体状態である。同じPlanを再実行する場合も、新しい
-Sessionを`create_session()`で生成する。`ContinuousSession`は同じ概念の継続実行variantであり、
-`start()`から`close()`または`cancel()`まで状態を保持する。
+`Session.run()`は呼出しごとにKernelState、buffer、collector、Extension状態を作り直すため、
+同じSessionから繰り返し実行できる。段階実行を選ぶ場合は同じSessionの`start()`を呼び、
+`close()`または`cancel()`まで状態を保持する。一つのSessionで一括実行と段階実行を混在させない。
 
 ## 10. run()戻り値
 
