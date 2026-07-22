@@ -11,14 +11,14 @@ Chunk = tuple[tuple[float, ...], ...]
 BeamFrame = tuple[tuple[float, ...], ...]
 
 
-class _ChunkSamplesSession:
+class _ChunkSamplesState:
     """一回のrun内でchunkを論理時間付きsampleへ展開するsession。"""
 
     def __init__(self, sample_rate_hz: int) -> None:
         self._sample_rate_hz = sample_rate_hz
         self._next_sample = 0
 
-    def run(self, inputs: tuple[object, ...], context: cw.RunContext) -> object:
+    def process(self, inputs: tuple[object, ...], context: cw.RunContext) -> object:
         """channel-first chunkを0件以上のsample Emissionへ変換する。"""
 
         chunk = inputs[0]
@@ -48,36 +48,36 @@ class _ChunkSamplesSession:
 
 
 @dataclass(frozen=True)
-class _CompiledChunkSamples:
+class _ChunkSamplesKernel:
     """sample rateを解決済みのrun-local session factory。"""
 
     sample_rate_hz: int
 
-    def create_session(self) -> _ChunkSamplesSession:
+    def create_state(self) -> _ChunkSamplesState:
         """sample cursorが0のsessionを生成する。"""
 
-        return _ChunkSamplesSession(self.sample_rate_hz)
+        return _ChunkSamplesState(self.sample_rate_hz)
 
 
 class ChunkSamplesKernel:
     """Configのsample rateでchunkをsample列へ変換するKernel。"""
 
-    def compile(self, context: cw.CompileContext) -> cw.CompiledKernel[object]:
+    def compile(self, context: cw.CompileContext) -> cw.Kernel[object]:
         """`stream.sample_rate_hz`を検証し、session factoryを返す。"""
 
         sample_rate_hz = context.config.require("stream.sample_rate_hz")
         if not isinstance(sample_rate_hz, int) or sample_rate_hz <= 0:
             raise ValueError("stream.sample_rate_hz must be a positive integer")
-        return _CompiledChunkSamples(sample_rate_hz)
+        return _ChunkSamplesKernel(sample_rate_hz)
 
 
-class _FixedCbfSession:
+class _FixedCbfState:
     """固定係数をframeごとに適用するrun-local CBF session。"""
 
     def __init__(self, weights: tuple[tuple[float, ...], ...]) -> None:
         self._weights = weights
 
-    def run(self, inputs: tuple[object, ...], context: cw.RunContext) -> BeamFrame:
+    def process(self, inputs: tuple[object, ...], context: cw.RunContext) -> BeamFrame:
         """sample-major frameへ`Y[b,t]=sum_c W[b,c]X[t,c]`を適用する。"""
 
         frame = inputs[0]
@@ -100,15 +100,15 @@ class _FixedCbfSession:
 
 
 @dataclass(frozen=True)
-class _CompiledFixedCbf:
+class _FixedCbfKernelFactory:
     """検証済み固定CBF係数を保持するsession factory。"""
 
     weights: tuple[tuple[float, ...], ...]
 
-    def create_session(self) -> _FixedCbfSession:
+    def create_state(self) -> _FixedCbfState:
         """固定係数を共有し、可変状態を持たないsessionを生成する。"""
 
-        return _FixedCbfSession(self.weights)
+        return _FixedCbfState(self.weights)
 
 
 @dataclass(frozen=True)
@@ -117,7 +117,7 @@ class FixedCbfKernel:
 
     weights: tuple[tuple[float, ...], ...]
 
-    def compile(self, context: cw.CompileContext) -> cw.CompiledKernel[object]:
+    def compile(self, context: cw.CompileContext) -> cw.Kernel[object]:
         """係数shapeを検証してCBF session factoryを返す。"""
 
         if not self.weights or not self.weights[0]:
@@ -125,7 +125,7 @@ class FixedCbfKernel:
         channel_count = len(self.weights[0])
         if any(len(beam) != channel_count for beam in self.weights):
             raise ValueError("all CBF beams must have the same channel count")
-        return _CompiledFixedCbf(self.weights)
+        return _FixedCbfKernelFactory(self.weights)
 
 
 def run_example() -> tuple[BeamFrame, ...]:

@@ -7,7 +7,7 @@ import pytest
 import chronowire as cw
 
 
-def _plan(*, hop: int = 2) -> cw.ExecutionPlan:
+def _plan(*, hop: int = 2) -> cw.Plan:
     source = cw.Flow(cw.f64_source([1.0, 2.0, 3.0]))
     frames = source.rate(2).frame(2, hop=hop).map(cw.identity_f64())
     return cw.compile([cw.output(frames, collector=cw.Bounded(8))])
@@ -197,7 +197,7 @@ def test_cython_executor_rejects_implicit_python_values_and_callbacks() -> None:
 
 
 def test_cython_executor_rejects_continuous_session_explicitly() -> None:
-    """未実装PlanSessionをPythonへ暗黙fallbackしない。"""
+    """未実装ContinuousSessionをPythonへ暗黙fallbackしない。"""
 
-    with pytest.raises(cw.PlanSessionError, match="cython_continuous_session"):
-        _plan().create_plan_session(executor=cw.CythonExecutor())
+    with pytest.raises(cw.SessionError, match="cython_continuous_session"):
+        _plan().create_continuous_session(executor=cw.CythonExecutor())

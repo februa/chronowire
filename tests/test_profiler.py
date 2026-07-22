@@ -27,7 +27,7 @@ def test_profiler_reports_bounded_resources_without_changing_trace() -> None:
     assert profiled.profile.sources[0].emitted_count == 3
 
 
-def test_profiler_state_is_plan_session_local() -> None:
+def test_profiler_state_is_continuous_session_local() -> None:
     """同じPlanの別sessionへscheduler/kernel計数を持ち越さない。"""
 
     plan = cw.compile([cw.output(cw.Flow([1, 2]).map(lambda value: value), collector=cw.Latest())])

@@ -45,7 +45,7 @@ result = session.run()
 
 `observe()`が返す`ObservationSpec`はcompile-time契約であり、`extension_id`、観測Port、trigger、priority、failure/overflow policy、要求ABIを保持する。観測Portはrequired rootかつFusion境界となる。Extension観測だけを理由に`RunResult.outputs`へは追加しない。
 
-`Extension`はprocess-local binding factoryであり、Flow、Port、triggerを知らない。`create_session()`がrun-localな`ExtensionSession`を生成する。`Snapshot`はJSONL recorder bindingであり、pathやPython objectをPortablePlanIRへ入れない。同じPlanまたはExecutionSessionを再実行しても、trigger、file、handlerの可変状態を持ち越さない。
+`Extension`はprocess-local binding factoryであり、Flow、Port、triggerを知らない。`create_session()`がrun-localな`ExtensionSession`を生成する。`Snapshot`はJSONL recorder bindingであり、pathやPython objectをPortablePlanIRへ入れない。同じPlanまたはSessionを再実行しても、trigger、file、handlerの可変状態を持ち越さない。
 
 `extension_id`は利用者が必ず明示し、Plan内で一意とする。`extension_id="spectrum_snapshot"`に対してCompilerは`binding_slot="extension:spectrum_snapshot"`を生成できるが、安定した観測契約IDとprocess-local注入slotは別field、別責務として扱う。
 
@@ -57,7 +57,7 @@ Extensionはcollectorと独立する。output collectorが`NoCollect`でもExten
 
 ## 1.4 Binding検証
 
-`ExecutionPlan.create_session(extension_bindings=...)`は実行前に次を検証する。
+`Plan.create_session(extension_bindings=...)`は実行前に次を検証する。
 
 - 必須`extension_id`のbinding不足
 - Planに存在しない、または未使用のbinding
@@ -124,7 +124,7 @@ flow.export("graph.svg")
 
 ## 3.2 Plan.export()
 
-compile後のExecutionPlanを出力する。
+compile後のPlanを出力する。
 
 ```python
 plan.export("plan.json")

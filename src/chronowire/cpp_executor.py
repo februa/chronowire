@@ -11,8 +11,8 @@ from typing import Any
 
 from ._cpp_executor import CppCooperativeStageSession, CppGraphNativeSession
 from .collector import BufferOverflowError
-from .errors import ExtensionExecutionError, KernelExecutionError, PlanSessionError
-from .executor import CppRuntimeMetrics, ExecutorSession
+from .errors import ExtensionExecutionError, KernelExecutionError, SessionError
+from .executor import CppRuntimeMetrics, SessionRunner
 from .extension import ExtensionSession, OutputEvent, PlanContext
 from .graph import InputSemantics, NodeKind, RatePolicy
 from .kernel import NativeRuntimeBindingProvider, RunContext
@@ -30,12 +30,12 @@ from .model import (
 from .native import F64VectorSourceValues, NativeF64Ingress
 from .native_module import NativeOperationRuntimeBinding
 from .runtime import (
-    ExecutionPlan,
-    ExecutionSession,
     OutputResult,
-    PlanSessionState,
+    Plan,
     RunResult,
     RuntimeOptions,
+    Session,
+    SessionState,
     _BoundExtension,
 )
 
@@ -220,7 +220,7 @@ def _run_python_map_nodes(
                 sequence += 1
                 continue
             try:
-                result = sessions[node.id].run(
+                result = sessions[node.id].process(
                     tuple(item.value for item in inputs),
                     RunContext(node.config, main.interval),
                 )
@@ -372,11 +372,11 @@ def _run_python_prefix_stage(
     return batches, counts
 
 
-class CppPythonStageExecutionSession(ExecutorSession):
+class CppPythonStageSession(SessionRunner):
     """all-Python Planを単一の協調的Python islandとして実行する。
 
     Args:
-        plan: 全Stageが`python_stage` runnerを要求するExecutionPlan。
+        plan: 全Stageが`python_stage` runnerを要求するPlan。
         python_session: run-local Operation/collector/Extension状態を所有するadapter側session。
 
     境界条件:
@@ -384,7 +384,7 @@ class CppPythonStageExecutionSession(ExecutorSession):
         C++側はstage IDのyield/resume状態だけを所有し、Python callbackを保持しない。
     """
 
-    def __init__(self, plan: ExecutionPlan, python_session: ExecutionSession) -> None:
+    def __init__(self, plan: Plan, python_session: Session) -> None:
         stages = plan.portable_ir.stages
         if len(stages) != 1 or stages[0].execution_domain != "python":
             stage_ids = tuple(stage.stage_id for stage in stages)
@@ -470,11 +470,11 @@ def _reshape_item(
     )
 
 
-class CppExecutionSession(ExecutorSession):
+class CppSession(SessionRunner):
     """compile済みPlanを所有するrun-local C++実行instance。
 
     Args:
-        plan: PortablePlanIR schema 0.3とprocess-local bindingを持つExecutionPlan。
+        plan: PortablePlanIR schema 0.3とprocess-local bindingを持つPlan。
 
     Raises:
         ValueError: CppExecutor対象外Node、ABI、Source、collectorまたは境界を含む場合。
@@ -487,7 +487,7 @@ class CppExecutionSession(ExecutorSession):
 
     def __init__(
         self,
-        plan: ExecutionPlan,
+        plan: Plan,
         extensions: tuple[_BoundExtension, ...] = (),
         *,
         node_ids: tuple[int, ...] | None = None,
@@ -640,7 +640,7 @@ class CppExecutionSession(ExecutorSession):
             parameter_shape: tuple[int, ...] = ()
             native_functions = (0, 0, 0, 0)
             if node.kind is NodeKind.MAP:
-                compiled = self.plan._compiled_kernels.get(node.id)
+                compiled = self.plan._kernels.get(node.id)
                 if not isinstance(compiled, NativeRuntimeBindingProvider):
                     stage = next(
                         (item for item in ir.stages if node.id in item.node_ids),
@@ -1063,7 +1063,7 @@ class CppExecutionSession(ExecutorSession):
         )
 
 
-class CppMixedExecutionSession(ExecutorSession):
+class CppMixedSession(SessionRunner):
     """native prefixから単一Python islandを経由してPlanを運用するmixed session。
 
     Args:
@@ -1077,7 +1077,7 @@ class CppMixedExecutionSession(ExecutorSession):
         Python関数を直接呼ばない。
     """
 
-    def __init__(self, plan: ExecutionPlan) -> None:
+    def __init__(self, plan: Plan) -> None:
         if plan._observations:
             raise ValueError(
                 "CppExecutor contract=mixed_extension_boundary_pending; "
@@ -1210,15 +1210,13 @@ class CppMixedExecutionSession(ExecutorSession):
         self._suffix_boundary_port = suffix_boundary_port
         self._suffix_boundary_shape = suffix_boundary_shape
         self._native_suffix_node_ids = native_suffix_node_ids
-        self._native = CppExecutionSession(
+        self._native = CppSession(
             plan,
             node_ids=native_prefix_node_ids,
             boundary_output_ports=boundary_ports,
         )
         self._coordinator = CppCooperativeStageSession((stage.stage_id,))
-        self._sessions = {
-            node.id: plan._compiled_kernels[node.id].create_session() for node in python_nodes
-        }
+        self._sessions = {node.id: plan._kernels[node.id].create_state() for node in python_nodes}
         self._last_metrics: CppRuntimeMetrics | None = None
 
     @property
@@ -1285,7 +1283,7 @@ class CppMixedExecutionSession(ExecutorSession):
                 if self._suffix_boundary_port is None or self._suffix_boundary_shape is None:
                     raise RuntimeError("CppExecutor contract=bound_native_suffix_boundary")
                 suffix_boundary = batches[self._suffix_boundary_port]
-                suffix = CppExecutionSession(
+                suffix = CppSession(
                     self.plan,
                     node_ids=self._native_suffix_node_ids,
                     ingress_port=self._suffix_boundary_port,
@@ -1405,7 +1403,7 @@ class CppMixedExecutionSession(ExecutorSession):
         return RunResult(tuple(outputs), self.plan.diagnostics, status_counts, completed=True)
 
 
-class CppPythonPrefixExecutionSession(ExecutorSession):
+class CppPythonPrefixSession(SessionRunner):
     """先頭Python islandのbatchをnative suffixへresumeするmixed session。
 
     Args:
@@ -1419,7 +1417,7 @@ class CppPythonPrefixExecutionSession(ExecutorSession):
         ingress境界として扱うが、公開status件数ではGraph Nodeとして二重計上しない。
     """
 
-    def __init__(self, plan: ExecutionPlan) -> None:
+    def __init__(self, plan: Plan) -> None:
         if plan._observations:
             raise ValueError(
                 "CppExecutor contract=mixed_extension_boundary_pending; "
@@ -1504,7 +1502,7 @@ class CppPythonPrefixExecutionSession(ExecutorSession):
             node.id for node in plan._nodes if node.id not in python_node_ids
         )
         self._sessions = {
-            node.id: plan._compiled_kernels[node.id].create_session()
+            node.id: plan._kernels[node.id].create_state()
             for node in stage_nodes
             if node.kind is NodeKind.MAP
         }
@@ -1552,7 +1550,7 @@ class CppPythonPrefixExecutionSession(ExecutorSession):
             python_stage_ns = perf_counter_ns() - started
             boundary = batches[self._boundary_port]
             self._coordinator.resume(stage_id)
-            native = CppExecutionSession(
+            native = CppSession(
                 self.plan,
                 node_ids=self._native_node_ids,
                 ingress_port=self._boundary_port,
@@ -1603,7 +1601,7 @@ class CppPythonPrefixExecutionSession(ExecutorSession):
         return replace(result, status_counts=status_counts)
 
 
-class CppMultiIslandExecutionSession(ExecutorSession):
+class CppMultiIslandSession(SessionRunner):
     """複数のPython islandをnative区間間で順次yield/resumeするsession。
 
     Args:
@@ -1617,7 +1615,7 @@ class CppMultiIslandExecutionSession(ExecutorSession):
         C++ GraphRuntimeSessionが自立実行し、境界batchだけを一回copyする。
     """
 
-    def __init__(self, plan: ExecutionPlan) -> None:
+    def __init__(self, plan: Plan) -> None:
         if plan._observations:
             raise ValueError(
                 "CppExecutor contract=mixed_extension_boundary_pending; "
@@ -1732,7 +1730,7 @@ class CppMultiIslandExecutionSession(ExecutorSession):
         self._node_positions = node_positions
         self._prefix_source = prefix_source
         self._sessions = {
-            node.id: plan._compiled_kernels[node.id].create_session()
+            node.id: plan._kernels[node.id].create_state()
             for stage in python_stages
             for node in stage_nodes[stage.stage_id]
             if node.kind is NodeKind.MAP
@@ -1823,7 +1821,7 @@ class CppMultiIslandExecutionSession(ExecutorSession):
                     boundary = source_batch
                 else:
                     input_ports = stage.input_port_ids
-                    native = CppExecutionSession(
+                    native = CppSession(
                         self.plan,
                         node_ids=native_node_ids,
                         boundary_output_ports=input_ports,
@@ -1909,7 +1907,7 @@ class CppMultiIslandExecutionSession(ExecutorSession):
             if suffix_node_ids:
                 if ingress_port is None or ingress_shape is None:
                     raise RuntimeError("CppExecutor contract=bound_multi_island_suffix")
-                suffix = CppExecutionSession(
+                suffix = CppSession(
                     self.plan,
                     node_ids=suffix_node_ids,
                     ingress_port=ingress_port,
@@ -1990,7 +1988,7 @@ class CppMultiIslandExecutionSession(ExecutorSession):
         return RunResult(tuple(outputs), self.plan.diagnostics, status_counts, completed=True)
 
 
-class CppPlanSession:
+class CppContinuousSession:
     """有限native Planを論理時間境界ごとにC++で継続観測するsession。
 
     v0.4では各境界のsnapshotを同じimmutable C++ Planから決定的に再計算する。Python側は
@@ -1999,23 +1997,23 @@ class CppPlanSession:
 
     def __init__(
         self,
-        plan: ExecutionPlan,
+        plan: Plan,
         options: RuntimeOptions | None,
         extensions: tuple[_BoundExtension, ...] = (),
     ) -> None:
         if extensions:
-            raise PlanSessionError(
+            raise SessionError(
                 "CppExecutor continuous Extension boundary is not supported; "
                 "contract=cpp_continuous_extension"
             )
         if options is not None and options != RuntimeOptions():
-            raise PlanSessionError(
-                "CppExecutor PlanSession supports default RuntimeOptions only; "
+            raise SessionError(
+                "CppExecutor ContinuousSession supports default RuntimeOptions only; "
                 "contract=cpp_runtime_options"
             )
-        self._execution = CppExecutionSession(plan)
+        self._execution = CppSession(plan)
         self._plan = plan
-        self._state = PlanSessionState.CREATED
+        self._state = SessionState.CREATED
         self._logical_end: Fraction | None = None
         self._last_result: RunResult | None = None
         self._session_diagnostics: list[Diagnostic] = []
@@ -2025,7 +2023,7 @@ class CppPlanSession:
         )
 
     @property
-    def state(self) -> PlanSessionState:
+    def state(self) -> SessionState:
         """現在のC++ session lifecycle状態を返す。"""
 
         return self._state
@@ -2033,18 +2031,18 @@ class CppPlanSession:
     def start(self) -> None:
         """run-local C++ Plan resourceを開始状態へ遷移させる。"""
 
-        if self._state is not PlanSessionState.CREATED:
-            raise PlanSessionError(
-                f"CppPlanSession.start requires state=created; actual={self._state.value}"
+        if self._state is not SessionState.CREATED:
+            raise SessionError(
+                f"CppContinuousSession.start requires state=created; actual={self._state.value}"
             )
         self._session_diagnostics.append(
             Diagnostic(
                 Severity.INFO,
                 "SESSION_STARTED",
-                "CppPlanSession acquired run-local resources",
+                "CppContinuousSession acquired run-local resources",
             )
         )
-        self._state = PlanSessionState.RUNNING
+        self._state = SessionState.RUNNING
 
     def run_until(self, logical_end: LogicalTime | Fraction | int | float) -> RunResult:
         """指定した排他的論理時間境界までの累積snapshotを返す。"""
@@ -2052,13 +2050,14 @@ class CppPlanSession:
         self._require_running("run_until")
         target = self._logical_time_fraction(logical_end)
         if target <= 0 or (self._logical_end is not None and target <= self._logical_end):
-            raise PlanSessionError(
-                "CppPlanSession.run_until requires a positive, strictly increasing logical_end"
+            raise SessionError(
+                "CppContinuousSession.run_until requires a positive, strictly "
+                "increasing logical_end"
             )
         try:
             result = self._execution.run(duration=target)
         except Exception:
-            self._state = PlanSessionState.FAILED
+            self._state = SessionState.FAILED
             raise
         self._logical_end = target
         completed = target >= self._source_end
@@ -2072,7 +2071,7 @@ class CppPlanSession:
         try:
             result = self._execution.run()
         except Exception:
-            self._state = PlanSessionState.FAILED
+            self._state = SessionState.FAILED
             raise
         self._last_result = self._decorate(result, completed=True)
         return self._last_result
@@ -2085,10 +2084,10 @@ class CppPlanSession:
             Diagnostic(
                 Severity.INFO,
                 "SESSION_CLOSED",
-                "CppPlanSession drained run-local resources",
+                "CppContinuousSession drained run-local resources",
             )
         )
-        self._state = PlanSessionState.CLOSED
+        self._state = SessionState.CLOSED
         self._last_result = self._decorate(result, completed=True)
         return self._last_result
 
@@ -2100,10 +2099,10 @@ class CppPlanSession:
             Diagnostic(
                 Severity.WARNING,
                 "SESSION_CANCELLED",
-                "CppPlanSession was cancelled without flushing pending input",
+                "CppContinuousSession was cancelled without flushing pending input",
             )
         )
-        self._state = PlanSessionState.CANCELLED
+        self._state = SessionState.CANCELLED
         base = self._last_result or RunResult(
             tuple(
                 OutputResult((), descriptor.collector_kind, 0, 0, None, None)
@@ -2124,9 +2123,10 @@ class CppPlanSession:
         return replace(result, diagnostics=diagnostics, completed=completed)
 
     def _require_running(self, operation: str) -> None:
-        if self._state is not PlanSessionState.RUNNING:
-            raise PlanSessionError(
-                f"CppPlanSession.{operation} requires state=running; actual={self._state.value}"
+        if self._state is not SessionState.RUNNING:
+            raise SessionError(
+                f"CppContinuousSession.{operation} requires state=running; "
+                f"actual={self._state.value}"
             )
 
     @staticmethod
@@ -2136,4 +2136,4 @@ class CppPlanSession:
         try:
             return Fraction(str(value)) if isinstance(value, float) else Fraction(value)
         except (TypeError, ValueError, ZeroDivisionError) as error:
-            raise PlanSessionError("logical_end must be a finite rational value") from error
+            raise SessionError("logical_end must be a finite rational value") from error

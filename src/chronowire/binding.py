@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from fractions import Fraction
@@ -11,7 +12,7 @@ from typing import Any
 from .collector import Collector
 from .config import Config
 from .errors import ExecutionBindingError
-from .executor import Executor, ExecutorPlanSession
+from .executor import ContinuousSessionRunner, Executor
 from .extension import (
     Always,
     Every,
@@ -22,7 +23,7 @@ from .extension import (
     ObservationSpec,
 )
 from .graph import Flow, Graph, InputSemantics, InputSpec, MissingInputPolicy, NodeKind, RatePolicy
-from .kernel import Backend, CompileContext, CompiledKernel, GapPolicy, Kernel
+from .kernel import Backend, CompileContext, GapPolicy, Kernel, KernelProvider
 from .operation import (
     ConfigSpec,
     ImplementationBinding,
@@ -39,7 +40,7 @@ from .plan_ir import (
     RationalDescriptor,
     TriggerDescriptor,
 )
-from .runtime import ExecutionPlan, RunResult, RuntimeOptions, compile, output
+from .runtime import Plan, RunResult, RuntimeOptions, compile, output
 from .source import RealtimeSource, Source
 
 
@@ -61,18 +62,18 @@ class ExecutionBindings:
 
 
 @dataclass(frozen=True)
-class _PrecompiledKernel:
-    compiled: CompiledKernel[object]
+class _BoundKernelProvider:
+    compiled: Kernel[object]
 
-    def compile(self, context: CompileContext) -> CompiledKernel[object]:
+    def compile(self, context: CompileContext) -> Kernel[object]:
         del context
         return self.compiled
 
 
-class BoundExecutionPlan:
-    """復元ExecutionPlanと検証済みExtension bindingを保持する。"""
+class BoundPlan:
+    """復元Planと検証済みExtension bindingを保持する。"""
 
-    def __init__(self, plan: ExecutionPlan, extensions: Mapping[str, Extension]) -> None:
+    def __init__(self, plan: Plan, extensions: Mapping[str, Extension]) -> None:
         self._plan = plan
         self._extensions = MappingProxyType(dict(extensions))
 
@@ -108,27 +109,42 @@ class BoundExecutionPlan:
             options=options,
         )
 
-    def create_plan_session(
+    def create_continuous_session(
         self,
         *,
         options: RuntimeOptions | None = None,
         executor: str | Executor = "python",
-    ) -> ExecutorPlanSession:
-        """検証済みbindingから継続PlanSessionを生成する。
+    ) -> ContinuousSessionRunner:
+        """検証済みbindingから継続ContinuousSessionを生成する。
 
         Args:
             options: session全体へ適用するruntime調整値。
             executor: 継続sessionを生成するExecutor名または実体。
 
         Returns:
-            CREATED状態の新しいPlanSession。
+            CREATED状態の新しいContinuousSession。
         """
 
-        return self._plan.create_plan_session(
+        return self._plan.create_continuous_session(
             extension_bindings=self._extensions,
             options=options,
             executor=executor,
         )
+
+    def create_plan_session(
+        self,
+        *,
+        options: RuntimeOptions | None = None,
+        executor: str | Executor = "python",
+    ) -> ContinuousSessionRunner:
+        """非推奨名からContinuousSessionを生成する互換入口。"""
+
+        warnings.warn(
+            "BoundPlan.create_plan_session() is deprecated; use create_continuous_session()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.create_continuous_session(options=options, executor=executor)
 
 
 def _fraction(value: RationalDescriptor) -> Fraction:
@@ -317,7 +333,7 @@ def bind_plan(
     bindings: ExecutionBindings,
     *,
     backend: str | Backend = "python",
-) -> BoundExecutionPlan:
+) -> BoundPlan:
     """PortablePlanIRを検証済みprocess-local実体へbindする。
 
     Args:
@@ -326,7 +342,7 @@ def bind_plan(
         backend: KernelをcompileするBackend。既定はPython。
 
     Returns:
-        binding検証とGraph再構築を終えたBoundExecutionPlan。
+        binding検証とGraph再構築を終えたBoundPlan。
 
     Raises:
         ExecutionBindingError: schema、slot集合、型、Config scope、Graph IDが不整合な場合。
@@ -372,7 +388,9 @@ def bind_plan(
             )
             for edge in edges_by_node[descriptor.node_id]
         )
-        operation: Callable[..., object] | Kernel[object] | OperationDefinition | None = None
+        operation: Callable[..., object] | KernelProvider[object] | OperationDefinition | None = (
+            None
+        )
         source: Iterable[object] | Source[object] | RealtimeSource[object] | None = None
         if descriptor.opcode == "source":
             if descriptor.binding_slot is None:
@@ -390,9 +408,9 @@ def bind_plan(
             bound = bindings.values[descriptor.binding_slot]
             if operation_descriptor is not None:
                 operation = _bound_operation(operation_descriptor, ir, bound)
-            elif isinstance(bound, CompiledKernel):
-                operation = _PrecompiledKernel(bound)
-            elif isinstance(bound, Kernel) or callable(bound):
+            elif isinstance(bound, Kernel):
+                operation = _BoundKernelProvider(bound)
+            elif isinstance(bound, KernelProvider) or callable(bound):
                 operation = bound
             else:
                 raise ExecutionBindingError(
@@ -451,7 +469,11 @@ def bind_plan(
             )
         )
         extension_bindings[descriptor.extension_id] = binding
-    return BoundExecutionPlan(
+    return BoundPlan(
         compile(output_specs, backend=backend, extensions=observations),
         extension_bindings,
     )
+
+
+# v0.4公開名からの一時的なclass alias。
+BoundExecutionPlan = BoundPlan

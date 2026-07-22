@@ -217,13 +217,13 @@ def test_declared_operation_without_python_implementation_is_compile_error() -> 
         cw.compile([mapped], backend="python")
 
 
-class _ShapeOnlySession:
-    def run(self, inputs: tuple[object, ...], context: cw.RunContext) -> object:
+class _ShapeOnlyState:
+    def process(self, inputs: tuple[object, ...], context: cw.RunContext) -> object:
         del context
         return inputs[0]
 
 
-class _ShapeOnlyCompiled:
+class _ShapeOnlyKernel:
     def __init__(self, operation_id: str) -> None:
         self.implementation_spec = cw.ImplementationSpec(
             operation_id,
@@ -232,8 +232,8 @@ class _ShapeOnlyCompiled:
             "test.shape-only.v1",
         )
 
-    def create_session(self) -> _ShapeOnlySession:
-        return _ShapeOnlySession()
+    def create_state(self) -> _ShapeOnlyState:
+        return _ShapeOnlyState()
 
 
 class _ShapeOnlyBackend:
@@ -248,16 +248,16 @@ class _ShapeOnlyBackend:
         self,
         operation: cw.OperationSpec,
         context: object,
-    ) -> cw.CompiledKernel[object]:
+    ) -> cw.Kernel[object]:
         self.compile_count += 1
         del context
-        return _ShapeOnlyCompiled(operation.operation_id)
+        return _ShapeOnlyKernel(operation.operation_id)
 
     def compile_kernel(
         self,
-        kernel: cw.Kernel[object],
+        kernel: object,
         context: cw.CompileContext,
-    ) -> cw.CompiledKernel[object]:
+    ) -> cw.Kernel[object]:
         del kernel, context
         raise AssertionError("legacy Kernel path must not be selected")
 

@@ -8,7 +8,7 @@ from types import MappingProxyType
 from typing import Protocol, TypeAlias, runtime_checkable
 
 from .config import ConfigView
-from .kernel import CompiledKernel, GapPolicy, RunContext
+from .kernel import GapPolicy, Kernel, RunContext
 
 Dimension: TypeAlias = int | str | None
 ShapeResolver: TypeAlias = Callable[
@@ -313,7 +313,7 @@ class OperationBackend(Protocol):
         self,
         operation: OperationSpec,
         context: object,
-    ) -> CompiledKernel[object]:
+    ) -> Kernel[object]:
         """operation IDに対応する実装を選択してcompileする。
 
         Args:
@@ -331,7 +331,7 @@ class OperationBackend(Protocol):
 
 
 @runtime_checkable
-class CompiledOperationMetadata(Protocol):
+class KernelMetadata(Protocol):
     """compile済みOperationが選択実装のportable属性を公開する境界。"""
 
     @property
@@ -364,14 +364,14 @@ class OperationDefinition:
 
 
 @dataclass(frozen=True)
-class _PythonOperationSession:
-    """名前付き入力とConfigViewをPython参照実装へ渡すrun-local session。"""
+class _PythonKernelState:
+    """名前付き入力とConfigViewをPython参照実装へ渡すrun-local KernelState。"""
 
     implementation: Callable[..., object]
     input_names: tuple[str, ...]
     config: ConfigView
 
-    def run(self, inputs: tuple[object, ...], context: RunContext) -> object:
+    def process(self, inputs: tuple[object, ...], context: RunContext) -> object:
         """物理tupleを不変な名前付き論理入力集合へ変換して実行する。"""
 
         del context
@@ -382,18 +382,18 @@ class _PythonOperationSession:
 
 
 @dataclass(frozen=True)
-class _CompiledPythonOperation:
-    """Python OperationSessionを生成するcompile済みfactory。"""
+class _PythonKernel:
+    """Python KernelStateを生成する不変Kernel。"""
 
     implementation: Callable[..., object]
     input_names: tuple[str, ...]
     config: ConfigView
     implementation_spec: ImplementationSpec
 
-    def create_session(self) -> _PythonOperationSession:
-        """別runと状態を共有しないPython OperationSessionを返す。"""
+    def create_state(self) -> _PythonKernelState:
+        """別Sessionと状態を共有しないPython KernelStateを返す。"""
 
-        return _PythonOperationSession(self.implementation, self.input_names, self.config)
+        return _PythonKernelState(self.implementation, self.input_names, self.config)
 
 
 def compile_python_operation(
@@ -401,7 +401,7 @@ def compile_python_operation(
     *,
     input_names: tuple[str, ...],
     config: ConfigView,
-) -> CompiledKernel[object]:
+) -> Kernel[object]:
     """OperationDefinitionのPython参照実装を内部factoryへcompileする。
 
     Raises:
@@ -415,7 +415,7 @@ def compile_python_operation(
         raise TypeError(
             f"operation {definition.operation_id!r} Python implementation must be callable"
         )
-    return _CompiledPythonOperation(
+    return _PythonKernel(
         implementation,
         input_names,
         config,

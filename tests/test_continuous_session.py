@@ -1,4 +1,4 @@
-"""v0.2 PlanSessionの継続状態とlifecycle契約を検証する。"""
+"""v0.2 ContinuousSessionの継続状態とlifecycle契約を検証する。"""
 
 from __future__ import annotations
 
@@ -9,44 +9,44 @@ import pytest
 import chronowire as cw
 
 
-class _CounterSession:
-    """PlanSession内でだけ状態を保持するtest session。"""
+class _CounterState:
+    """ContinuousSession内でだけ状態を保持するtest session。"""
 
     def __init__(self) -> None:
         self._count = 0
 
-    def run(self, inputs: tuple[object, ...], context: cw.RunContext) -> object:
+    def process(self, inputs: tuple[object, ...], context: cw.RunContext) -> object:
         """入力ごとにsession-local counterを進める。"""
 
         self._count += 1
         return self._count
 
 
-class _CompiledCounter:
-    """独立したcounter sessionを生成するcompile済みKernel。"""
+class _CounterKernelFactory:
+    """独立したcounter KernelStateを生成するKernel。"""
 
-    def create_session(self) -> _CounterSession:
+    def create_state(self) -> _CounterState:
         """counter=0の新しいsessionを返す。"""
 
-        return _CounterSession()
+        return _CounterState()
 
 
 class _CounterKernel:
     """継続状態の境界試験に使うtest Kernel。"""
 
-    def compile(self, context: cw.CompileContext) -> cw.CompiledKernel[object]:
+    def compile(self, context: cw.CompileContext) -> cw.Kernel[object]:
         """共有可能なcompile済みcounter factoryを返す。"""
 
-        return _CompiledCounter()
+        return _CounterKernelFactory()
 
 
-class _MaybeFailSession:
+class _MaybeFailState:
     """指定されたsessionだけKernel実行を失敗させるtest session。"""
 
     def __init__(self, should_fail: bool) -> None:
         self._should_fail = should_fail
 
-    def run(self, inputs: tuple[object, ...], context: cw.RunContext) -> object:
+    def process(self, inputs: tuple[object, ...], context: cw.RunContext) -> object:
         """失敗対象でなければ入力をそのまま返す。"""
 
         if self._should_fail:
@@ -54,42 +54,42 @@ class _MaybeFailSession:
         return inputs[0]
 
 
-class _FailFirstCompiled:
-    """最初のrun-local sessionだけ失敗させるcompile済みKernel。"""
+class _FailFirstKernelFactory:
+    """最初のrun-local KernelStateだけ失敗させるKernel。"""
 
     def __init__(self) -> None:
         self._created = 0
 
-    def create_session(self) -> _MaybeFailSession:
+    def create_state(self) -> _MaybeFailState:
         """一回目だけ失敗する独立sessionを生成する。"""
 
         self._created += 1
-        return _MaybeFailSession(self._created == 1)
+        return _MaybeFailState(self._created == 1)
 
 
 class _FailFirstKernel:
-    """失敗後のExecutionPlan再利用を検証するtest Kernel。"""
+    """失敗後のPlan再利用を検証するtest Kernel。"""
 
-    def compile(self, context: cw.CompileContext) -> cw.CompiledKernel[object]:
+    def compile(self, context: cw.CompileContext) -> cw.Kernel[object]:
         """失敗回数をcompile済みfactoryだけで管理する。"""
 
-        return _FailFirstCompiled()
+        return _FailFirstKernelFactory()
 
 
 def _values(result: cw.RunResult) -> list[object]:
     return [item.value for item in result.outputs[0].emissions]
 
 
-def test_plan_session_preserves_frame_state_across_run_until_boundaries() -> None:
+def test_continuous_session_preserves_frame_state_across_run_until_boundaries() -> None:
     """境界外Source値を失わず、FRAME historyを次の呼出しへ保持する。"""
 
     frames = cw.Flow([1, 2, 3, 4]).frame(2)
     plan = cw.compile([cw.output(frames, collector=cw.Bounded(2))])
-    session = plan.create_plan_session()
+    session = plan.create_continuous_session()
 
-    assert session.state is cw.PlanSessionState.CREATED
+    assert session.state is cw.SessionState.CREATED
     session.start()
-    assert session.state is cw.PlanSessionState.RUNNING
+    assert session.state is cw.SessionState.RUNNING
 
     first = session.run_until(1)
     second = session.run_until(2)
@@ -105,56 +105,56 @@ def test_plan_session_preserves_frame_state_across_run_until_boundaries() -> Non
     closed = session.close()
     assert _values(closed) == [(1, 2), (3, 4)]
     assert closed.completed
-    assert session.state is cw.PlanSessionState.CLOSED
+    assert session.state is cw.SessionState.CLOSED
 
 
-def test_plan_session_preserves_kernel_state_but_new_session_resets_it() -> None:
+def test_continuous_session_preserves_kernel_state_but_new_session_resets_it() -> None:
     """同一sessionではKernel状態を継続し、別sessionでは初期化する。"""
 
     counted = cw.Flow([10, 20]).map(_CounterKernel())
     plan = cw.compile([cw.output(counted, collector=cw.Bounded(2))])
 
-    first_session = plan.create_plan_session()
+    first_session = plan.create_continuous_session()
     first_session.start()
     assert _values(first_session.run_until(Fraction(1))) == [1]
     assert _values(first_session.run_until(Fraction(2))) == [1, 2]
     first_session.close()
 
-    second_session = plan.create_plan_session()
+    second_session = plan.create_continuous_session()
     second_session.start()
     assert _values(second_session.run_until(1)) == [1]
     second_session.cancel()
 
 
-def test_plan_session_requires_valid_lifecycle_and_monotonic_boundary() -> None:
+def test_continuous_session_requires_valid_lifecycle_and_monotonic_boundary() -> None:
     """未開始、二重開始、非単調境界、終了後操作を明示例外にする。"""
 
     plan = cw.compile([cw.output(cw.Flow([1, 2]), collector=cw.Bounded(2))])
-    session = plan.create_plan_session()
+    session = plan.create_continuous_session()
 
-    with pytest.raises(cw.PlanSessionError, match="requires state=running"):
+    with pytest.raises(cw.SessionError, match="requires state=running"):
         session.run_until(1)
     session.start()
-    with pytest.raises(cw.PlanSessionError, match="requires state=created"):
+    with pytest.raises(cw.SessionError, match="requires state=created"):
         session.start()
     session.run_until(1)
-    with pytest.raises(cw.PlanSessionError, match="strictly increasing"):
+    with pytest.raises(cw.SessionError, match="strictly increasing"):
         session.run_until(1)
 
     cancelled = session.cancel()
-    assert session.state is cw.PlanSessionState.CANCELLED
+    assert session.state is cw.SessionState.CANCELLED
     assert not cancelled.completed
     assert any(item.code == "SESSION_CANCELLED" for item in cancelled.diagnostics)
-    with pytest.raises(cw.PlanSessionError, match="actual=cancelled"):
+    with pytest.raises(cw.SessionError, match="actual=cancelled"):
         session.close()
 
 
-def test_plan_session_flushes_finite_source_after_partial_run() -> None:
+def test_continuous_session_flushes_finite_source_after_partial_run() -> None:
     """finite Sourceの残りとpad_end FRAMEをflushでdrainする。"""
 
     frames = cw.Flow([1, 2, 3]).frame(2, pad_end=True)
     plan = cw.compile([cw.output(frames, collector=cw.Bounded(2))])
-    session = plan.create_plan_session()
+    session = plan.create_continuous_session()
     session.start()
 
     assert _values(session.run_until(1)) == []
@@ -166,19 +166,19 @@ def test_plan_session_flushes_finite_source_after_partial_run() -> None:
     assert _values(closed) == [(1, 2), (3, None)]
 
 
-def test_failed_plan_session_does_not_poison_execution_plan() -> None:
+def test_failed_continuous_session_does_not_poison_plan() -> None:
     """Kernel失敗sessionを閉じ、同じPlanから新しい状態で再実行できる。"""
 
     mapped = cw.Flow([7]).map(_FailFirstKernel())
     plan = cw.compile([cw.output(mapped, collector=cw.Latest())])
-    failed = plan.create_plan_session()
+    failed = plan.create_continuous_session()
     failed.start()
 
     with pytest.raises(cw.KernelExecutionError, match="planned failure"):
         failed.run_until(1)
-    assert failed.state is cw.PlanSessionState.FAILED
+    assert failed.state is cw.SessionState.FAILED
 
-    recovered = plan.create_plan_session()
+    recovered = plan.create_continuous_session()
     recovered.start()
     assert _values(recovered.run_until(1)) == [7]
     assert recovered.close().completed
@@ -199,7 +199,7 @@ def test_runtime_options_budget_allows_retrying_same_logical_boundary() -> None:
     """budget終了時は同じrun_until境界を再指定して継続できる。"""
 
     plan = cw.compile([cw.output(cw.Flow([1, 2, 3]), collector=cw.Bounded(3))])
-    session = plan.create_plan_session(options=cw.RuntimeOptions(max_scheduler_steps=1))
+    session = plan.create_continuous_session(options=cw.RuntimeOptions(max_scheduler_steps=1))
     session.start()
 
     first = session.run_until(3)
@@ -226,8 +226,8 @@ def test_runtime_options_validates_watermarks_and_budget() -> None:
     source = cw.Flow([1, 2])
     framed = source.frame(2)
     merged = source.map(lambda value, *, frame: (value, frame), frame=framed)
-    session = cw.compile([merged]).create_plan_session(
+    session = cw.compile([merged]).create_continuous_session(
         options=cw.RuntimeOptions(port_high_watermark=1)
     )
-    with pytest.raises(cw.PlanSessionError, match="below compiled capacity"):
+    with pytest.raises(cw.SessionError, match="below compiled capacity"):
         session.start()

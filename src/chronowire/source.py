@@ -34,7 +34,7 @@ class SourceBatch(Generic[T_co]):
 class Source(Protocol[T_co]):
     """論理時間requestに応じてEmissionを供給する公開protocol。
 
-    generated Sourceは`is_finite=False`とし、ExecutionPlan.runへdurationが必要になる。
+    generated Sourceは`is_finite=False`とし、Plan.runへdurationが必要になる。
     """
 
     @property

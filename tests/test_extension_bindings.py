@@ -82,7 +82,7 @@ def test_every_logical_time_uses_half_open_interval_boundaries() -> None:
 
 
 def test_logical_trigger_state_is_reset_for_each_run() -> None:
-    """同じExecutionSessionを再実行してもtrigger状態を持ち越さない。"""
+    """同じPlanから作る別Sessionへtrigger状態を持ち越さない。"""
 
     source = cw.Flow(range(4))
     observation = cw.observe(
@@ -91,14 +91,22 @@ def test_logical_trigger_state_is_reset_for_each_run() -> None:
         trigger=cw.EveryLogicalTime(Fraction(2)),
     )
     binding = _RecordingExtension()
-    session = cw.compile([source], extensions=[observation]).create_session(
-        extension_bindings={"periodic": binding}
-    )
+    plan = cw.compile([source], extensions=[observation])
 
-    session.run()
-    session.run()
+    plan.create_session(extension_bindings={"periodic": binding}).run()
+    plan.create_session(extension_bindings={"periodic": binding}).run()
 
     assert binding.sessions == [[0, 2], [0, 2]]
+
+
+def test_session_is_single_use_run_local_state() -> None:
+    """一つのSessionを再実行せず、新しいSessionをPlanから生成させる。"""
+
+    session = cw.compile([cw.Flow([1])]).create_session()
+
+    session.run()
+    with pytest.raises(cw.SessionError, match="only once"):
+        session.run()
 
 
 def test_extension_priority_then_registration_order_is_deterministic() -> None:

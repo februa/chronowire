@@ -9,9 +9,9 @@ from fractions import Fraction
 from math import lcm, prod
 
 from ._cython_executor import run_f64_rate_frame, run_f64_vector_rate_frame
-from .executor import ExecutorSession
+from .executor import SessionRunner
 from .graph import NodeKind, NodeSpec, RatePolicy
-from .kernel import NativeBatchCompiledKernel, NativeBatchKernelSession
+from .kernel import NativeBatchKernel, NativeBatchKernelState
 from .model import Diagnostic, Emission, EmissionStatus, LogicalInterval, LogicalTime, Severity
 from .native import (
     F64SourceValues,
@@ -19,7 +19,7 @@ from .native import (
     IdentityF64Kernel,
     NativeValueBatch,
 )
-from .runtime import ExecutionPlan, OutputResult, RunResult, RuntimeOptions
+from .runtime import OutputResult, Plan, RunResult, RuntimeOptions
 
 _STATUS_TO_NATIVE = {
     EmissionStatus.OK: 0,
@@ -79,10 +79,10 @@ def _reshape_f64_item(
 
 
 @dataclass(frozen=True)
-class CythonExecutionSession(ExecutorSession):
+class CythonSession(SessionRunner):
     """限定f64 Planを一回ずつnative loopで実行するsession。"""
 
-    plan: ExecutionPlan
+    plan: Plan
 
     def __post_init__(self) -> None:
         self._validate_plan()
@@ -365,13 +365,13 @@ class CythonExecutionSession(ExecutorSession):
             frame_count,
             (frame_node.frame_size, source.width),
         )
-        compiled = self.plan._compiled_kernels.get(map_node.id)
-        if not isinstance(compiled, NativeBatchCompiledKernel):
-            raise RuntimeError("validated native batch CompiledKernel binding was lost")
-        kernel_session = compiled.create_session()
-        if not isinstance(kernel_session, NativeBatchKernelSession):
-            raise RuntimeError("native batch CompiledKernel returned an incompatible session")
-        kernel_result = kernel_session.run_batch(
+        compiled = self.plan._kernels.get(map_node.id)
+        if not isinstance(compiled, NativeBatchKernel):
+            raise RuntimeError("validated native batch Kernel binding was lost")
+        kernel_state = compiled.create_state()
+        if not isinstance(kernel_state, NativeBatchKernelState):
+            raise RuntimeError("native batch Kernel returned an incompatible KernelState")
+        kernel_result = kernel_state.process_batch(
             frame_batch.f64_view(),
             item_count=frame_batch.item_count,
             item_shape=frame_batch.item_shape,
@@ -471,13 +471,13 @@ class CythonExecutionSession(ExecutorSession):
                 "CythonExecutor contract=frame_eof forbids pad_end; "
                 f"node={frame_node.id} port={frame_node.output_port}"
             )
-        compiled = self.plan._compiled_kernels.get(map_node.id)
+        compiled = self.plan._kernels.get(map_node.id)
         if is_scalar_source and not isinstance(map_node.operation, IdentityF64Kernel):
             raise ValueError(
                 "CythonExecutor contract=kernel_abi requires cw.identity_f64(); "
                 f"node={map_node.id} port={map_node.output_port}"
             )
-        if is_vector_source and not isinstance(compiled, NativeBatchCompiledKernel):
+        if is_vector_source and not isinstance(compiled, NativeBatchKernel):
             raise ValueError(
                 "CythonExecutor contract=batch_kernel_abi requires a native batch Kernel; "
                 f"node={map_node.id} port={map_node.output_port}"

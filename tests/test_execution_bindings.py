@@ -10,7 +10,7 @@ def _values(result: cw.RunResult) -> list[object]:
 
 
 def _binding_values(
-    plan: cw.ExecutionPlan,
+    plan: cw.Plan,
     *,
     source: object,
     kernel: object,

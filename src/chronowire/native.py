@@ -10,7 +10,7 @@ from functools import reduce
 from math import isfinite, lcm
 from operator import mul
 
-from .kernel import CompileContext, CompiledKernel, NativeKernelRuntimeBinding, RunContext
+from .kernel import CompileContext, Kernel, NativeKernelRuntimeBinding, RunContext
 from .model import Emission, EmissionStatus, LogicalInterval, LogicalTime
 
 _I64_MIN = -(2**63)
@@ -351,16 +351,16 @@ def f64_source(
 
 
 @dataclass(frozen=True)
-class _IdentityF64Session:
-    def run(self, inputs: tuple[object, ...], context: RunContext) -> object:
+class _IdentityF64State:
+    def process(self, inputs: tuple[object, ...], context: RunContext) -> object:
         del context
         return inputs[0]
 
 
 @dataclass(frozen=True)
-class _CompiledIdentityF64:
-    def create_session(self) -> _IdentityF64Session:
-        return _IdentityF64Session()
+class _IdentityF64Kernel:
+    def create_state(self) -> _IdentityF64State:
+        return _IdentityF64State()
 
     def create_native_runtime_binding(self) -> NativeKernelRuntimeBinding:
         """parameterを持たないidentity ABI bindingを返す。"""
@@ -381,11 +381,11 @@ class IdentityF64Kernel:
     abi_version: str = "chronowire.kernel.identity_f64.v1"
     process_model: str = "identity_f64"
 
-    def compile(self, context: CompileContext) -> CompiledKernel[object]:
+    def compile(self, context: CompileContext) -> Kernel[object]:
         """Python基準実装用のstateless session factoryを返す。"""
 
         del context
-        return _CompiledIdentityF64()
+        return _IdentityF64Kernel()
 
 
 def identity_f64() -> IdentityF64Kernel:

@@ -15,8 +15,8 @@ from .config import ConfigView
 from .errors import MissingImplementationError
 from .kernel import (
     CompileContext,
-    CompiledKernel,
-    CompiledKernelSession,
+    Kernel,
+    KernelState,
     RunContext,
 )
 from .model import Diagnostic, Emission, EmissionStatus, Severity
@@ -400,34 +400,34 @@ def _reshape_f64(values: tuple[float, ...], shape: tuple[int, ...], offset: int 
     )
 
 
-class _NativeModulePythonSession:
-    """PythonExecutorでC ABI wrapperをEmission単位に照合するrun-local session。"""
+class _NativeModuleKernelState:
+    """PythonExecutorでC ABI wrapperをEmission単位に照合するrun-local KernelState。"""
 
-    def __init__(self, compiled: _CompiledNativeModuleOperation) -> None:
-        self._compiled = compiled
-        self._create = _CreateFunctionV1(compiled.entry.create_address)
-        self._process = _ProcessFunctionV1(compiled.entry.process_address)
-        self._destroy = _DestroyFunctionV1(compiled.entry.destroy_address)
+    def __init__(self, kernel: _NativeModuleKernel) -> None:
+        self._compiled = kernel
+        self._create = _CreateFunctionV1(kernel.entry.create_address)
+        self._process = _ProcessFunctionV1(kernel.entry.process_address)
+        self._destroy = _DestroyFunctionV1(kernel.entry.destroy_address)
         self._handle: int | None = None
-        parameters = (ctypes.c_double * len(compiled.parameters))(*compiled.parameters)
+        parameters = (ctypes.c_double * len(kernel.parameters))(*kernel.parameters)
         error = ctypes.create_string_buffer(512)
-        handle = self._create(parameters, len(compiled.parameters), error, len(error))
+        handle = self._create(parameters, len(kernel.parameters), error, len(error))
         if not handle:
             message = error.value.decode("utf-8", errors="replace")
             raise RuntimeError(
-                f"node={compiled.node_id} port={compiled.output_port_id} "
-                f"operation={compiled.entry.operation_id} error={message}; "
+                f"node={kernel.node_id} port={kernel.output_port_id} "
+                f"operation={kernel.entry.operation_id} error={message}; "
                 "contract=native_module_create"
             )
         self._handle = int(handle)
 
-    def run(self, inputs: tuple[object, ...], context: RunContext) -> object:
+    def process(self, inputs: tuple[object, ...], context: RunContext) -> object:
         """Operationの物理input列をC ABI wrapperで一回処理する。"""
 
         if self._handle is None:
             raise RuntimeError(
                 f"operation={self._compiled.entry.operation_id} session is closed; "
-                "contract=operation_session_lifecycle"
+                "contract=kernel_state_lifecycle"
             )
         if len(inputs) != len(self._compiled.input_shapes):
             raise ValueError(
@@ -526,7 +526,7 @@ class _NativeModulePythonSession:
         )
 
     def close(self) -> None:
-        """native Operation sessionを一度だけdestroyする。"""
+        """native KernelStateを一度だけdestroyする。"""
 
         if self._handle is None:
             return
@@ -540,7 +540,7 @@ class _NativeModulePythonSession:
 
 
 @dataclass(frozen=True)
-class _CompiledNativeModuleOperation:
+class _NativeModuleKernel:
     entry: NativeOperationEntry
     parameters: tuple[float, ...]
     implementation_spec: ImplementationSpec
@@ -556,14 +556,14 @@ class _CompiledNativeModuleOperation:
     session_local: bool
     native_compatible: bool = True
 
-    def create_session(self) -> CompiledKernelSession[object]:
-        """PythonExecutor用のC ABI conformance sessionを生成する。"""
+    def create_state(self) -> KernelState[object]:
+        """PythonExecutor用のC ABI conformance KernelStateを生成する。"""
 
         if self.supports_flush:
             raise RuntimeError(
                 f"operation={self.entry.operation_id} contract=python_executor_native_flush"
             )
-        return _NativeModulePythonSession(self)
+        return _NativeModuleKernelState(self)
 
     def create_native_runtime_binding(self) -> NativeOperationRuntimeBinding:
         """module handleを保持したC++ runtime bindingを生成する。"""
@@ -625,7 +625,7 @@ class NativeModuleBackend:
     module: NativeOperationModule
     name: str = "cpp"
 
-    def compile_kernel(self, kernel: object, context: CompileContext) -> CompiledKernel[object]:
+    def compile_kernel(self, kernel: object, context: CompileContext) -> Kernel[object]:
         """legacy Kernelはmodule Operation境界外として拒否する。
 
         Args:
@@ -643,7 +643,7 @@ class NativeModuleBackend:
         self,
         operation: OperationSpec,
         context: object,
-    ) -> CompiledKernel[object]:
+    ) -> Kernel[object]:
         """manifest entryと固定Configをcompile済みOperationへbindする。
 
         Args:
@@ -689,7 +689,7 @@ class NativeModuleBackend:
         if output_shape is None:
             raise RuntimeError("validated native output shape was lost")
         specification = entry.implementation_spec(self.name)
-        return _CompiledNativeModuleOperation(
+        return _NativeModuleKernel(
             entry,
             _float64_parameters(operation, config),
             specification,

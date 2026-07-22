@@ -149,28 +149,28 @@ def test_realtime_source_state_is_run_local() -> None:
     assert [item.details["total_dropped_count"] for item in second.diagnostics] == [2]
 
 
-def test_plan_session_close_stops_and_drains_open_realtime_source() -> None:
+def test_continuous_session_close_stops_and_drains_open_realtime_source() -> None:
     """closeは外部受付を止めてingress残件と下流をdrainする。"""
 
     source_impl = _OpenRealtimeSource(2, max_items=2)
     plan = cw.compile([cw.output(cw.Flow(source_impl), collector=cw.Bounded(2))])
-    session = plan.create_plan_session()
+    session = plan.create_continuous_session()
     session.start()
 
     result = session.close()
 
     assert [item.value for item in result.outputs[0].emissions] == [0, 1]
     assert result.completed
-    assert session.state is cw.PlanSessionState.CLOSED
+    assert session.state is cw.SessionState.CLOSED
     assert source_impl.sessions[0].stopped
 
 
-def test_plan_session_cancel_discards_realtime_ingress_with_diagnostic() -> None:
+def test_continuous_session_cancel_discards_realtime_ingress_with_diagnostic() -> None:
     """cancelはdrainせず、破棄したRealtime件数をDiagnosticへ残す。"""
 
     source_impl = _OpenRealtimeSource(2, max_items=2)
     plan = cw.compile([cw.output(cw.Flow(source_impl), collector=cw.Bounded(2))])
-    session = plan.create_plan_session()
+    session = plan.create_continuous_session()
     session.start()
 
     result = session.cancel()
@@ -186,14 +186,14 @@ def test_realtime_receiver_failure_is_source_error_and_plan_is_reusable() -> Non
 
     source_impl = _FailingRealtimeSource(1, max_items=1)
     plan = cw.compile([cw.output(cw.Flow(source_impl), collector=cw.Latest())])
-    session = plan.create_plan_session()
+    session = plan.create_continuous_session()
     session.start()
 
     with pytest.raises(cw.SourceExecutionError, match="node 0 port 0.*receive failed"):
         session.run_until(2)
-    assert session.state is cw.PlanSessionState.FAILED
+    assert session.state is cw.SessionState.FAILED
 
-    replacement = plan.create_plan_session()
+    replacement = plan.create_continuous_session()
     replacement.start()
     with pytest.raises(cw.SourceExecutionError):
         replacement.run_until(2)
@@ -293,11 +293,11 @@ def test_rate_reestablishes_offset_from_first_post_gap_interval() -> None:
     ]
 
 
-class _CountingSession:
+class _CountingState:
     def __init__(self) -> None:
         self.count = 0
 
-    def run(self, inputs: tuple[object, ...], context: cw.RunContext) -> int:
+    def process(self, inputs: tuple[object, ...], context: cw.RunContext) -> int:
         """session内の呼出し回数を返す。"""
 
         del inputs, context
@@ -305,23 +305,23 @@ class _CountingSession:
         return self.count
 
 
-class _CountingCompiled:
-    def create_session(self) -> _CountingSession:
+class _CountingKernelFactory:
+    def create_state(self) -> _CountingState:
         """空のrun-local counterを生成する。"""
 
-        return _CountingSession()
+        return _CountingState()
 
 
 class _CountingKernel:
-    def compile(self, context: cw.CompileContext) -> _CountingCompiled:
+    def compile(self, context: cw.CompileContext) -> _CountingKernelFactory:
         """設定に依存しないcounter factoryを返す。"""
 
         del context
-        return _CountingCompiled()
+        return _CountingKernelFactory()
 
 
-def test_stateful_kernel_session_resets_after_gap() -> None:
-    """MAPは欠落境界後にCompiledKernelSessionを作り直す。"""
+def test_stateful_kernel_state_resets_after_gap() -> None:
+    """MAPは欠落境界後にKernelStateを作り直す。"""
 
     values = [
         cw.Emission(

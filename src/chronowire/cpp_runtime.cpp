@@ -459,9 +459,9 @@ GraphKernelKind resolve_graph_kernel(const GraphNodeSpec& node) {
     throw std::invalid_argument("CppExecutor contract=kernel_abi_table");
 }
 
-class ExternalOperationSession {
+class ExternalKernelState {
 public:
-    explicit ExternalOperationSession(const GraphNodeSpec& node) : node_(node) {
+    explicit ExternalKernelState(const GraphNodeSpec& node) : node_(node) {
         create_ = reinterpret_cast<CwCreateFnV1>(node.native_create);
         process_ = reinterpret_cast<CwProcessFnV1>(node.native_process);
         destroy_ = reinterpret_cast<CwDestroyFnV1>(node.native_destroy);
@@ -481,10 +481,10 @@ public:
         }
     }
 
-    ExternalOperationSession(const ExternalOperationSession&) = delete;
-    ExternalOperationSession& operator=(const ExternalOperationSession&) = delete;
+    ExternalKernelState(const ExternalKernelState&) = delete;
+    ExternalKernelState& operator=(const ExternalKernelState&) = delete;
 
-    ~ExternalOperationSession() {
+    ~ExternalKernelState() {
         if (session_ != nullptr && destroy_ != nullptr) {
             destroy_(session_);
         }
@@ -749,9 +749,9 @@ GraphBatch run_map_node(
     std::vector<bool> has_latest(inputs.size(), false);
     std::vector<double> covariance_sums;
     std::size_t covariance_sample_count = 0;
-    std::unique_ptr<ExternalOperationSession> external_session;
+    std::unique_ptr<ExternalKernelState> external_session;
     if (kind == GraphKernelKind::external_operation) {
-        external_session = std::make_unique<ExternalOperationSession>(node);
+        external_session = std::make_unique<ExternalKernelState>(node);
     }
     for (const GraphItem& item : input) {
         GraphItem mapped = item;

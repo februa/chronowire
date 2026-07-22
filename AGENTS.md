@@ -1,6 +1,6 @@
 # AGENTS.md
 
-このリポジトリは、論理時間に基づくストリーミング処理をFlow APIで記述し、Logical GraphからExecutionPlanへcompileするChronowireを扱う。
+このリポジトリは、論理時間に基づくストリーミング処理をFlow APIで記述し、Logical Graphから不変なPlanへcompileするChronowireを扱う。
 
 実装では、動作だけでなく、責務、型、時間区間、状態、buffer境界、劣化理由を後から説明できることを重視する。
 

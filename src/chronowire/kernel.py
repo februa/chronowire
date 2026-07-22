@@ -14,7 +14,7 @@ T_co = TypeVar("T_co", covariant=True)
 
 
 class GapPolicy(StrEnum):
-    """入力gap境界後のstateful Kernel session処理を表す。"""
+    """入力gap境界後のstateful KernelState処理を表す。"""
 
     RESET = "reset"
     CONTINUE = "continue"
@@ -59,7 +59,7 @@ def callable_kernel(
         max_items: 一回の呼出しで生成できるEmission上限。
         accepts_invalid: INVALID入力でも呼び出す場合にTrue。
         time_transform: 入力interval維持は`preserve`、Kernel明示変更は`explicit`。
-        gap_policy: gap後にKernel sessionをresetまたは継続する規則。
+        gap_policy: gap後にKernelStateをresetまたは継続する規則。
 
     Returns:
         Flow.mapへ渡せる不変CallableAdapter。
@@ -108,34 +108,39 @@ class CompileContext:
 
 @dataclass(frozen=True)
 class RunContext:
-    """CompiledKernel.runへ渡す一回のEmission区間を表す。"""
+    """KernelState.processへ渡す一回のEmission区間を表す。"""
 
     config: Config
     interval: LogicalInterval
 
 
 @runtime_checkable
-class CompiledKernelSession(Protocol[T_co]):
-    """一回のExecutionPlan.runに閉じたKernel実行状態のprotocol。"""
+class KernelState(Protocol[T_co]):
+    """一つのSessionに閉じた能動的なKernel実行状態のprotocol。
 
-    def run(self, inputs: tuple[object, ...], context: RunContext) -> T_co:
+    実装は必要に応じて`flush()`と`close()`も持てる。v0.4 runtimeは`close()`を
+    capability検出し、output-producing `flush()`はportable Emission ABI確定後に扱う。
+    状態本体、workspace、native handleを所有し、別Sessionや例外後の再実行へ共有してはならない。
+    """
+
+    def process(self, inputs: tuple[object, ...], context: RunContext) -> T_co:
         """入力値列から一つのKernel戻り値を生成する。"""
 
         ...
 
 
 @runtime_checkable
-class CompiledKernel(Protocol[T_co]):
-    """Backendが生成する、複数run間で共有可能なKernel factoryのprotocol。"""
+class Kernel(Protocol[T_co]):
+    """Backendが生成する、複数Session間で共有可能な不変実装factory。"""
 
-    def create_session(self) -> CompiledKernelSession[T_co]:
-        """一回のrunだけが所有する空の実行sessionを生成する。"""
+    def create_state(self) -> KernelState[T_co]:
+        """一つのSessionだけが所有する空のKernelStateを生成する。"""
 
         ...
 
 
 @runtime_checkable
-class NativeCompiledKernel(CompiledKernel[T_co], Protocol[T_co]):
+class NativeKernel(Kernel[T_co], Protocol[T_co]):
     """PortablePlanIRへexport可能なnative Kernel ABI付きfactory。"""
 
     abi_version: str
@@ -148,10 +153,10 @@ class NativeCompiledKernel(CompiledKernel[T_co], Protocol[T_co]):
 
 
 @runtime_checkable
-class NativeBatchKernelSession(CompiledKernelSession[T_co], Protocol[T_co]):
-    """固定shape item batchを一回のnative呼出しで処理するsession。"""
+class NativeBatchKernelState(KernelState[T_co], Protocol[T_co]):
+    """固定shape item batchを一回のnative呼出しで処理するKernelState。"""
 
-    def run_batch(
+    def process_batch(
         self,
         values: memoryview[float],
         *,
@@ -164,11 +169,11 @@ class NativeBatchKernelSession(CompiledKernelSession[T_co], Protocol[T_co]):
 
 
 @runtime_checkable
-class NativeBatchCompiledKernel(NativeCompiledKernel[T_co], Protocol[T_co]):
-    """run-local batch sessionを生成できるnative Kernel factory。"""
+class NativeBatchKernel(NativeKernel[T_co], Protocol[T_co]):
+    """run-local batch KernelStateを生成できるnative Kernel factory。"""
 
-    def create_session(self) -> NativeBatchKernelSession[T_co]:
-        """一回のrunだけが所有するbatch対応sessionを生成する。"""
+    def create_state(self) -> NativeBatchKernelState[T_co]:
+        """一つのSessionだけが所有するbatch対応KernelStateを生成する。"""
 
         ...
 
@@ -234,17 +239,17 @@ class NativeRuntimeBindingProvider(Protocol):
 
 
 @runtime_checkable
-class Kernel(Protocol[T_co]):
-    """Config解決と作業領域準備をrunから分離するprotocol。"""
+class KernelProvider(Protocol[T_co]):
+    """legacy直接Kernel記述をcompile済みKernelへ変換する内部protocol。"""
 
-    def compile(self, context: CompileContext) -> CompiledKernel[T_co]:
-        """Node固有のCompiledKernelを一回生成する。"""
+    def compile(self, context: CompileContext) -> Kernel[T_co]:
+        """Node固有の不変Kernelを一回生成する。"""
 
         ...
 
 
 class Backend(Protocol):
-    """KernelをCompiledKernelへ変換するBackend protocol。"""
+    """KernelProviderを不変Kernelへ変換するBackend protocol。"""
 
     @property
     def name(self) -> str:
@@ -254,10 +259,10 @@ class Backend(Protocol):
 
     def compile_kernel(
         self,
-        kernel: Kernel[object],
+        kernel: KernelProvider[object],
         context: CompileContext,
-    ) -> CompiledKernel[object]:
-        """指定KernelをこのBackendでcompileする。"""
+    ) -> Kernel[object]:
+        """指定KernelProviderをこのBackendでcompileする。"""
 
         ...
 
@@ -270,24 +275,24 @@ class PythonBackend:
 
     def compile_kernel(
         self,
-        kernel: Kernel[object],
+        kernel: KernelProvider[object],
         context: CompileContext,
-    ) -> CompiledKernel[object]:
+    ) -> Kernel[object]:
         """Kernel.compileの結果をそのまま返す。"""
 
         return kernel.compile(context)
 
 
 @dataclass(frozen=True)
-class _PythonCallableSession:
-    """一回のrunに閉じてPython callableを呼び出す内部session。"""
+class _PythonCallableState:
+    """一つのSessionに閉じてPython callableを呼び出すKernelState。"""
 
     operation: Callable[..., object]
     constants: tuple[tuple[str, object], ...]
     input_keywords: tuple[str, ...]
     inject_config: bool
 
-    def run(self, inputs: tuple[object, ...], context: RunContext) -> object:
+    def process(self, inputs: tuple[object, ...], context: RunContext) -> object:
         """主入力と追加Flow入力を元のPython callableへ渡す。"""
 
         if not inputs:
@@ -302,18 +307,18 @@ class _PythonCallableSession:
 
 
 @dataclass(frozen=True)
-class _CompiledPythonCallable:
-    """Python callableと解決済み引数を保持する内部session factory。"""
+class _PythonCallableKernel:
+    """Python callableと解決済み引数を保持する不変Kernel。"""
 
     operation: Callable[..., object]
     constants: tuple[tuple[str, object], ...]
     input_keywords: tuple[str, ...]
     inject_config: bool
 
-    def create_session(self) -> _PythonCallableSession:
-        """可変状態を共有しないPython callable sessionを生成する。"""
+    def create_state(self) -> _PythonCallableState:
+        """可変状態を共有しないPython callable KernelStateを生成する。"""
 
-        return _PythonCallableSession(
+        return _PythonCallableState(
             self.operation,
             self.constants,
             self.input_keywords,
@@ -329,12 +334,20 @@ class PythonCallableKernel:
     input_keywords: tuple[str, ...]
     inject_config: bool = False
 
-    def compile(self, context: CompileContext) -> CompiledKernel[object]:
-        """定数引数を固定し、run-local session factoryを返す。"""
+    def compile(self, context: CompileContext) -> Kernel[object]:
+        """定数引数を固定し、run-local KernelState factoryを返す。"""
 
-        return _CompiledPythonCallable(
+        return _PythonCallableKernel(
             self.operation,
             tuple(context.constants.items()),
             self.input_keywords,
             self.inject_config,
         )
+
+
+# v0.4公開名からの一時的な型alias。内部実装は正式名称だけを使用する。
+CompiledKernel = Kernel
+CompiledKernelSession = KernelState
+NativeCompiledKernel = NativeKernel
+NativeBatchCompiledKernel = NativeBatchKernel
+NativeBatchKernelSession = NativeBatchKernelState

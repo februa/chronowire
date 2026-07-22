@@ -51,10 +51,10 @@ def _normalize_frame(value: object, channel_count: int) -> tuple[Sample, ...]:
 
 
 @dataclass(frozen=True)
-class _PythonCbfSession:
+class _PythonCbfState:
     weights: tuple[tuple[float, ...], ...]
 
-    def run(self, inputs: tuple[object, ...], context: cw.RunContext) -> BeamFrame:
+    def process(self, inputs: tuple[object, ...], context: cw.RunContext) -> BeamFrame:
         """Python loopで固定CBFを実行する。"""
 
         del context
@@ -69,20 +69,20 @@ class _PythonCbfSession:
 
 
 @dataclass(frozen=True)
-class _CompiledPythonCbf:
+class _PythonCbfKernel:
     weights: tuple[tuple[float, ...], ...]
 
-    def create_session(self) -> _PythonCbfSession:
+    def create_state(self) -> _PythonCbfState:
         """状態を共有しないPython CBF sessionを生成する。"""
 
-        return _PythonCbfSession(self.weights)
+        return _PythonCbfState(self.weights)
 
 
 @dataclass(frozen=True)
-class _CythonCbfSession:
+class _CythonCbfState:
     weights: tuple[tuple[float, ...], ...]
 
-    def run(self, inputs: tuple[object, ...], context: cw.RunContext) -> BeamFrame:
+    def process(self, inputs: tuple[object, ...], context: cw.RunContext) -> BeamFrame:
         """検証後の固定shape bufferをCython `nogil` loopへ渡す。"""
 
         del context
@@ -98,7 +98,7 @@ class _CythonCbfSession:
             len(self.weights),
         )
 
-    def run_batch(
+    def process_batch(
         self,
         values: memoryview[float],
         *,
@@ -129,7 +129,7 @@ class _CythonCbfSession:
 
 
 @dataclass(frozen=True)
-class _CompiledCythonCbf:
+class _CythonCbfKernel:
     weights: tuple[tuple[float, ...], ...]
     abi_version: str = "chronowire.reference.fixed_cbf_f64.v1"
     process_model: str = "fixed_cbf_f64_frame"
@@ -140,10 +140,10 @@ class _CompiledCythonCbf:
     native_compatible: bool = True
     output_dtype: str = "float64"
 
-    def create_session(self) -> _CythonCbfSession:
+    def create_state(self) -> _CythonCbfState:
         """run-local Cython CBF sessionを生成する。"""
 
-        return _CythonCbfSession(self.weights)
+        return _CythonCbfState(self.weights)
 
     def create_native_runtime_binding(self) -> cw.NativeKernelRuntimeBinding:
         """CppExecutorへ固定CBF係数をimmutable f64 bindingとして渡す。"""
@@ -176,11 +176,11 @@ class FixedCbfKernel:
     def __init__(self, weights: tuple[tuple[float, ...], ...]) -> None:
         object.__setattr__(self, "weights", _normalize_weights(weights))
 
-    def compile(self, context: cw.CompileContext) -> cw.CompiledKernel[object]:
+    def compile(self, context: cw.CompileContext) -> cw.Kernel[object]:
         """Python基準実装をcompileする。"""
 
         del context
-        return _CompiledPythonCbf(self.weights)
+        return _PythonCbfKernel(self.weights)
 
 
 @dataclass(frozen=True)
@@ -191,10 +191,10 @@ class CythonCbfBackend:
 
     def compile_kernel(
         self,
-        kernel: cw.Kernel[object],
+        kernel: object,
         context: cw.CompileContext,
-    ) -> cw.CompiledKernel[object]:
-        """CBF宣言をCython CompiledKernelへ変換する。
+    ) -> cw.Kernel[object]:
+        """CBF宣言をCython Kernelへ変換する。
 
         Raises:
             TypeError: この参照Backendの対象外Kernelの場合。
@@ -205,7 +205,7 @@ class CythonCbfBackend:
         if not isinstance(kernel, FixedCbfKernel):
             raise TypeError("CythonCbfBackend supports FixedCbfKernel and native identity")
         del context
-        return _CompiledCythonCbf(kernel.weights)
+        return _CythonCbfKernel(kernel.weights)
 
 
 @dataclass(frozen=True)

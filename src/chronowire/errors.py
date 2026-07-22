@@ -10,7 +10,7 @@ class GraphError(ChronowireError):
 
 
 class CompileError(ChronowireError):
-    """ExecutionPlanを安全に生成できない場合の例外。"""
+    """Planを安全に生成できない場合の例外。"""
 
 
 class DuplicateOutputError(CompileError):
@@ -49,8 +49,12 @@ class SynchronizationError(ChronowireError):
     """runtimeの同期契約自体が破損した場合の例外。"""
 
 
-class PlanSessionError(ChronowireError):
-    """PlanSessionの状態遷移または継続実行契約違反。"""
+class SessionError(ChronowireError):
+    """Sessionの再利用またはlifecycle契約違反。"""
+
+
+# v0.4公開名からの一時的な例外alias。
+PlanSessionError = SessionError
 
 
 class SourceExecutionError(ChronowireError):

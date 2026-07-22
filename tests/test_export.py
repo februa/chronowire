@@ -1,4 +1,4 @@
-"""Logical GraphとExecutionPlanのexport契約を検証する。"""
+"""Logical GraphとPlanのexport契約を検証する。"""
 
 import json
 from pathlib import Path
@@ -8,7 +8,7 @@ import pytest
 import chronowire as cw
 
 
-def _port_capacities(plan: cw.ExecutionPlan) -> dict[int, int | None]:
+def _port_capacities(plan: cw.Plan) -> dict[int, int | None]:
     """PORT_SHAREDだけをproducer Port別capacityへ整理する。"""
 
     return {

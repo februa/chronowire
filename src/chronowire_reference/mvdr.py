@@ -217,14 +217,14 @@ def build_mvdr_flow(
 
 
 @dataclass(frozen=True)
-class _NativeMvdrSession:
+class _NativeMvdrState:
     """PythonExecutor conformance用に同一Operation関数を呼ぶnative session。"""
 
     implementation: object
     config: cw.ConfigView
     operation_id: str
 
-    def run(self, inputs: tuple[object, ...], context: cw.RunContext) -> object:
+    def process(self, inputs: tuple[object, ...], context: cw.RunContext) -> object:
         """物理入力tupleをOperation宣言順のmappingへ変換して実行する。"""
 
         del context
@@ -237,7 +237,7 @@ class _NativeMvdrSession:
         return self.implementation(dict(zip(names, inputs, strict=True)), self.config)
 
 
-class _CovarianceAccumulatorSession:
+class _CovarianceAccumulatorState:
     """run内の全sample外積を累積し、各frame境界で共分散を出力する。"""
 
     def __init__(self, diagonal_loading: float) -> None:
@@ -246,7 +246,7 @@ class _CovarianceAccumulatorSession:
         self._sample_count = 0
         self._channel_count = 0
 
-    def run(self, inputs: tuple[object, ...], context: cw.RunContext) -> object:
+    def process(self, inputs: tuple[object, ...], context: cw.RunContext) -> object:
         """現在frameを累積し、不十分な積分もDEGRADED共分散として返す。"""
 
         signal = inputs[0]
@@ -292,7 +292,7 @@ class _CovarianceAccumulatorSession:
 
 
 @dataclass(frozen=True)
-class _CompiledNativeMvdr:
+class _NativeMvdrKernel:
     """MVDR OperationのPython conformanceとC++ runtime bindingを保持する。"""
 
     definition: cw.OperationDefinition
@@ -309,19 +309,19 @@ class _CompiledNativeMvdr:
     native_compatible: bool = True
     output_dtype: str = "float64"
 
-    def create_session(self) -> cw.CompiledKernelSession[object]:
+    def create_state(self) -> cw.KernelState[object]:
         """run-localなPython conformance sessionを生成する。"""
 
         if self.implementation_spec.operation_id == covariance_operation.operation_id:
             loading = self.config.diagonal_loading
             if not isinstance(loading, float) or loading < 0.0:
                 raise ValueError("diagonal_loading must be a non-negative float")
-            return _CovarianceAccumulatorSession(loading)
+            return _CovarianceAccumulatorState(loading)
 
         binding = self.definition.python_binding
         if binding is None:
             raise RuntimeError("MVDR reference Operation lacks Python implementation")
-        return _NativeMvdrSession(
+        return _NativeMvdrState(
             binding.implementation,
             self.config,
             self.implementation_spec.operation_id,
@@ -354,9 +354,9 @@ class MvdrNativeBackend:
 
     def compile_kernel(
         self,
-        kernel: cw.Kernel[object],
+        kernel: object,
         context: cw.CompileContext,
-    ) -> cw.CompiledKernel[object]:
+    ) -> cw.Kernel[object]:
         """legacy Kernelは対象外として明示拒否する。"""
 
         del kernel, context
@@ -366,7 +366,7 @@ class MvdrNativeBackend:
         self,
         operation: cw.OperationSpec,
         context: object,
-    ) -> cw.CompiledKernel[object]:
+    ) -> cw.Kernel[object]:
         """operation IDとConfigからnative実装metadataと定数を生成する。
 
         Args:
@@ -429,7 +429,7 @@ class MvdrNativeBackend:
             False,
             True,
         )
-        return _CompiledNativeMvdr(
+        return _NativeMvdrKernel(
             definition,
             config,
             implementation,

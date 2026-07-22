@@ -1013,7 +1013,7 @@ class PlanDiagnosticDescriptor:
 
 @dataclass(frozen=True)
 class PortablePlanIR:
-    """Executorと言語に依存しないserialization可能なExecutionPlan。
+    """Executorと言語に依存しないserialization可能なPlan。
 
     Python callable、collector instance、pointer、allocatorは含めず、安定IDと
     descriptorだけを保持する。schema 0.1/0.2/0.3/0.4の読込みとround-tripを保証し、

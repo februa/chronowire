@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Generic, TypeVar
 
 from .config import Config
-from .kernel import CallableAdapter, GapPolicy, Kernel
+from .kernel import CallableAdapter, GapPolicy, KernelProvider
 from .operation import OperationDefinition
 from .source import RealtimeSource, Source
 
@@ -73,7 +73,7 @@ class NodeSpec:
     output_ports: tuple[int, ...]
     inputs: tuple[InputSpec, ...]
     config: Config
-    operation: Callable[..., object] | Kernel[object] | OperationDefinition | None = None
+    operation: Callable[..., object] | KernelProvider[object] | OperationDefinition | None = None
     constants: Mapping[str, object] | None = None
     config_paths: tuple[str, ...] | None = None
     accepts_invalid: bool = False
@@ -154,7 +154,9 @@ class Graph:
         config: Config,
         *,
         inputs: tuple[InputSpec, ...] = (),
-        operation: Callable[..., object] | Kernel[object] | OperationDefinition | None = None,
+        operation: (
+            Callable[..., object] | KernelProvider[object] | OperationDefinition | None
+        ) = None,
         constants: Mapping[str, object] | None = None,
         config_paths: tuple[str, ...] | None = None,
         accepts_invalid: bool = False,
@@ -196,7 +198,9 @@ class Graph:
         config: Config,
         *,
         inputs: tuple[InputSpec, ...] = (),
-        operation: Callable[..., object] | Kernel[object] | OperationDefinition | None = None,
+        operation: (
+            Callable[..., object] | KernelProvider[object] | OperationDefinition | None
+        ) = None,
         constants: Mapping[str, object] | None = None,
         config_paths: tuple[str, ...] | None = None,
         accepts_invalid: bool = False,
@@ -553,7 +557,7 @@ class Flow(Generic[T]):
 
     def map(
         self,
-        operation: Callable[..., U] | Kernel[U] | OperationDefinition,
+        operation: Callable[..., U] | KernelProvider[U] | OperationDefinition,
         *,
         config_paths: tuple[str, ...] | None = None,
         accepts_invalid: bool = False,
@@ -662,7 +666,7 @@ class Flow(Generic[T]):
 
     def map_outputs(
         self,
-        operation: Callable[..., object] | Kernel[object] | OperationDefinition,
+        operation: Callable[..., object] | KernelProvider[object] | OperationDefinition,
         *,
         output_count: int,
         config_paths: tuple[str, ...] | None = None,

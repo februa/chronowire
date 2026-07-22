@@ -21,7 +21,7 @@ _SAMPLES = (
 )
 
 
-def _plan() -> cw.ExecutionPlan:
+def _plan() -> cw.Plan:
     """重み更新とbeam出力をともに観測するnative MVDR Planを返す。"""
 
     flow = build_mvdr_flow(_SAMPLES, frame_size=2, update_period=4)

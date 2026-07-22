@@ -1,4 +1,4 @@
-"""ExecutionPlanからrun-local sessionを生成するExecutor境界を定義する。"""
+"""Planからrun-local sessionを生成するExecutor境界を定義する。"""
 
 from __future__ import annotations
 
@@ -11,17 +11,17 @@ if TYPE_CHECKING:
     from .extension import Extension
     from .model import LogicalTime
     from .runtime import (
-        ExecutionPlan,
-        ExecutionSession,
-        PlanSession,
-        PlanSessionState,
+        ContinuousSession,
+        Plan,
         RunResult,
         RuntimeOptions,
+        Session,
+        SessionState,
     )
 
 
 @runtime_checkable
-class ExecutorSession(Protocol):
+class SessionRunner(Protocol):
     """一回実行Executor sessionの公開操作。"""
 
     def run(
@@ -36,11 +36,11 @@ class ExecutorSession(Protocol):
 
 
 @runtime_checkable
-class ExecutorPlanSession(Protocol):
+class ContinuousSessionRunner(Protocol):
     """継続実行Executor sessionの公開lifecycle操作。"""
 
     @property
-    def state(self) -> PlanSessionState:
+    def state(self) -> SessionState:
         """現在のsession状態を返す。"""
 
         ...
@@ -83,19 +83,19 @@ class Executor(Protocol):
 
     def create_session(
         self,
-        plan: ExecutionPlan,
+        plan: Plan,
         extension_bindings: Mapping[str, Extension] | None,
-    ) -> ExecutorSession:
+    ) -> SessionRunner:
         """一回実行用のrun-local sessionを生成する。"""
 
         ...
 
-    def create_plan_session(
+    def create_continuous_session(
         self,
-        plan: ExecutionPlan,
+        plan: Plan,
         extension_bindings: Mapping[str, Extension] | None,
         options: RuntimeOptions | None,
-    ) -> ExecutorPlanSession:
+    ) -> ContinuousSessionRunner:
         """継続実行用のrun-local sessionを生成する。"""
 
         ...
@@ -109,22 +109,22 @@ class PythonExecutor:
 
     def create_session(
         self,
-        plan: ExecutionPlan,
+        plan: Plan,
         extension_bindings: Mapping[str, Extension] | None,
-    ) -> ExecutionSession:
+    ) -> Session:
         """既存Python runtimeを所有する一回実行sessionを生成する。"""
 
         return plan._create_python_session(extension_bindings)
 
-    def create_plan_session(
+    def create_continuous_session(
         self,
-        plan: ExecutionPlan,
+        plan: Plan,
         extension_bindings: Mapping[str, Extension] | None,
         options: RuntimeOptions | None,
-    ) -> PlanSession:
+    ) -> ContinuousSession:
         """既存Python runtimeを所有する継続sessionを生成する。"""
 
-        return plan._create_python_plan_session(extension_bindings, options)
+        return plan._create_python_continuous_session(extension_bindings, options)
 
 
 @dataclass(frozen=True)
@@ -135,30 +135,30 @@ class CythonExecutor:
 
     def create_session(
         self,
-        plan: ExecutionPlan,
+        plan: Plan,
         extension_bindings: Mapping[str, Extension] | None,
-    ) -> ExecutorSession:
+    ) -> SessionRunner:
         """STRICT検証済みのCython一回実行sessionを生成する。"""
 
         if extension_bindings:
             raise ValueError("CythonExecutor prototype does not support Extension bindings")
-        from .cython_executor import CythonExecutionSession
+        from .cython_executor import CythonSession
 
-        return CythonExecutionSession(plan)
+        return CythonSession(plan)
 
-    def create_plan_session(
+    def create_continuous_session(
         self,
-        plan: ExecutionPlan,
+        plan: Plan,
         extension_bindings: Mapping[str, Extension] | None,
         options: RuntimeOptions | None,
-    ) -> ExecutorPlanSession:
+    ) -> ContinuousSessionRunner:
         """未実装の継続Cython sessionを暗黙fallbackせず拒否する。"""
 
         del plan, extension_bindings, options
-        from .errors import PlanSessionError
+        from .errors import SessionError
 
-        raise PlanSessionError(
-            "CythonExecutor prototype does not support PlanSession; "
+        raise SessionError(
+            "CythonExecutor prototype does not support ContinuousSession; "
             "contract=cython_continuous_session"
         )
 
@@ -241,51 +241,51 @@ class CppExecutor:
 
     def create_session(
         self,
-        plan: ExecutionPlan,
+        plan: Plan,
         extension_bindings: Mapping[str, Extension] | None,
-    ) -> ExecutorSession:
+    ) -> SessionRunner:
         """検証済みPlanから自立したC++一回実行sessionを生成する。
 
         Raises:
             ValueError: Extension bindingまたは最小C++契約外Planの場合。
         """
 
-        from .cpp_executor import CppExecutionSession
+        from .cpp_executor import CppSession
 
         validated = plan._create_python_session(extension_bindings)
         if plan.portable_ir.stages and all(
             stage.execution_domain == "python" for stage in plan.portable_ir.stages
         ):
-            from .cpp_executor import CppPythonStageExecutionSession
+            from .cpp_executor import CppPythonStageSession
 
-            return CppPythonStageExecutionSession(plan, validated)
+            return CppPythonStageSession(plan, validated)
         if any(stage.execution_domain == "python" for stage in plan.portable_ir.stages):
             from .cpp_executor import (
-                CppMixedExecutionSession,
-                CppMultiIslandExecutionSession,
-                CppPythonPrefixExecutionSession,
+                CppMixedSession,
+                CppMultiIslandSession,
+                CppPythonPrefixSession,
             )
 
             python_stage_count = sum(
                 stage.execution_domain == "python" for stage in plan.portable_ir.stages
             )
             if python_stage_count > 1:
-                return CppMultiIslandExecutionSession(plan)
+                return CppMultiIslandSession(plan)
             if plan.portable_ir.stages[0].execution_domain == "python":
-                return CppPythonPrefixExecutionSession(plan)
-            return CppMixedExecutionSession(plan)
-        return CppExecutionSession(plan, validated._extensions)
+                return CppPythonPrefixSession(plan)
+            return CppMixedSession(plan)
+        return CppSession(plan, validated._extensions)
 
-    def create_plan_session(
+    def create_continuous_session(
         self,
-        plan: ExecutionPlan,
+        plan: Plan,
         extension_bindings: Mapping[str, Extension] | None,
         options: RuntimeOptions | None,
-    ) -> ExecutorPlanSession:
+    ) -> ContinuousSessionRunner:
         """有限native Planから継続論理時間C++ sessionを生成する。"""
 
-        from .cpp_executor import CppPlanSession
-        from .errors import PlanSessionError
+        from .cpp_executor import CppContinuousSession
+        from .errors import SessionError
 
         python_stages = tuple(
             stage for stage in plan.portable_ir.stages if stage.execution_domain == "python"
@@ -298,11 +298,11 @@ class CppExecutor:
                 (item.slot_id for item in plan.portable_ir.bindings if item.node_id == node_id),
                 None,
             )
-            raise PlanSessionError(
-                "CppExecutor Python Stage PlanSession is not implemented; "
+            raise SessionError(
+                "CppExecutor Python Stage ContinuousSession is not implemented; "
                 f"stage={stage.stage_id} node={node_id} port={node.output_port_ids[-1]} "
-                f"binding={binding}; contract=python_stage_plan_session_pending"
+                f"binding={binding}; contract=python_stage_continuous_session_pending"
             )
 
         validated = plan._create_python_session(extension_bindings)
-        return CppPlanSession(plan, options, validated._extensions)
+        return CppContinuousSession(plan, options, validated._extensions)

@@ -17,7 +17,7 @@ T = TypeVar("T")
 class ConsumerCursor:
     """一つのconsumerが次に読むPortBuffer位置を保持する。
 
-    cursorはrun-localであり、GraphやExecutionPlanへ可変状態を持ち込まない。
+    cursorはrun-localであり、GraphやPlanへ可変状態を持ち込まない。
     利用者はpositionを直接変更せず、PortBufferの操作を通して進める。
     """
 
@@ -56,7 +56,7 @@ class PortBuffer(Generic[T]):
         """現在の末尾から読み始めるconsumer cursorを登録する。
 
         Args:
-            cursor_id: ExecutionPlan内で一意なconsumer cursor ID。
+            cursor_id: Plan内で一意なconsumer cursor ID。
 
         Returns:
             PortBufferが所有するrun-local cursor。

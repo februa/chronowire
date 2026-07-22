@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import time
+import warnings
 from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import suppress
@@ -11,6 +12,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from fractions import Fraction
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Generic, TypeVar
 
 from .collector import Bounded, Collector, CollectorSession, Latest, NoCollect, Sink
@@ -23,17 +25,17 @@ from .errors import (
     KernelExecutionError,
     MissingConfigError,
     MissingImplementationError,
-    PlanSessionError,
+    SessionError,
     ShapeMismatchError,
     SourceExecutionError,
 )
 from .executor import (
+    ContinuousSessionRunner,
     CppExecutor,
     CythonExecutor,
     Executor,
-    ExecutorPlanSession,
-    ExecutorSession,
     PythonExecutor,
+    SessionRunner,
 )
 from .extension import (
     Always,
@@ -59,11 +61,11 @@ from .graph import (
 from .kernel import (
     Backend,
     CompileContext,
-    CompiledKernel,
-    CompiledKernelSession,
     GapPolicy,
     Kernel,
-    NativeCompiledKernel,
+    KernelProvider,
+    KernelState,
+    NativeKernel,
     NativeValueSchemaProvider,
     PythonBackend,
     PythonCallableKernel,
@@ -82,7 +84,7 @@ from .model import (
 )
 from .native import F64SourceValues, F64VectorSourceValues, IdentityF64Kernel
 from .operation import (
-    CompiledOperationMetadata,
+    KernelMetadata,
     OperationBackend,
     OperationDefinition,
     ValueSpec,
@@ -161,7 +163,7 @@ class OutputResult(Generic[T]):
 
 @dataclass(frozen=True)
 class RunResult:
-    """一回のExecutionPlan.runの結果と診断summaryを表す。"""
+    """一回のPlan.runの結果と診断summaryを表す。"""
 
     outputs: tuple[OutputResult[Any], ...]
     diagnostics: tuple[Diagnostic, ...]
@@ -1084,7 +1086,7 @@ def _resolve_operation_schemas(
 
 def _value_schema_descriptors(
     nodes: tuple[NodeSpec, ...],
-    compiled_kernels: dict[int, CompiledKernel[object]],
+    kernels: dict[int, Kernel[object]],
 ) -> tuple[tuple[ValueSchemaDescriptor, ...], dict[int, str]]:
     """明示native契約だけをPort value schemaへ伝播する。"""
 
@@ -1119,7 +1121,7 @@ def _value_schema_descriptors(
                 input_schema.representation == "contiguous_f64"
                 and input_schema.shape is not None
                 and isinstance(
-                    provider := compiled_kernels.get(node.id),
+                    provider := kernels.get(node.id),
                     NativeValueSchemaProvider,
                 )
             ):
@@ -1180,7 +1182,7 @@ def _portable_plan_ir(
     backend_name: str,
     node_backend_names: dict[int, str],
     kernel_abi_descriptors: dict[int, KernelAbiDescriptor],
-    compiled_kernels: dict[int, CompiledKernel[object]],
+    kernels: dict[int, Kernel[object]],
     source_request_periods: dict[int, Fraction],
 ) -> PortablePlanIR:
     """compile済みPython実体からportable descriptorだけを抽出する。"""
@@ -1247,15 +1249,15 @@ def _portable_plan_ir(
         )
         for node in nodes
     )
-    value_schemas, port_schema_ids = _value_schema_descriptors(nodes, compiled_kernels)
+    value_schemas, port_schema_ids = _value_schema_descriptors(nodes, kernels)
     operation_descriptors: list[OperationDescriptor] = []
     implementation_descriptors: list[ImplementationDescriptor] = []
     for node in nodes:
         operation = node.operation
         if not isinstance(operation, OperationDefinition):
             continue
-        compiled = compiled_kernels[node.id]
-        if not isinstance(compiled, CompiledOperationMetadata):
+        compiled = kernels[node.id]
+        if not isinstance(compiled, KernelMetadata):
             raise CompileError(
                 f"node={node.id} port={node.output_port} operation={operation.operation_id} "
                 "contract=compiled_operation_metadata"
@@ -1676,8 +1678,8 @@ def compile(
     backend: str | Backend = "python",
     implementations: Mapping[str, str | Backend] | None = None,
     extensions: Sequence[ObservationSpec] = (),
-) -> ExecutionPlan:
-    """Flow群から不変なExecutionPlanを生成する。
+) -> Plan:
+    """Flow群から不変なPlanを生成する。
 
     Args:
         outputs: 観測終端。bare FlowはNoCollectとして実行だけ行う。
@@ -1711,7 +1713,7 @@ def compile(
         if not isinstance(extension, ObservationSpec):
             raise CompileError(
                 "compile extensions must be ObservationSpec values returned by observe(); "
-                "bind Extension handlers with ExecutionPlan.create_session()"
+                "bind Extension handlers with Plan.create_session()"
             )
         if extension.flow._graph is not graph:
             raise ValueError(
@@ -1791,7 +1793,7 @@ def compile(
         operation_id: resolve_backend(value)
         for operation_id, value in implementation_overrides.items()
     }
-    compiled_kernels: dict[int, CompiledKernel[object]] = {}
+    kernels: dict[int, Kernel[object]] = {}
     kernel_abi_descriptors: dict[int, KernelAbiDescriptor] = {}
     node_backend_names: dict[int, str] = {
         node.id: "executor" for node in nodes if node.kind is not NodeKind.MAP
@@ -1802,7 +1804,7 @@ def compile(
             continue
         operation = node.operation
         selected_backend = backend_instance
-        kernel: Kernel[object]
+        kernel: KernelProvider[object]
         if isinstance(operation, OperationDefinition):
             selected_backend = selected_implementations.get(
                 operation.operation_id,
@@ -1840,12 +1842,12 @@ def compile(
                     f"operation={operation.operation_id} backend={selected_backend.name} "
                     "contract=missing_implementation"
                 )
-            if not isinstance(compiled, CompiledKernel):
+            if not isinstance(compiled, Kernel):
                 raise TypeError(
                     f"backend {selected_backend.name!r} returned an invalid "
-                    f"CompiledOperation for node {node.id} operation={operation.operation_id}"
+                    f"Kernel for node {node.id} operation={operation.operation_id}"
                 )
-            if not isinstance(compiled, CompiledOperationMetadata):
+            if not isinstance(compiled, KernelMetadata):
                 raise CompileError(
                     f"node={node.id} port={node.output_port} "
                     f"operation={operation.operation_id} "
@@ -1863,8 +1865,8 @@ def compile(
                     f"implementation_backend={implementation.backend} "
                     f"backend={selected_backend.name} contract=implementation_identity"
                 )
-            compiled_kernels[node.id] = compiled
-            if isinstance(compiled, NativeCompiledKernel):
+            kernels[node.id] = compiled
+            if isinstance(compiled, NativeKernel):
                 if implementation.abi_version != compiled.abi_version:
                     raise CompileError(
                         f"node={node.id} port={node.output_port} "
@@ -1897,7 +1899,7 @@ def compile(
                 )
             node_backend_names[node.id] = selected_backend.name
             continue
-        if isinstance(operation, Kernel):
+        if isinstance(operation, KernelProvider):
             kernel = operation
         elif callable(operation):
             try:
@@ -1915,13 +1917,12 @@ def compile(
             kernel,
             compile_context(node),
         )
-        if not isinstance(compiled, CompiledKernel):
+        if not isinstance(compiled, Kernel):
             raise TypeError(
-                f"backend {selected_backend.name!r} returned an invalid "
-                f"CompiledKernel for node {node.id}"
+                f"backend {selected_backend.name!r} returned an invalid Kernel for node {node.id}"
             )
-        compiled_kernels[node.id] = compiled
-        if isinstance(compiled, NativeCompiledKernel):
+        kernels[node.id] = compiled
+        if isinstance(compiled, NativeKernel):
             kernel_abi_descriptors[node.id] = KernelAbiDescriptor(
                 node.id,
                 f"kernel:{node.id}",
@@ -1978,16 +1979,16 @@ def compile(
         backend_name=plan_backend_name,
         node_backend_names=node_backend_names,
         kernel_abi_descriptors=kernel_abi_descriptors,
-        compiled_kernels=compiled_kernels,
+        kernels=kernels,
         source_request_periods=source_request_periods,
     )
-    return ExecutionPlan(
+    return Plan(
         graph=graph,
         nodes=nodes,
         outputs=tuple(normalized),
         observations=sorted_extensions,
         compile_diagnostics=diagnostics,
-        compiled_kernels=compiled_kernels,
+        kernels=kernels,
         backend_name=plan_backend_name,
         node_backend_names=node_backend_names,
         source_request_periods=source_request_periods,
@@ -1995,11 +1996,23 @@ def compile(
     )
 
 
-class ExecutionPlan:
+@dataclass(frozen=True, init=False, eq=False)
+class Plan:
     """compile後のrequired Nodeと実行policyを保持する不変な計画。
 
     Graph構造は変更せず、各runでcollector、buffer、KernelStateを作り直す。
     """
+
+    _graph: Graph
+    _nodes: tuple[NodeSpec, ...]
+    _outputs: tuple[OutputSpec[Any], ...]
+    _observations: tuple[ObservationSpec, ...]
+    _compile_diagnostics: tuple[Diagnostic, ...]
+    _kernels: Mapping[int, Kernel[object]]
+    _backend_name: str
+    _node_backend_names: Mapping[int, str]
+    _source_request_periods: Mapping[int, Fraction]
+    _portable_ir: PortablePlanIR
 
     def __init__(
         self,
@@ -2009,22 +2022,30 @@ class ExecutionPlan:
         outputs: tuple[OutputSpec[Any], ...],
         observations: tuple[ObservationSpec, ...],
         compile_diagnostics: tuple[Diagnostic, ...],
-        compiled_kernels: dict[int, CompiledKernel[object]],
+        kernels: dict[int, Kernel[object]],
         backend_name: str,
         node_backend_names: dict[int, str],
         source_request_periods: dict[int, Fraction],
         portable_ir: PortablePlanIR,
     ) -> None:
-        self._graph = graph
-        self._nodes = nodes
-        self._outputs = outputs
-        self._observations = observations
-        self._compile_diagnostics = compile_diagnostics
-        self._compiled_kernels = compiled_kernels
-        self._backend_name = backend_name
-        self._node_backend_names = node_backend_names
-        self._source_request_periods = source_request_periods
-        self._portable_ir = portable_ir
+        object.__setattr__(self, "_graph", graph)
+        object.__setattr__(self, "_nodes", nodes)
+        object.__setattr__(self, "_outputs", outputs)
+        object.__setattr__(self, "_observations", observations)
+        object.__setattr__(self, "_compile_diagnostics", compile_diagnostics)
+        object.__setattr__(self, "_kernels", MappingProxyType(dict(kernels)))
+        object.__setattr__(self, "_backend_name", backend_name)
+        object.__setattr__(
+            self,
+            "_node_backend_names",
+            MappingProxyType(dict(node_backend_names)),
+        )
+        object.__setattr__(
+            self,
+            "_source_request_periods",
+            MappingProxyType(dict(source_request_periods)),
+        )
+        object.__setattr__(self, "_portable_ir", portable_ir)
 
     @property
     def diagnostics(self) -> tuple[Diagnostic, ...]:
@@ -2034,7 +2055,7 @@ class ExecutionPlan:
 
     @property
     def portable_ir(self) -> PortablePlanIR:
-        """Executor非依存の不変なExecutionPlan descriptorを返す。"""
+        """Executor非依存の不変なPlan descriptorを返す。"""
 
         return self._portable_ir
 
@@ -2063,7 +2084,7 @@ class ExecutionPlan:
         *,
         extension_bindings: Mapping[str, Extension] | None = None,
         executor: str | Executor = "python",
-    ) -> ExecutorSession:
+    ) -> SessionRunner:
         """process-local Extension実体を検証して実行instanceを生成する。
 
         Args:
@@ -2071,7 +2092,7 @@ class ExecutionPlan:
             executor: 実行sessionを生成するExecutor名または実体。
 
         Returns:
-            同じPlanをrun-local状態で実行するExecutionSession。
+            同じPlanをrun-local状態で実行するSession。
 
         Raises:
             ExtensionBindingError: binding不足、未知ID、種別、ABI不整合の場合。
@@ -2082,7 +2103,7 @@ class ExecutionPlan:
     def _create_python_session(
         self,
         extension_bindings: Mapping[str, Extension] | None,
-    ) -> ExecutionSession:
+    ) -> Session:
         """検証済みExtensionを持つPython実行sessionを生成する。"""
 
         bindings = {} if extension_bindings is None else dict(extension_bindings)
@@ -2121,16 +2142,16 @@ class ExecutionPlan:
                     f"required {item.abi_version!r}; contract=extension_abi"
                 )
             bound.append(_BoundExtension(item, binding))
-        return ExecutionSession(self, tuple(bound))
+        return Session(self, tuple(bound))
 
-    def create_plan_session(
+    def create_continuous_session(
         self,
         *,
         extension_bindings: Mapping[str, Extension] | None = None,
         options: RuntimeOptions | None = None,
         executor: str | Executor = "python",
-    ) -> ExecutorPlanSession:
-        """v0.2の継続実行状態を持つPlanSessionを生成する。
+    ) -> ContinuousSessionRunner:
+        """v0.2の継続実行状態を持つContinuousSessionを生成する。
 
         Args:
             extension_bindings: extension_idからrun-local Extension factoryへの完全な対応。
@@ -2138,27 +2159,47 @@ class ExecutionPlan:
             executor: 継続sessionを生成するExecutor名または実体。
 
         Returns:
-            `start()`前の新しいPlanSession。
+            `start()`前の新しいContinuousSession。
 
         Raises:
             ExtensionBindingError: binding不足、未知ID、種別、ABI不整合の場合。
         """
 
-        return self._resolve_executor(executor).create_plan_session(
+        return self._resolve_executor(executor).create_continuous_session(
             self,
             extension_bindings,
             options,
         )
 
-    def _create_python_plan_session(
+    def create_plan_session(
+        self,
+        *,
+        extension_bindings: Mapping[str, Extension] | None = None,
+        options: RuntimeOptions | None = None,
+        executor: str | Executor = "python",
+    ) -> ContinuousSessionRunner:
+        """非推奨名からContinuousSessionを生成する互換入口。"""
+
+        warnings.warn(
+            "Plan.create_plan_session() is deprecated; use create_continuous_session()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.create_continuous_session(
+            extension_bindings=extension_bindings,
+            options=options,
+            executor=executor,
+        )
+
+    def _create_python_continuous_session(
         self,
         extension_bindings: Mapping[str, Extension] | None,
         options: RuntimeOptions | None,
-    ) -> PlanSession:
+    ) -> ContinuousSession:
         """検証済みExtensionを持つPython継続sessionを生成する。"""
 
         one_shot = self._create_python_session(extension_bindings)
-        return PlanSession(self, one_shot._extensions, options or RuntimeOptions())
+        return ContinuousSession(self, one_shot._extensions, options or RuntimeOptions())
 
     @staticmethod
     def _resolve_executor(executor: str | Executor) -> Executor:
@@ -2201,7 +2242,7 @@ class ExecutionPlan:
             lines.append("}")
             output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             return
-        raise ValueError("ExecutionPlan export supports only .json and .dot")
+        raise ValueError("Plan export supports only .json and .dot")
 
 
 @dataclass(frozen=True)
@@ -2217,16 +2258,17 @@ class _ExtensionRuntime:
     trigger: TriggerSession
 
 
-class ExecutionSession:
-    """ExecutionPlanと検証済みprocess-local bindingを結ぶ実行instance。"""
+class Session:
+    """Planと検証済みprocess-local bindingを結ぶ実行instance。"""
 
     def __init__(
         self,
-        plan: ExecutionPlan,
+        plan: Plan,
         extensions: tuple[_BoundExtension, ...],
     ) -> None:
         self._plan = plan
         self._extensions = extensions
+        self._consumed = False
 
     def run(
         self,
@@ -2244,6 +2286,11 @@ class ExecutionSession:
             collector結果、Diagnostic、status件数を持つRunResult。
         """
 
+        if self._consumed:
+            raise SessionError(
+                "Session.run may be called only once; create a new Session from the Plan"
+            )
+        self._consumed = True
         runtime = _PlanRuntime(
             self._plan,
             duration,
@@ -2253,8 +2300,8 @@ class ExecutionSession:
         return runtime.run()
 
 
-class PlanSessionState(StrEnum):
-    """PlanSessionの公開lifecycle状態。"""
+class SessionState(StrEnum):
+    """ContinuousSessionの公開lifecycle状態。"""
 
     CREATED = "created"
     RUNNING = "running"
@@ -2263,16 +2310,16 @@ class PlanSessionState(StrEnum):
     FAILED = "failed"
 
 
-class PlanSession:
-    """一つのExecutionPlanを論理時間境界ごとに継続実行するsession。
+class ContinuousSession:
+    """一つのPlanを論理時間境界ごとに継続実行するsession。
 
     Kernel、FRAME、RATE、buffer、collector、Extensionの状態はsession終了まで保持し、
-    別のPlanSessionとは共有しない。
+    別のContinuousSessionとは共有しない。
     """
 
     def __init__(
         self,
-        plan: ExecutionPlan,
+        plan: Plan,
         extensions: tuple[_BoundExtension, ...],
         options: RuntimeOptions,
     ) -> None:
@@ -2280,11 +2327,11 @@ class PlanSession:
         self._extensions = extensions
         self._options = options
         self._runtime: _PlanRuntime | None = None
-        self._state = PlanSessionState.CREATED
+        self._state = SessionState.CREATED
         self._logical_end: Fraction | None = None
 
     @property
-    def state(self) -> PlanSessionState:
+    def state(self) -> SessionState:
         """現在のlifecycle状態を返す。"""
 
         return self._state
@@ -2293,12 +2340,12 @@ class PlanSession:
         """run-local resourceを生成して継続実行を開始する。
 
         Raises:
-            PlanSessionError: CREATED以外から開始しようとした場合。
+            SessionError: CREATED以外から開始しようとした場合。
         """
 
-        if self._state is not PlanSessionState.CREATED:
-            raise PlanSessionError(
-                f"PlanSession.start requires state=created; actual={self._state.value}"
+        if self._state is not SessionState.CREATED:
+            raise SessionError(
+                f"ContinuousSession.start requires state=created; actual={self._state.value}"
             )
         runtime = _PlanRuntime(
             self._plan,
@@ -2313,7 +2360,7 @@ class PlanSession:
             self._fail_and_finish(runtime, error)
             raise
         self._runtime = runtime
-        self._state = PlanSessionState.RUNNING
+        self._state = SessionState.RUNNING
 
     def run_until(
         self,
@@ -2328,14 +2375,14 @@ class PlanSession:
             session開始時から現在境界までの累積RunResult snapshot。
 
         Raises:
-            PlanSessionError: 未開始、終了済み、または境界が単調増加でない場合。
+            SessionError: 未開始、終了済み、または境界が単調増加でない場合。
         """
 
         runtime = self._running_runtime("run_until")
         target = self._logical_time_fraction(logical_end)
         if target <= 0 or (self._logical_end is not None and target <= self._logical_end):
-            raise PlanSessionError(
-                "PlanSession.run_until requires a positive, strictly increasing logical_end"
+            raise SessionError(
+                "ContinuousSession.run_until requires a positive, strictly increasing logical_end"
             )
         try:
             result = runtime.run_until(target)
@@ -2353,13 +2400,13 @@ class PlanSession:
             flush後の累積RunResult snapshot。
 
         Raises:
-            PlanSessionError: sessionがRUNNINGでない場合、または無限Sourceを含む場合。
+            SessionError: sessionがRUNNINGでない場合、または無限Sourceを含む場合。
         """
 
         runtime = self._running_runtime("flush")
         try:
             return runtime.flush()
-        except PlanSessionError:
+        except SessionError:
             raise
         except Exception as error:
             self._fail_and_finish(runtime, error)
@@ -2379,7 +2426,7 @@ class PlanSession:
         except Exception as error:
             self._fail_and_finish(runtime, error)
             raise
-        self._state = PlanSessionState.CLOSED
+        self._state = SessionState.CLOSED
         return result
 
     def cancel(self) -> RunResult:
@@ -2396,24 +2443,24 @@ class PlanSession:
         except Exception as error:
             self._fail_and_finish(runtime, error)
             raise
-        self._state = PlanSessionState.CANCELLED
+        self._state = SessionState.CANCELLED
         return result
 
     def _running_runtime(self, operation: str) -> _PlanRuntime:
-        if self._state is not PlanSessionState.RUNNING or self._runtime is None:
-            raise PlanSessionError(
-                f"PlanSession.{operation} requires state=running; actual={self._state.value}"
+        if self._state is not SessionState.RUNNING or self._runtime is None:
+            raise SessionError(
+                f"ContinuousSession.{operation} requires state=running; actual={self._state.value}"
             )
         return self._runtime
 
     def _fail_and_finish(self, runtime: _PlanRuntime, error: Exception) -> None:
         """元の失敗を保持したまま全resourceの解放を試みる。"""
 
-        self._state = PlanSessionState.FAILED
+        self._state = SessionState.FAILED
         try:
             runtime.finish()
         except Exception as cleanup_error:
-            error.add_note(f"PlanSession resource cleanup also failed: {cleanup_error}")
+            error.add_note(f"ContinuousSession resource cleanup also failed: {cleanup_error}")
 
     @staticmethod
     def _logical_time_fraction(value: LogicalTime | Fraction | int | float) -> Fraction:
@@ -2422,13 +2469,20 @@ class PlanSession:
         try:
             return Fraction(str(value)) if isinstance(value, float) else Fraction(value)
         except (TypeError, ValueError, ZeroDivisionError) as error:
-            raise PlanSessionError("logical_end must be a finite rational value") from error
+            raise SessionError("logical_end must be a finite rational value") from error
+
+
+# v0.4公開名からの一時的なclass alias。新規コードは正式名称を使用する。
+ExecutionPlan = Plan
+ExecutionSession = Session
+PlanSession = ContinuousSession
+PlanSessionState = SessionState
 
 
 class _PlanRuntime:
     def __init__(
         self,
-        plan: ExecutionPlan,
+        plan: Plan,
         duration: float | None,
         extensions: tuple[_BoundExtension, ...],
         *,
@@ -2542,15 +2596,15 @@ class _PlanRuntime:
         self.collectors: dict[int, CollectorSession[Any]] = {
             item.flow.port_id: item.collector.create_session() for item in plan._outputs
         }
-        self.kernel_sessions: dict[int, CompiledKernelSession[object]] = {}
+        self.kernel_states: dict[int, KernelState[object]] = {}
         try:
-            for node_id, kernel in plan._compiled_kernels.items():
-                self.kernel_sessions[node_id] = kernel.create_session()
+            for node_id, kernel in plan._kernels.items():
+                self.kernel_states[node_id] = kernel.create_state()
         except Exception:
-            for created_node_id, session in reversed(tuple(self.kernel_sessions.items())):
+            for created_node_id, session in reversed(tuple(self.kernel_states.items())):
                 with suppress(Exception):
-                    self._close_kernel_session(created_node_id, session)
-            self.kernel_sessions.clear()
+                    self._close_kernel_state(created_node_id, session)
+            self.kernel_states.clear()
             raise
         self.extensions = tuple(self._create_extension_runtime(item) for item in extensions)
         self.output_ports = set(self.collectors)
@@ -2591,7 +2645,7 @@ class _PlanRuntime:
 
         required = cls._required_buffer_capacity(port_id, compiled)
         if requested is not None and requested < required:
-            raise PlanSessionError(
+            raise SessionError(
                 f"port {port_id} requested high_watermark={requested} is below "
                 f"compiled capacity={required}; contract=bounded_shared_buffer"
             )
@@ -2649,9 +2703,9 @@ class _PlanRuntime:
             diagnostic = Diagnostic(
                 Severity.INFO,
                 "SESSION_STARTED",
-                "PlanSession acquired run-local resources",
+                "ContinuousSession acquired run-local resources",
                 details={
-                    "kernel_sessions": sorted(self.kernel_sessions),
+                    "kernel_states": sorted(self.kernel_states),
                     "realtime_source_sessions": sorted(self.realtime_sessions),
                     "buffer_ids": sorted(buffer.buffer_id for buffer in self.port_buffers.values()),
                 },
@@ -2681,8 +2735,8 @@ class _PlanRuntime:
             if not item.is_finite and item.mode != "realtime_push"
         ]
         if open_realtime or non_finite_pull:
-            raise PlanSessionError(
-                "PlanSession.flush requires finite or already closed Sources; "
+            raise SessionError(
+                "ContinuousSession.flush requires finite or already closed Sources; "
                 f"open_realtime_nodes={open_realtime}; non_finite_pull_nodes={non_finite_pull}"
             )
         self.duration = None
@@ -2702,8 +2756,8 @@ class _PlanRuntime:
             if not item.is_finite and item.mode != "realtime_push"
         ]
         if non_finite_pull:
-            raise PlanSessionError(
-                "PlanSession.close cannot infer EOF for non-finite pull Sources; "
+            raise SessionError(
+                "ContinuousSession.close cannot infer EOF for non-finite pull Sources; "
                 f"nodes={non_finite_pull}; call cancel()"
             )
         self.duration = None
@@ -2714,7 +2768,7 @@ class _PlanRuntime:
         diagnostic = Diagnostic(
             Severity.INFO,
             "SESSION_CLOSED",
-            "PlanSession stopped Sources and drained run-local resources",
+            "ContinuousSession stopped Sources and drained run-local resources",
             details={
                 "remaining_active_ports": sorted(self._active),
                 "realtime_pending_items": {
@@ -2737,7 +2791,7 @@ class _PlanRuntime:
         diagnostic = Diagnostic(
             Severity.WARNING,
             "SESSION_CANCELLED",
-            "PlanSession was cancelled without flushing pending state",
+            "ContinuousSession was cancelled without flushing pending state",
             details={
                 "active_ports": sorted(self._active),
                 "discarded_realtime_items": discarded,
@@ -2765,38 +2819,36 @@ class _PlanRuntime:
             except Exception as error:
                 if first_error is None:
                     first_error = error
-        for node_id, session in reversed(tuple(self.kernel_sessions.items())):
+        for node_id, session in reversed(tuple(self.kernel_states.items())):
             try:
-                self._close_kernel_session(node_id, session)
+                self._close_kernel_state(node_id, session)
             except Exception as error:
                 if first_error is None:
                     first_error = error
             finally:
-                self.kernel_sessions.pop(node_id, None)
+                self.kernel_states.pop(node_id, None)
         if first_error is not None:
             raise first_error
 
     @staticmethod
-    def _close_kernel_session(
+    def _close_kernel_state(
         node_id: int,
-        session: CompiledKernelSession[object],
+        session: KernelState[object],
     ) -> None:
-        """optional close entrypointを持つOperationSessionを確実に解放する。"""
+        """optional close entrypointを持つKernelStateを確実に解放する。"""
 
         close = getattr(session, "close", None)
         if close is None:
             return
         if not callable(close):
             raise KernelExecutionError(
-                f"node {node_id} OperationSession close is not callable; "
-                "contract=operation_session_lifecycle"
+                f"node {node_id} KernelState close is not callable; contract=kernel_state_lifecycle"
             )
         try:
             close()
         except Exception as error:
             raise KernelExecutionError(
-                f"node {node_id} OperationSession close failed: {error}; "
-                "contract=operation_session_lifecycle"
+                f"node {node_id} KernelState close failed: {error}; contract=kernel_state_lifecycle"
             ) from error
 
     def _drive(self) -> None:
@@ -3741,13 +3793,13 @@ class _PlanRuntime:
 
         self._record_emission_gaps(node.output_port, inputs)
         if any(_has_input_overrun(item) for item in inputs) and node.gap_policy is GapPolicy.RESET:
-            compiled = self.plan._compiled_kernels.get(node.id)
+            compiled = self.plan._kernels.get(node.id)
             if compiled is None:
-                raise RuntimeError(f"MAP Node {node.id} lacks a CompiledKernel")
-            previous = self.kernel_sessions.get(node.id)
+                raise RuntimeError(f"MAP Node {node.id} lacks a Kernel")
+            previous = self.kernel_states.get(node.id)
             if previous is not None:
-                self._close_kernel_session(node.id, previous)
-            self.kernel_sessions[node.id] = compiled.create_session()
+                self._close_kernel_state(node.id, previous)
+            self.kernel_states[node.id] = compiled.create_state()
 
         if (
             any(item.status is EmissionStatus.INVALID for item in inputs)
@@ -3780,10 +3832,10 @@ class _PlanRuntime:
 
         started_ns = time.perf_counter_ns() if self.options.profiler_enabled else None
         try:
-            session = self.kernel_sessions.get(node.id)
-            if session is None:
-                raise RuntimeError("MAP Node lacks a CompiledKernelSession")
-            result = session.run(
+            state = self.kernel_states.get(node.id)
+            if state is None:
+                raise RuntimeError("MAP Node lacks a KernelState")
+            result = state.process(
                 tuple(item.value for item in inputs),
                 RunContext(node.config, main.interval),
             )

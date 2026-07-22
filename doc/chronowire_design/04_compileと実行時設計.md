@@ -2,7 +2,7 @@
 
 ## 1. compileの責務
 
-`chronowire.compile(outputs)`はLogical GraphからExecutionPlanを生成する。
+`chronowire.compile(outputs)`はLogical GraphからPlanを生成する。
 
 処理段階:
 
@@ -20,7 +20,7 @@
 12. parallel stage構築
 13. buffer割当
 14. output collector設定
-15. ExecutionPlan生成
+15. Plan生成
 
 OperationSpecとImplementationの分離、shape unification、Backend選択は
 [14_Operation設計.md](14_Operation設計.md)を正本とする。Backend実装がshapeや時間意味論を独自に
@@ -54,7 +54,7 @@ Logical Graph:
 
 compile([beam, covariance])
 
-ExecutionPlan:
+Plan:
  source -> base -> beam
               -> covariance
 ```
@@ -155,8 +155,8 @@ Schedulerは内部APIとする。
 
 初期版は単一スレッド・決定的Schedulerを採用する。
 
-Python Schedulerは実行可能な参照実装とする。意味論の正本はExecutionPlanと本書の
-契約である。性能向けには、同じExecutionPlanを実行するNativeExecutorを追加し、RATE、
+Python Schedulerは実行可能な参照実装とする。意味論の正本はPlanと本書の
+契約である。性能向けには、同じPlanを実行するNativeExecutorを追加し、RATE、
 FRAME、buffer、ready判定をnative Stage内で連続実行する。Flow API、Backend、Executorの
 責務分離と段階的な実装方針は[10_Native_Executor設計方針.md](10_Native_Executor設計方針.md)に定める。
 
@@ -306,18 +306,21 @@ plan.run(duration=60.0)
 
 終了前にcollectorをcloseし、Extensionのbounded queueをpolicyに従ってflushしてから`finalize`を呼ぶ。
 
-## 14. ExecutionPlanの再利用
+## 14. Planの再利用
 
-ExecutionPlanと内部CompiledOperationはrun間で共有可能な不変情報を保持する。Extension観測も`ObservationSpec`としてPlanへ固定するが、handler実体と可変状態は保持しない。`ExecutionPlan.create_session(extension_bindings=...)`が`extension_id`とprocess-local factoryを検証し、各runはOperationとExtensionの`create_session()`を呼んでrun-local状態を生成する。v0.4のCompiledKernelはこの内部factoryの旧名称である。
+PlanとKernelはSession間で共有可能な不変情報を保持する。Extension観測も`ObservationSpec`として
+Planへ固定するが、handler実体と可変状態は保持しない。`Plan.create_session()`がprocess-local bindingを
+検証し、Kernelの`create_state()`とExtensionの`create_session()`からrun-local状態を生成する。
+v0.4の`CompiledKernel`はKernelへのdeprecated aliasである。
 
 観測契約がないPlanでは`plan.run()`を`plan.create_session().run()`の簡略形として使用できる。必須Extension bindingがあるPlanで`plan.run()`を呼んだ場合は、binding不足を暗黙に無視せず明示例外にする。
 
 初期版推奨:
 
 - 各`run()`開始時に新しいsessionを生成
-- 同じExecutionSessionを再実行してもExtension triggerとhandler状態をreset
-- v0.2の継続実行は`ExecutionPlan.create_plan_session()`で明示的に生成
-- `PlanSession.start()`から`close()`または`cancel()`までOperationSession、FRAME、RATE、buffer、collector、Extension trigger状態を保持
+- 同じSessionを再実行してもExtension triggerとhandler状態をreset
+- v0.2の継続実行は`Plan.create_continuous_session()`で明示的に生成
+- `ContinuousSession.start()`から`close()`または`cancel()`までKernelState、FRAME、RATE、buffer、collector、Extension trigger状態を保持
 - `run_until(logical_end)`は終端が指定境界以下のEmissionまで進め、境界外の既取得Emissionをsession内に保留
 - `run_until()`が返す`RunResult`はsession開始時からの累積snapshotとし、別sessionへ可変状態を持ち越さない
 

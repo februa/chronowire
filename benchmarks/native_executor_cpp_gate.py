@@ -96,7 +96,7 @@ class CppExecutorMeasurement:
     """CppExecutorのsession生成込みと構築済みsession実行を分離した測定値。
 
     Args:
-        end_to_end: `ExecutionPlan.run(executor=CppExecutor())`のlatency。
+        end_to_end: `Plan.run(executor=CppExecutor())`のlatency。
         session_run: 構築済みrun-local C++ sessionのlatency。
         cython_collected_end_to_end: 全frameをBounded保持するCython latency。
         cpp_collected_end_to_end: 全frameをBounded保持するC++ latency。

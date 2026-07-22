@@ -12,7 +12,9 @@ import chronowire as cw
 cw.Flow
 cw.Config
 cw.compile
-cw.ExecutionPlan
+cw.Plan
+cw.Session
+cw.ContinuousSession
 cw.OutputSpec
 cw.OutputResult
 cw.RunResult
@@ -32,10 +34,10 @@ cw.ConfigSpec
 cw.GraphInfo
 ```
 
-内部Graph、Scheduler、Node、Edge、Portは原則としてトップレベル公開しない。
-`Kernel`、`CompiledKernel`、`CompiledKernelSession`はv0.4実装からの移行用内部概念とし、新しい
-Flow利用者へ公開しない。Operation APIの完全な契約は[14_Operation設計.md](14_Operation設計.md)を
-正本とする。
+内部Graph、Scheduler、Node、Edge、Portは原則としてトップレベル公開しない。通常のFlow利用者は
+Operationを接続するだけでよい。`Kernel`と`KernelState`はDSP package実装者向けの高度な公開契約で、
+fixed-schema、ABI、zero-copy設定を通常利用者へ要求しない。Operation APIの完全な契約は
+[14_Operation設計.md](14_Operation設計.md)を正本とする。
 
 ## 2. Flow生成
 
@@ -232,7 +234,7 @@ Graph本体の可変オブジェクトは返さない。
 
 ## 7. export()
 
-FlowとExecutionPlanの両方が`export()`を持つ。
+FlowとPlanの両方が`export()`を持つ。
 
 ```python
 flow.export("logical_graph.json")
@@ -273,7 +275,7 @@ def compile(
     backend: str | Backend = "python",
     optimization: OptimizationLevel = OptimizationLevel.DEFAULT,
     extensions: Sequence[ObservationSpec] = (),
-) -> ExecutionPlan:
+) -> Plan:
     ...
 ```
 
@@ -316,10 +318,10 @@ result = session.run()
 
 ## v0.2公開API
 
-継続実行は一回実行の`ExecutionSession`と区別し、次の明示lifecycleを持つ。
+継続実行は一回実行の`Session`と区別し、次の明示lifecycleを持つ。
 
 ```python
-session = plan.create_plan_session(options=cw.RuntimeOptions(max_scheduler_steps=1000))
+session = plan.create_continuous_session(options=cw.RuntimeOptions(max_scheduler_steps=1000))
 session.start()
 session.run_until(10)
 session.run_until(20)
@@ -364,7 +366,7 @@ cw.output(flow, collector=cw.Sink(write_item))
 
 全件保持collectorは初期公開APIに含めない。必要なら利用者が明示的なSinkとして実装する。
 
-## 9. ExecutionPlan
+## 9. Plan
 
 ```python
 results = plan.run(duration=60.0)
@@ -374,7 +376,10 @@ plan.export("plan.json")
 概念的API:
 
 ```python
-class ExecutionPlan:
+class Plan:
+    def create_session(self, ...) -> Session:
+        ...
+
     def run(
         self,
         *,
@@ -391,7 +396,11 @@ class ExecutionPlan:
         ...
 ```
 
-ExecutionPlanはcompile後に不変とする。
+Planはcompile後に不変とする。
+
+`Session`は一回だけ実行できるrun-localな全体状態である。同じPlanを再実行する場合も、新しい
+Sessionを`create_session()`で生成する。`ContinuousSession`は同じ概念の継続実行variantであり、
+`start()`から`close()`または`cancel()`まで状態を保持する。
 
 ## 10. run()戻り値
 
