@@ -32,6 +32,7 @@ class RatePolicy(StrEnum):
     """rate Nodeが発火時刻の値を選ぶ方法を表す。"""
 
     HOLD = "hold"
+    SAMPLE = "sample"
 
 
 class InputSemantics(StrEnum):
@@ -839,6 +840,41 @@ class Flow(Generic[T]):
             inputs=(InputSpec(self._port_id, InputSemantics.SYNCHRONOUS),),
             rate_period=Fraction(1, 1) / frequency,
             rate_policy=policy,
+        )
+        return self._from_port(self._graph, port_id, self._config)
+
+    def sample_every(
+        self,
+        period: int | float | Fraction,
+    ) -> Flow[T]:
+        """完全なEmissionを一定論理間隔で選択するRATE Nodeを登録する。
+
+        Args:
+            period: 論理時間0を基準とする正の選択周期。
+
+        Returns:
+            `interval.start = n * period`を満たす入力だけをinterval変更なしで通すFlow。
+
+        Raises:
+            ValueError: periodが正の有限値でない場合。
+
+        境界条件:
+            HOLDによる複製やframe分割は行わない。compile時に入力periodの整数倍であることを
+            証明できない場合は拒否する。
+        """
+
+        try:
+            resolved = Fraction(str(period)) if isinstance(period, float) else Fraction(period)
+        except (ValueError, ZeroDivisionError) as error:
+            raise ValueError("sample period must be a positive finite value") from error
+        if resolved <= 0:
+            raise ValueError("sample period must be positive")
+        port_id = self._graph.add_node(
+            NodeKind.RATE,
+            self._config,
+            inputs=(InputSpec(self._port_id, InputSemantics.SYNCHRONOUS),),
+            rate_period=resolved,
+            rate_policy=RatePolicy.SAMPLE,
         )
         return self._from_port(self._graph, port_id, self._config)
 

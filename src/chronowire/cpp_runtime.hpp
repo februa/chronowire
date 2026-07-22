@@ -114,10 +114,12 @@ private:
 struct GraphNodeSpec {
     std::int64_t node_id = -1;
     int opcode = -1;
-    std::int64_t input_port = -1;
+    std::vector<std::int64_t> input_ports;
+    std::vector<int> input_semantics;
     std::int64_t output_port = -1;
     std::int64_t period_numerator = 0;
     std::int64_t period_denominator = 1;
+    int rate_policy = 0;
     std::size_t frame_size = 0;
     std::size_t frame_hop = 0;
     bool pad_end = false;
@@ -151,6 +153,8 @@ struct GraphRuntimeResult {
     std::vector<std::vector<std::size_t>> provenance_offsets;
     std::vector<std::vector<std::int64_t>> invalid_nodes;
     std::vector<std::vector<std::size_t>> invalid_node_offsets;
+    std::vector<std::vector<std::int64_t>> degraded_nodes;
+    std::vector<std::vector<std::size_t>> degraded_node_offsets;
     std::vector<std::vector<std::int64_t>> metadata_source_indices;
     std::vector<std::int64_t> status_counts;
     std::uint64_t scheduler_ns = 0;

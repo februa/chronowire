@@ -33,6 +33,8 @@ _NATIVE_TO_STATUS = (
 _PORTABLE_OPCODE = {"source": 0, "rate": 1, "frame": 2, "map": 3}
 _COLLECTOR_KIND = {"none": 0, "latest": 1, "bounded": 2}
 _OVERFLOW_POLICY = {None: 0, "fail": 0, "drop_oldest": 1, "drop_newest": 2}
+_INPUT_SEMANTICS = {"synchronous": 0, "latest": 1}
+_RATE_POLICY = {None: 0, RatePolicy.HOLD: 0, RatePolicy.SAMPLE: 1}
 
 
 def _reshape_item(
@@ -98,8 +100,8 @@ class CppExecutionSession(ExecutorSession):
                 f"node={source_node.id} port={source_node.output_port}"
             )
         ir = self.plan.portable_ir
-        if ir.schema_version != "0.3":
-            raise ValueError("CppExecutor contract=portable_plan_schema requires schema 0.3")
+        if ir.schema_version not in {"0.3", "0.4"}:
+            raise ValueError("CppExecutor contract=portable_plan_schema requires schema 0.3/0.4")
         if tuple(item.node_id for item in ir.nodes) != tuple(node.id for node in nodes):
             raise ValueError(
                 "CppExecutor contract=portable_node_order does not match bound Plan; "
@@ -125,18 +127,26 @@ class CppExecutionSession(ExecutorSession):
         }
         portable_nodes: list[tuple[object, ...]] = []
         for node, descriptor in zip(nodes, ir.nodes, strict=True):
-            if len(node.inputs) > 1:
-                raise ValueError(
-                    "CppExecutor contract=single_input_native_node; "
-                    f"node={node.id} port={node.output_port}"
+            input_ports = tuple(item.source_port for item in node.inputs)
+            try:
+                input_semantics = tuple(
+                    _INPUT_SEMANTICS[item.semantics.value] for item in node.inputs
                 )
-            input_port = -1 if not node.inputs else node.inputs[0].source_port
+            except KeyError as error:
+                raise ValueError(
+                    "CppExecutor contract=native_input_semantics supports synchronous/latest; "
+                    f"node={node.id} port={node.output_port}"
+                ) from error
             period_numerator = 0
             period_denominator = 1
             if node.kind is NodeKind.RATE:
-                if node.rate_policy is not RatePolicy.HOLD or node.rate_period is None:
+                if (
+                    node.rate_policy not in {RatePolicy.HOLD, RatePolicy.SAMPLE}
+                    or node.rate_period is None
+                ):
                     raise ValueError(
-                        "CppExecutor contract=rate_policy requires HOLD with an exact period; "
+                        "CppExecutor contract=rate_policy requires HOLD/SAMPLE with an exact "
+                        "period; "
                         f"node={node.id} port={node.output_port}"
                     )
                 period_numerator = node.rate_period.numerator
@@ -186,10 +196,12 @@ class CppExecutionSession(ExecutorSession):
                 (
                     descriptor.node_id,
                     _PORTABLE_OPCODE[descriptor.opcode],
-                    input_port,
+                    input_ports,
+                    input_semantics,
                     node.output_port,
                     period_numerator,
                     period_denominator,
+                    _RATE_POLICY[node.rate_policy],
                     node.frame_size or 0,
                     node.frame_hop or 0,
                     node.pad_end,
@@ -259,6 +271,7 @@ class CppExecutionSession(ExecutorSession):
             native_statuses,
             provenance,
             invalid_nodes,
+            degraded_nodes,
             metadata_indices,
             timebase_denominator,
             received_count,
@@ -277,6 +290,7 @@ class CppExecutionSession(ExecutorSession):
             native_statuses,
             provenance,
             invalid_nodes,
+            degraded_nodes,
             metadata_indices,
             strict=True,
         )
@@ -290,6 +304,7 @@ class CppExecutionSession(ExecutorSession):
             native_status,
             source_indices,
             skipped_nodes,
+            insufficient_nodes,
             metadata_index,
         ) in rows:
             if prod(shape) != value_end - value_start:
@@ -316,6 +331,17 @@ class CppExecutionSession(ExecutorSession):
                     interval=interval,
                 )
                 for node_id in skipped_nodes
+            )
+            diagnostics += tuple(
+                Diagnostic(
+                    Severity.WARNING,
+                    "INSUFFICIENT_INTEGRATION",
+                    "MVDR covariance has fewer than channels squared samples",
+                    node_id=node_id,
+                    port_id=self._node_ports[node_id],
+                    interval=interval,
+                )
+                for node_id in insufficient_nodes
             )
             metadata = (
                 self._source_emissions[metadata_index].metadata if metadata_index >= 0 else {}

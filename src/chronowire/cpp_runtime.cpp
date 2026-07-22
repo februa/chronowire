@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -389,6 +390,7 @@ struct GraphItem {
     std::uint8_t status = 0;
     std::vector<std::int64_t> provenance;
     std::vector<std::int64_t> invalid_nodes;
+    std::vector<std::int64_t> degraded_nodes;
     std::int64_t metadata_source_index = -1;
     std::int64_t segment = 0;
 };
@@ -406,7 +408,13 @@ std::size_t checked_shape_product(const std::vector<std::size_t>& shape) {
     return result;
 }
 
-enum class GraphKernelKind { identity_f64, fixed_cbf_f64 };
+enum class GraphKernelKind {
+    identity_f64,
+    fixed_cbf_f64,
+    covariance_f64,
+    mvdr_weights_f64,
+    apply_weights_f64,
+};
 
 GraphKernelKind resolve_graph_kernel(const GraphNodeSpec& node) {
     if (node.kernel_abi == "chronowire.kernel.identity_f64.v1" &&
@@ -416,6 +424,18 @@ GraphKernelKind resolve_graph_kernel(const GraphNodeSpec& node) {
     if (node.kernel_abi == "chronowire.reference.fixed_cbf_f64.v1" &&
         node.process_model == "fixed_cbf_f64_frame") {
         return GraphKernelKind::fixed_cbf_f64;
+    }
+    if (node.kernel_abi == "chronowire.reference.covariance_accumulator_f64_frame.v1" &&
+        node.process_model == "covariance_accumulator_f64_frame") {
+        return GraphKernelKind::covariance_f64;
+    }
+    if (node.kernel_abi == "chronowire.reference.mvdr_weights_f64.v1" &&
+        node.process_model == "mvdr_weights_f64") {
+        return GraphKernelKind::mvdr_weights_f64;
+    }
+    if (node.kernel_abi == "chronowire.reference.apply_weights_f64_latest.v1" &&
+        node.process_model == "apply_weights_f64_latest") {
+        return GraphKernelKind::apply_weights_f64;
     }
     throw std::invalid_argument("CppExecutor contract=kernel_abi_table");
 }
@@ -431,6 +451,20 @@ GraphBatch run_rate_node(
         throw std::invalid_argument("CppExecutor contract=positive_rate_period");
     }
     GraphBatch output;
+    if (node.rate_policy == 1) {
+        for (const GraphItem& item : input) {
+            if (item.start % period_ticks != 0) {
+                continue;
+            }
+            GraphItem emitted = item;
+            emitted.sequence = static_cast<std::int64_t>(output.size());
+            output.push_back(std::move(emitted));
+        }
+        return output;
+    }
+    if (node.rate_policy != 0) {
+        throw std::invalid_argument("CppExecutor contract=rate_policy");
+    }
     bool has_next_fire = false;
     std::int64_t next_fire = 0;
     std::int64_t current_segment = -1;
@@ -496,6 +530,11 @@ GraphBatch run_frame_node(const GraphBatch& input, const GraphNodeSpec& node) {
                 frame.invalid_nodes.insert(
                     frame.invalid_nodes.end(), item.invalid_nodes.begin(), item.invalid_nodes.end()
                 );
+                frame.degraded_nodes.insert(
+                    frame.degraded_nodes.end(),
+                    item.degraded_nodes.begin(),
+                    item.degraded_nodes.end()
+                );
             }
             output.push_back(std::move(frame));
             if (node.frame_hop > segment_end - offset) {
@@ -508,14 +547,115 @@ GraphBatch run_frame_node(const GraphBatch& input, const GraphNodeSpec& node) {
     return output;
 }
 
-GraphBatch run_map_node(const GraphBatch& input, const GraphNodeSpec& node) {
+std::vector<double> solve_linear_system(
+    const std::vector<double>& matrix,
+    const std::vector<double>& right
+) {
+    const std::size_t size = right.size();
+    if (matrix.size() != checked_size_multiply(size, size) || size == 0) {
+        throw std::invalid_argument("CppExecutor contract=mvdr_linear_shape");
+    }
+    std::vector<double> rows(checked_size_multiply(size, size + 1), 0.0);
+    for (std::size_t row = 0; row < size; ++row) {
+        std::copy_n(
+            matrix.begin() + static_cast<std::ptrdiff_t>(row * size),
+            size,
+            rows.begin() + static_cast<std::ptrdiff_t>(row * (size + 1))
+        );
+        rows[row * (size + 1) + size] = right[row];
+    }
+    for (std::size_t pivot = 0; pivot < size; ++pivot) {
+        std::size_t selected = pivot;
+        for (std::size_t row = pivot + 1; row < size; ++row) {
+            if (std::abs(rows[row * (size + 1) + pivot]) >
+                std::abs(rows[selected * (size + 1) + pivot])) {
+                selected = row;
+            }
+        }
+        if (std::abs(rows[selected * (size + 1) + pivot]) <= 1.0e-12) {
+            throw std::invalid_argument("CppExecutor contract=mvdr_singular_covariance");
+        }
+        for (std::size_t column = pivot; column <= size; ++column) {
+            std::swap(
+                rows[pivot * (size + 1) + column],
+                rows[selected * (size + 1) + column]
+            );
+        }
+        const double divisor = rows[pivot * (size + 1) + pivot];
+        for (std::size_t column = pivot; column <= size; ++column) {
+            rows[pivot * (size + 1) + column] /= divisor;
+        }
+        for (std::size_t row = 0; row < size; ++row) {
+            if (row == pivot) {
+                continue;
+            }
+            const double factor = rows[row * (size + 1) + pivot];
+            for (std::size_t column = pivot; column <= size; ++column) {
+                rows[row * (size + 1) + column] -=
+                    factor * rows[pivot * (size + 1) + column];
+            }
+        }
+    }
+    std::vector<double> result(size);
+    for (std::size_t row = 0; row < size; ++row) {
+        result[row] = rows[row * (size + 1) + size];
+    }
+    return result;
+}
+
+GraphBatch run_map_node(
+    const std::vector<const GraphBatch*>& inputs,
+    const GraphNodeSpec& node
+) {
+    if (inputs.empty() || inputs.size() != node.input_semantics.size()) {
+        throw std::invalid_argument("CppExecutor contract=map_input_descriptor");
+    }
     const GraphKernelKind kind = resolve_graph_kernel(node);
+    const GraphBatch& input = *inputs[0];
     GraphBatch output;
     output.reserve(input.size());
+    std::vector<std::size_t> latest_indices(inputs.size(), 0);
+    std::vector<bool> has_latest(inputs.size(), false);
+    std::vector<double> covariance_sums;
+    std::size_t covariance_sample_count = 0;
     for (const GraphItem& item : input) {
         GraphItem mapped = item;
         mapped.sequence = static_cast<std::int64_t>(output.size());
-        if (item.status == 2 && !node.accepts_invalid) {
+        std::vector<const GraphItem*> selected_inputs = {&item};
+        bool missing = false;
+        for (std::size_t input_index = 1; input_index < inputs.size(); ++input_index) {
+            if (node.input_semantics[input_index] != 1) {
+                throw std::invalid_argument("CppExecutor contract=map_secondary_latest");
+            }
+            const GraphBatch& candidates = *inputs[input_index];
+            while (latest_indices[input_index] < candidates.size() &&
+                   candidates[latest_indices[input_index]].start <= item.start) {
+                has_latest[input_index] = true;
+                ++latest_indices[input_index];
+            }
+            if (!has_latest[input_index]) {
+                missing = true;
+                break;
+            }
+            const GraphItem& latest = candidates[latest_indices[input_index] - 1];
+            selected_inputs.push_back(&latest);
+            mapped.status = std::max(mapped.status, latest.status);
+            mapped.provenance.insert(
+                mapped.provenance.end(), latest.provenance.begin(), latest.provenance.end()
+            );
+            mapped.invalid_nodes.insert(
+                mapped.invalid_nodes.end(), latest.invalid_nodes.begin(), latest.invalid_nodes.end()
+            );
+            mapped.degraded_nodes.insert(
+                mapped.degraded_nodes.end(),
+                latest.degraded_nodes.begin(),
+                latest.degraded_nodes.end()
+            );
+        }
+        if (missing) {
+            continue;
+        }
+        if (mapped.status == 2 && !node.accepts_invalid) {
             mapped.invalid_nodes.push_back(node.node_id);
             output.push_back(std::move(mapped));
             continue;
@@ -523,6 +663,95 @@ GraphBatch run_map_node(const GraphBatch& input, const GraphNodeSpec& node) {
         if (kind == GraphKernelKind::identity_f64) {
             if (node.output_shape != item.shape) {
                 throw std::invalid_argument("CppExecutor contract=identity_output_shape");
+            }
+            output.push_back(std::move(mapped));
+            continue;
+        }
+        if (kind == GraphKernelKind::covariance_f64) {
+            if (item.shape.size() != 2 || node.output_shape.size() != 2 ||
+                node.kernel_parameters.size() != 1 || node.parameter_shape != std::vector<std::size_t>({1})) {
+                throw std::invalid_argument("CppExecutor contract=covariance_shape");
+            }
+            const std::size_t sample_count = item.shape[0];
+            const std::size_t channel_count = item.shape[1];
+            if (node.output_shape[0] != channel_count || node.output_shape[1] != channel_count) {
+                throw std::invalid_argument("CppExecutor contract=covariance_output_shape");
+            }
+            if (covariance_sums.empty()) {
+                covariance_sums.assign(
+                    checked_size_multiply(channel_count, channel_count),
+                    0.0
+                );
+            }
+            covariance_sample_count = checked_size_add(covariance_sample_count, sample_count);
+            mapped.values.assign(checked_size_multiply(channel_count, channel_count), 0.0);
+            mapped.shape = node.output_shape;
+            for (std::size_t row = 0; row < channel_count; ++row) {
+                for (std::size_t column = 0; column < channel_count; ++column) {
+                    for (std::size_t sample = 0; sample < sample_count; ++sample) {
+                        covariance_sums[row * channel_count + column] +=
+                            item.values[sample * channel_count + row] *
+                            item.values[sample * channel_count + column];
+                    }
+                    mapped.values[row * channel_count + column] =
+                        covariance_sums[row * channel_count + column] /
+                        static_cast<double>(covariance_sample_count) +
+                        (row == column ? node.kernel_parameters[0] : 0.0);
+                }
+            }
+            if (covariance_sample_count < checked_size_multiply(channel_count, channel_count)) {
+                mapped.status = std::max<std::uint8_t>(mapped.status, 1);
+                mapped.degraded_nodes.push_back(node.node_id);
+            }
+            output.push_back(std::move(mapped));
+            continue;
+        }
+        if (kind == GraphKernelKind::mvdr_weights_f64) {
+            if (item.shape.size() != 2 || item.shape[0] != item.shape[1] ||
+                node.output_shape.size() != 1 || node.parameter_shape.size() != 1) {
+                throw std::invalid_argument("CppExecutor contract=mvdr_weights_shape");
+            }
+            const std::size_t channel_count = item.shape[0];
+            if (node.output_shape[0] != channel_count ||
+                node.parameter_shape[0] != channel_count ||
+                node.kernel_parameters.size() != channel_count) {
+                throw std::invalid_argument("CppExecutor contract=mvdr_steering_shape");
+            }
+            mapped.values = solve_linear_system(item.values, node.kernel_parameters);
+            const double denominator = std::inner_product(
+                node.kernel_parameters.begin(),
+                node.kernel_parameters.end(),
+                mapped.values.begin(),
+                0.0
+            );
+            if (std::abs(denominator) <= 1.0e-12) {
+                throw std::invalid_argument("CppExecutor contract=mvdr_denominator");
+            }
+            for (double& value : mapped.values) {
+                value /= denominator;
+            }
+            mapped.shape = node.output_shape;
+            output.push_back(std::move(mapped));
+            continue;
+        }
+        if (kind == GraphKernelKind::apply_weights_f64) {
+            if (selected_inputs.size() != 2 || item.shape.size() != 2 ||
+                selected_inputs[1]->shape.size() != 1 || node.output_shape.size() != 1) {
+                throw std::invalid_argument("CppExecutor contract=apply_weights_shape");
+            }
+            const std::size_t sample_count = item.shape[0];
+            const std::size_t channel_count = item.shape[1];
+            const GraphItem& weights = *selected_inputs[1];
+            if (weights.shape[0] != channel_count || node.output_shape[0] != sample_count) {
+                throw std::invalid_argument("CppExecutor contract=apply_weights_channel_shape");
+            }
+            mapped.values.assign(sample_count, 0.0);
+            mapped.shape = node.output_shape;
+            for (std::size_t sample = 0; sample < sample_count; ++sample) {
+                for (std::size_t channel = 0; channel < channel_count; ++channel) {
+                    mapped.values[sample] += item.values[sample * channel_count + channel] *
+                        weights.values[channel];
+                }
             }
             output.push_back(std::move(mapped));
             continue;
@@ -601,7 +830,8 @@ GraphRuntimeSession::GraphRuntimeSession(
     source_count_(source_count),
     source_width_(source_width),
     source_timebase_denominator_(source_timebase_denominator) {
-    if (schema_version != "0.3" || nodes_.empty() || outputs_.empty()) {
+    if ((schema_version != "0.3" && schema_version != "0.4") ||
+        nodes_.empty() || outputs_.empty()) {
         throw std::invalid_argument("CppExecutor contract=portable_graph_plan");
     }
     if (source_width_ == 0 || source_timebase_denominator_ <= 0) {
@@ -618,8 +848,16 @@ GraphRuntimeSession::GraphRuntimeSession(
         }
         if (node.opcode == 0) {
             ++source_nodes;
-        } else if (produced_ports.find(node.input_port) == produced_ports.end()) {
-            throw std::invalid_argument("CppExecutor contract=topological_native_edge");
+        } else {
+            if (node.input_ports.empty() ||
+                node.input_ports.size() != node.input_semantics.size()) {
+                throw std::invalid_argument("CppExecutor contract=native_input_descriptor");
+            }
+            for (const std::int64_t input_port : node.input_ports) {
+                if (produced_ports.find(input_port) == produced_ports.end()) {
+                    throw std::invalid_argument("CppExecutor contract=topological_native_edge");
+                }
+            }
         }
         if (node.opcode == 3) {
             static_cast<void>(resolve_graph_kernel(node));
@@ -703,17 +941,28 @@ GraphRuntimeResult GraphRuntimeSession::run(
                 batch.push_back(std::move(item));
             }
         } else {
-            const auto input = batches.find(node.input_port);
-            if (input == batches.end()) {
-                throw std::runtime_error("CppExecutor contract=native_input_batch");
+            std::vector<const GraphBatch*> inputs;
+            inputs.reserve(node.input_ports.size());
+            for (const std::int64_t input_port : node.input_ports) {
+                const auto input = batches.find(input_port);
+                if (input == batches.end()) {
+                    throw std::runtime_error("CppExecutor contract=native_input_batch");
+                }
+                inputs.push_back(&input->second);
             }
             if (node.opcode == 1) {
-                batch = run_rate_node(input->second, node, timebase);
+                if (inputs.size() != 1) {
+                    throw std::runtime_error("CppExecutor contract=rate_input_count");
+                }
+                batch = run_rate_node(*inputs[0], node, timebase);
             } else if (node.opcode == 2) {
-                batch = run_frame_node(input->second, node);
+                if (inputs.size() != 1) {
+                    throw std::runtime_error("CppExecutor contract=frame_input_count");
+                }
+                batch = run_frame_node(*inputs[0], node);
             } else {
                 const auto kernel_start = std::chrono::steady_clock::now();
-                batch = run_map_node(input->second, node);
+                batch = run_map_node(inputs, node);
                 result.kernel_ns += elapsed_ns(kernel_start, std::chrono::steady_clock::now());
             }
         }
@@ -760,6 +1009,8 @@ GraphRuntimeResult GraphRuntimeSession::run(
         std::vector<std::size_t> provenance_offsets = {0};
         std::vector<std::int64_t> invalid_nodes;
         std::vector<std::size_t> invalid_offsets = {0};
+        std::vector<std::int64_t> degraded_nodes;
+        std::vector<std::size_t> degraded_offsets = {0};
         std::vector<std::size_t> shapes;
         std::vector<std::int64_t> metadata_indices;
         if (!output.overflowed) {
@@ -775,6 +1026,7 @@ GraphRuntimeResult GraphRuntimeSession::run(
                 output.statuses.push_back(item.status);
                 append_offsets(item.provenance, output.provenance, provenance_offsets);
                 append_offsets(item.invalid_nodes, invalid_nodes, invalid_offsets);
+                append_offsets(item.degraded_nodes, degraded_nodes, degraded_offsets);
                 metadata_indices.push_back(item.metadata_source_index);
             }
         }
@@ -793,6 +1045,8 @@ GraphRuntimeResult GraphRuntimeSession::run(
         result.provenance_offsets.push_back(std::move(provenance_offsets));
         result.invalid_nodes.push_back(std::move(invalid_nodes));
         result.invalid_node_offsets.push_back(std::move(invalid_offsets));
+        result.degraded_nodes.push_back(std::move(degraded_nodes));
+        result.degraded_node_offsets.push_back(std::move(degraded_offsets));
         result.metadata_source_indices.push_back(std::move(metadata_indices));
     }
     result.output_select_ns = elapsed_ns(select_start, std::chrono::steady_clock::now());

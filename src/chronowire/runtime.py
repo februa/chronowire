@@ -323,7 +323,11 @@ def _time_signature(nodes: Sequence[NodeSpec]) -> dict[int, tuple[Fraction, Frac
         elif node.kind is NodeKind.RATE:
             if node.rate_period is None:
                 raise RuntimeError("RATE Node lacks period")
-            value = (node.rate_period, node.rate_period)
+            if node.rate_policy is RatePolicy.SAMPLE:
+                input_length, _ = signatures[node.inputs[0].source_port]
+                value = (input_length, node.rate_period)
+            else:
+                value = (node.rate_period, node.rate_period)
         else:
             raise RuntimeError(f"unsupported Node kind {node.kind!r}")
         for output_port in node.output_ports:
@@ -401,13 +405,30 @@ def _validate_rate_frame_boundaries(nodes: Sequence[NodeSpec]) -> None:
         elif node.kind is NodeKind.RATE:
             source_port = node.inputs[0].source_port
             source = proofs[source_port]
-            if source.contains_frame:
+            if source.contains_frame and node.rate_policy is RatePolicy.HOLD:
                 raise CompileError(
                     f"rate node {node.id} port {node.output_port} consumes a completed frame "
                     f"from port {source_port}; move Flow.rate(...) before Flow.frame(...) so HOLD "
                     "cannot duplicate or discard frames; contract=rate_before_frame"
                 )
-            proof = _TimingProof(exact=True, contains_frame=False, contains_rate=True)
+            if node.rate_policy is RatePolicy.SAMPLE:
+                if node.rate_period is None:
+                    raise RuntimeError("SAMPLE Node lacks period")
+                _, input_period = signatures[source_port]
+                ratio = node.rate_period / input_period
+                if ratio.denominator != 1:
+                    raise CompileError(
+                        f"sample node {node.id} port {node.output_port} period "
+                        f"{node.rate_period} is not an integer multiple of input period "
+                        f"{input_period}; contract=stable_sample_boundary"
+                    )
+                proof = _TimingProof(
+                    exact=source.exact,
+                    contains_frame=source.contains_frame,
+                    contains_rate=True,
+                )
+            else:
+                proof = _TimingProof(exact=True, contains_frame=False, contains_rate=True)
         else:
             raise RuntimeError(f"unsupported Node kind {node.kind!r}")
         for output_port in node.output_ports:
@@ -527,7 +548,7 @@ def _node_max_items(
 ) -> int:
     """一回のNode処理で生成し得るEmission件数上限を求める。"""
 
-    if node.kind is not NodeKind.RATE:
+    if node.kind is not NodeKind.RATE or node.rate_policy is RatePolicy.SAMPLE:
         return node.max_items
     if node.rate_period is None:
         raise RuntimeError("RATE Node lacks period")
@@ -577,6 +598,14 @@ def _planned_port_buffers(
             if node.frame_size is None:
                 raise RuntimeError("FRAME Node lacks size")
             multiplier = node.frame_size
+        elif node.kind is NodeKind.RATE and node.rate_policy is RatePolicy.SAMPLE:
+            if node.rate_period is None:
+                raise RuntimeError("SAMPLE Node lacks period")
+            input_period = signatures[node.inputs[0].source_port][1]
+            ratio = node.rate_period / input_period
+            if ratio.denominator != 1:
+                raise CompileError(f"sample node {node.id} period is not an integer input multiple")
+            multiplier = ratio.numerator
         for input_spec in node.inputs:
             for ancestor, count in ancestor_demands(input_spec.source_port).items():
                 demands[ancestor] = max(demands.get(ancestor, 0), count * multiplier)
@@ -3413,10 +3442,27 @@ class _PlanRuntime:
         source = queue.popleft()
         self._record_emission_gaps(node.output_port, (source,))
         period = node.rate_period
-        if period is None or node.rate_policy is not RatePolicy.HOLD:
+        if period is None or node.rate_policy is None:
             raise RuntimeError("RATE Node lacks a supported period and policy")
         start = source.interval.start.as_fraction()
         end = source.interval.end.as_fraction()
+        if node.rate_policy is RatePolicy.SAMPLE:
+            if (start / period).denominator == 1:
+                self._publish(
+                    node.output_port,
+                    Emission(
+                        source.value,
+                        source.interval,
+                        self._next_sequence(node.output_port),
+                        source.status,
+                        source.diagnostics,
+                        source.metadata,
+                    ),
+                )
+            self._advance_frontier(node.output_port, end)
+            return True
+        if node.rate_policy is not RatePolicy.HOLD:
+            raise RuntimeError("RATE Node has an unsupported policy")
         state = self.rates.setdefault(node.id, _RateState())
         if _has_input_overrun(source):
             state.next_fire = None

@@ -147,7 +147,8 @@ uv run python -m benchmarks.native_executor_cpp_gate \
 
 `0.4.0`では、PythonでcompileしたPortablePlanIRからrun-local C++ sessionを生成し、単一の有限
 `f64_vector_source`からなるRATE、FRAME、複数native MAP、fan-out、複数outputを一つのC++ DAG
-runtimeで運用できる。version付きKernel ABI tableにはidentity f64と固定CBFを登録する。C++実行中は
+runtimeで運用できる。version付きKernel ABI tableにはidentity f64、固定CBF、および周期更新MVDRの
+参照ABIを登録する。C++実行中は
 GILを解放し、NoCollectではKernel出力値をPythonへ戻さない。
 
 ```python
@@ -164,6 +165,16 @@ plan = cw.compile(
 result = plan.run(executor="cpp")
 ```
 
+周期更新MVDRの受入例は、完成frameから`sample_every(update_period)`で更新境界だけを選択し、累積
+共分散、MVDR重み生成、latest StateFlowによる重み保持、各frameへの重み適用を一つのschema 0.4 Planへ
+compileする。`sample_every()`は数値rate変換ではなく、frameを分割・複製しないEmission選択である。
+更新周期がframe周期の整数倍でなければcompile errorにする。初期積分がchannel数の二乗未満でも処理を
+止めず、重みとbeamを`DEGRADED`かつ`INSUFFICIENT_INTEGRATION`付きで保存する。
+
+このMVDRはScheduler、複数入力、LATEST、state resetのconformance用実数参照実装であり、本番用の複素
+FFT bin別DSP実装ではない。PythonExecutorとCppExecutorは値、interval、sequence、status、Diagnosticを
+同じtraceとして返し、同じPlanの再実行では共分散積分状態を持ち越さない。
+
 Flow APIとcompileはPython、compile後のlogical tick、Scheduler、buffer、CBF、collector保持選択は
 C++が所有する。Kernel定数は`NativeKernelRuntimeBinding`としてprocess-local slotへbindし、
 PortablePlanIRへPython objectやpointerを保存しない。共通祖先のbatchはread-onlyとしてfan-out間で
@@ -176,7 +187,8 @@ Extensionへpriority順に配送する。
 
 v0.4のC++経路は単一有限Source、`FRAME(pad_end=False)`、既定`RuntimeOptions`に限定する。realtime
 push、複数Source/merge、任意Python Kernel、native内部のPython callback、継続PlanSessionで状態を持つ
-Extension、mutable native Kernel workspaceは暗黙fallbackせず明示エラーにする。これらはv0.5で
+Extension、manifestから読み込む汎用mutable native workspaceは暗黙fallbackせず明示エラーにする。
+登録済みMVDR参照ABIのrun-local共分散状態だけは受入経路として対応する。残りはv0.5で
 実測しながら拡張する。
 
 ## 実行例

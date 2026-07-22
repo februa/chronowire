@@ -54,11 +54,22 @@ PortablePlanIRは各runtime bufferを次のいずれかに分類する。
 
 capacityは少なくとも`max_items`を持つ。native memoryの割当と保護には`max_bytes`も使用できるが、item単位の意味論上限をbyte数だけで置き換えない。
 
-v0.1の`PORT_SHARED` capacityはPortごとに計画する。各Portはproducer一回のEmission `max_items`を下限とし、複数入力MAPの分岐が共有し、実際に複数consumer cursorへ分岐する祖先Portだけへ、分岐一件を生成するための最大需要を逆伝播する。分岐前の共通経路にconsumer cursorが一つしかないPortへは需要を伝播しない。`FRAME`は`size`を乗算し、nested frameは積を使用する。identity MAPとRATEは入力item需要を増やさない。無関係なPortや生成後のPortへ同じ最大値を一律配布しない。共有祖先producerが複数Emissionを原子的に生成する場合は、構造需要をproducer burstの整数倍へ切り上げ、publish途中でbackpressureしないcapacityを確保する。
+v0.1の`PORT_SHARED` capacityはPortごとに計画する。各Portはproducer一回のEmission `max_items`を下限とし、複数入力MAPの分岐が共有し、実際に複数consumer cursorへ分岐する祖先Portだけへ、分岐一件を生成するための最大需要を逆伝播する。分岐前の共通経路にconsumer cursorが一つしかないPortへは需要を伝播しない。`FRAME`は`size`を乗算し、nested frameは積を使用する。identity MAPとHOLD RATEは入力item需要を増やさない。`SAMPLE`は次の選択境界を探すlookaheadとして、出力周期と入力周期の整数比を需要へ乗算する。無関係なPortや生成後のPortへ同じ最大値を一律配布しない。共有祖先producerが複数Emissionを原子的に生成する場合は、構造需要をproducer burstの整数倍へ切り上げ、publish途中でbackpressureしないcapacityを確保する。
 
 例えば`source`と`source.frame(4)`をexact mergeする場合、共有Source Portは4件、FRAME出力Portとmerge出力Portはproducer burstの1件となる。Kernelの`emit_many(max_items=3)`はそのKernel出力Portだけを3件にする。
 
 各`BufferDescriptor`は`capacity_reasons`へ`producer_burst`および必要な`shared_merge_demand`を記録する。`high_watermark`は`max_items`、同期Python Executorの`low_watermark`は`max_items - 1`とし、一件以上の空きができた時点でpullを再開する。
+
+### 3.1 完成Emissionの周期選択
+
+`Flow.sample_every(period)`は数値補間を行うRATE変換ではない。入力Emissionのintervalを変更せず、
+`interval.start = offset + n * period`に一致する完成Emissionだけを一件ずつ通す。v0.4の公開APIでは
+`offset=0`に固定する。Compilerは入力periodが既知で、選択periodが入力periodの正の整数倍であることを
+`stable_sample_boundary`契約として証明する。証明できない場合や端数境界を生む場合はcompile errorにし、
+Schedulerがframeを分割、複製、先行生成して帳尻を合わせてはならない。
+
+主処理branchと低頻度更新branchが同じframe Portを共有する場合、`SAMPLE`の整数比は共有祖先bufferの
+lookahead需要へ反映する。これにより更新境界を待つbranchが主branchを塞がず、かつ無制限queueを作らない。
 
 `FRAME_HISTORY`は所有FRAME Nodeとinput index、`size`件のcapacity、`frame_hop` reclaimを明示し、Python Executorの`FrameHistoryBuffer`がdescriptorから生成される。`LATEST_STATE`は所有MAP Nodeとlatest input index、確定値一件のcapacity、`replace_on_newer` reclaimを明示し、future pendingは入力の`PORT_SHARED` cursorに残す。いずれもEmission参照をcopyせず、run間では共有しない。
 

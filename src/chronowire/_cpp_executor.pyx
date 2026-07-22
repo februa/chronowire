@@ -68,10 +68,12 @@ cdef extern from "cpp_runtime.hpp" namespace "chronowire::cpp_runtime":
         GraphNodeSpec() except +
         int64_t node_id
         int opcode
-        int64_t input_port
+        vector[int64_t] input_ports
+        vector[int] input_semantics
         int64_t output_port
         int64_t period_numerator
         int64_t period_denominator
+        int rate_policy
         size_t frame_size
         size_t frame_hop
         bint pad_end
@@ -97,6 +99,8 @@ cdef extern from "cpp_runtime.hpp" namespace "chronowire::cpp_runtime":
         vector[vector[size_t]] provenance_offsets
         vector[vector[int64_t]] invalid_nodes
         vector[vector[size_t]] invalid_node_offsets
+        vector[vector[int64_t]] degraded_nodes
+        vector[vector[size_t]] degraded_node_offsets
         vector[vector[int64_t]] metadata_source_indices
         vector[int64_t] status_counts
         uint64_t scheduler_ns
@@ -328,28 +332,34 @@ cdef class CppGraphNativeSession:
         cdef bytes model_bytes
         cdef object descriptor
         cdef object extent
+        cdef object input_port
+        cdef object input_semantic
 
         self._runtime = NULL
         for descriptor in nodes:
             node = GraphNodeSpec()
             node.node_id = descriptor[0]
             node.opcode = descriptor[1]
-            node.input_port = descriptor[2]
-            node.output_port = descriptor[3]
-            node.period_numerator = descriptor[4]
-            node.period_denominator = descriptor[5]
-            node.frame_size = descriptor[6]
-            node.frame_hop = descriptor[7]
-            node.pad_end = descriptor[8]
-            node.accepts_invalid = descriptor[9]
-            abi_bytes = descriptor[10].encode("utf-8")
-            model_bytes = descriptor[11].encode("utf-8")
+            for input_port in descriptor[2]:
+                node.input_ports.push_back(input_port)
+            for input_semantic in descriptor[3]:
+                node.input_semantics.push_back(input_semantic)
+            node.output_port = descriptor[4]
+            node.period_numerator = descriptor[5]
+            node.period_denominator = descriptor[6]
+            node.rate_policy = descriptor[7]
+            node.frame_size = descriptor[8]
+            node.frame_hop = descriptor[9]
+            node.pad_end = descriptor[10]
+            node.accepts_invalid = descriptor[11]
+            abi_bytes = descriptor[12].encode("utf-8")
+            model_bytes = descriptor[13].encode("utf-8")
             node.kernel_abi = abi_bytes
             node.process_model = model_bytes
-            node.kernel_parameters = _f64_vector(descriptor[12])
-            for extent in descriptor[13]:
+            node.kernel_parameters = _f64_vector(descriptor[14])
+            for extent in descriptor[15]:
                 node.parameter_shape.push_back(extent)
-            for extent in descriptor[14]:
+            for extent in descriptor[16]:
                 node.output_shape.push_back(extent)
             native_nodes.push_back(node)
         for descriptor in outputs:
@@ -403,6 +413,7 @@ cdef class CppGraphNativeSession:
         cdef list shapes
         cdef list provenance
         cdef list invalid_nodes
+        cdef list degraded_nodes
         cdef bytes values
 
         # C++ sessionは全Plan/inputを所有しPython callbackを持たない。
@@ -421,6 +432,7 @@ cdef class CppGraphNativeSession:
             shapes = []
             provenance = []
             invalid_nodes = []
+            degraded_nodes = []
             for item_index in range(output.retained_count):
                 start = result.shape_offsets[output_index][item_index]
                 end = result.shape_offsets[output_index][item_index + 1]
@@ -443,6 +455,14 @@ cdef class CppGraphNativeSession:
                         for offset in range(start, end)
                     )
                 )
+                start = result.degraded_node_offsets[output_index][item_index]
+                end = result.degraded_node_offsets[output_index][item_index + 1]
+                degraded_nodes.append(
+                    tuple(
+                        result.degraded_nodes[output_index][offset]
+                        for offset in range(start, end)
+                    )
+                )
             python_outputs.append(
                 (
                     values,
@@ -454,6 +474,7 @@ cdef class CppGraphNativeSession:
                     tuple(output.statuses),
                     tuple(provenance),
                     tuple(invalid_nodes),
+                    tuple(degraded_nodes),
                     tuple(result.metadata_source_indices[output_index]),
                     output.timebase_denominator,
                     output.received_count,
