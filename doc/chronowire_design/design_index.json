@@ -1,6 +1,6 @@
 {
   "project": "Chronowire",
-  "document_count": 14,
+  "document_count": 15,
   "documents": [
     "README.md",
     "01_基本設計.md",
@@ -15,6 +15,7 @@
     "10_Native_Executor設計方針.md",
     "11_Buffer_Scheduler_PortablePlanIR設計.md",
     "12_v0.1_v0.2リリース方針.md",
-    "13_CppExecutor移行測定.md"
+    "13_CppExecutor移行測定.md",
+    "14_Operation設計.md"
   ]
 }

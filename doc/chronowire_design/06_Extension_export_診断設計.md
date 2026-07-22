@@ -1,5 +1,10 @@
 # Extension・export・診断設計
 
+本書の`KernelExecutionError`等はv0.4実装の例外名である。Operation移行後も、安全な劣化結果を
+DEGRADED/INVALIDとして保存する意味論は変えない。implementation不足、shape、Config、ABI違反に
+Node、Port、operation ID、input名を含める追加契約は[14_Operation設計.md](14_Operation設計.md)を
+正本とし、例外classのrename時期はOperation実装段階で決める。
+
 # 1. Extension
 
 ## 1.1 目的

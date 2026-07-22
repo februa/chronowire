@@ -22,13 +22,20 @@ cw.skip
 cw.emit_many
 cw.Source
 cw.RealtimeSource
-cw.Kernel
-cw.CompiledKernel
-cw.CompiledKernelSession
+cw.operation
+cw.declare_operation
+cw.OperationSpec
+cw.OperationInputSpec
+cw.OperationOutputSpec
+cw.ValueSpec
+cw.ConfigSpec
 cw.GraphInfo
 ```
 
 内部Graph、Scheduler、Node、Edge、Portは原則としてトップレベル公開しない。
+`Kernel`、`CompiledKernel`、`CompiledKernelSession`はv0.4実装からの移行用内部概念とし、新しい
+Flow利用者へ公開しない。Operation APIの完全な契約は[14_Operation設計.md](14_Operation設計.md)を
+正本とする。
 
 ## 2. Flow生成
 
@@ -71,7 +78,7 @@ out = flow.map(process)
 out = signal.map(
     combine,
     reference=reference_flow,
-    gain=0.5,
+    calibration=calibration_state,
 )
 ```
 
@@ -79,33 +86,30 @@ out = signal.map(
 
 | 種別 | Graph上の意味 |
 |---|---|
-| 通常の値 | 定数Node parameter |
 | Flow | 同期入力Edge |
 | StateFlow | latest state入力 |
-| Config | Nodeが参照する不変な設定scope |
+| 固定値 | 現在の不変Config scopeからOperationSpecに従って解決 |
+
+receiver FlowはOperationSpecのprimary inputへ、追加Flow/StateFlowは名前でbindする。宣言Operationでは
+未知の通常値をNode parameterとして受理しない。v0.4 plain callable adapterだけは互換のため既存の
+通常値引数を扱えるが、portable native Operationへ移行するときは固定値をConfig、時変値をFlowへ移す。
 
 ### 3.1 Config自動注入
 
-以下の両方を許す。
+宣言OperationのPython参照実装は次の統一契約を使う。
 
 ```python
-def process(x):
-    ...
-
-def process_with_config(x, config):
+@cw.operation(operation_id="example.process.v1", output="same")
+def process(inputs, config):
     ...
 ```
 
-ユーザーはどちらも同じように登録する。
+`inputs`はprimary、synchronous、latestを含む不変な名前付き入力集合、`config`はOperationSpecが選んだ
+subtreeだけのConfigViewである。`map(process, config=config)`は提供しない。scopeを変更する場合は
+`flow.with_config(config)`を明示し、Nodeがどのscopeを参照するかをGraphへ記録する。
 
-```python
-flow.map(process)
-flow.map(process_with_config)
-```
-
-`map(process, config=config)`は提供しない。scopeを変更する場合は`flow.with_config(config)`を明示し、Nodeがどのscopeを参照するかをGraphへ記録する。
-
-シグネチャ解析はcompile時に一度だけ行い、runごとに`inspect.signature()`を呼ばない。
+plain callableはPython-only試作用として既存signatureを維持し、adapterのシグネチャ解析はcompile時に
+一度だけ行う。runごとに`inspect.signature()`を呼ばない。
 
 ### 3.2 データ移動と設定を分ける
 
@@ -131,13 +135,13 @@ return cw.skip()             # 0 Emission
 return cw.emit_many(values)  # 複数Emission
 ```
 
-通常のlistやtupleは一つの値として扱い、暗黙に複数Emissionへ展開しない。`emit_many()`の各値には、Kernelが明示的な時間変換を宣言しない限り入力intervalを引き継ぐ。
+通常のlistやtupleは一つの値として扱い、暗黙に複数Emissionへ展開しない。`emit_many()`の各値には、Operationが明示的な時間変換を宣言しない限り入力intervalを引き継ぐ。
 
-`emit_many()`を返せるKernelまたはPython callableは、一回の呼出しで生成するEmission上限をdescriptorの`max_items`へ宣言する。単一値または`skip()`だけを返す処理のdefaultは`max_items=1`とする。上限を超えた呼出しは契約違反であり、その呼出しの出力を一件も公開しない。plain callableへ上限を付与する具体的なdecoratorまたはadapter APIは、Kernel descriptor実装時に一つへ統一する。
+`emit_many()`を返せるOperationまたはPython callableは、一回の呼出しで生成するEmission上限をdescriptorの`max_items`へ宣言する。単一値または`skip()`だけを返す処理のdefaultは`max_items=1`とする。上限を超えた呼出しは契約違反であり、その呼出しの出力を一件も公開しない。
 
 ### 3.4 Config参照path
 
-Python callableがConfigを受け取る場合、主APIでは`map()`に参照pathを明示する。
+plain Python callableがConfigを受け取る場合、互換APIでは`map()`に参照pathを明示する。
 
 ```python
 out = flow.map(
@@ -146,7 +150,8 @@ out = flow.map(
 )
 ```
 
-再利用可能なKernel用decoratorは補助APIとし、v0.1の必須機能にはしない。`config_paths`を省略したcallableはConfig scope全体へ依存するとみなす。
+宣言Operationは`ConfigSpec(scope=..., fields=...)`へleaf依存を記載し、呼出し側の`config_paths`を
+使用しない。`config_paths`を省略したplain callableはConfig scope全体へ依存するとみなす。
 
 ## 4. frame()
 
@@ -173,7 +178,7 @@ def frame(
 
 - `hop=None`なら`hop=size`
 - frameはバッファリング機能でありSTFTではない
-- window処理やFFTはKernel側の責務
+- window処理やFFTは外部DSP Operation側の責務
 - 出力は入力の論理区間を保持する
 
 ## 5. rate()
@@ -184,7 +189,7 @@ out = flow.rate(100.0)
 
 `rate()`は論理的な出力周期・起動周期を制御する。
 
-数値補間、デシメーションフィルタ、アンチエイリアス処理はChronowire coreの責務ではない。必要な数値処理はKernelへ委譲する。
+数値補間、デシメーションフィルタ、アンチエイリアス処理はChronowire coreの責務ではない。必要な数値処理はOperationへ委譲する。
 
 候補policy:
 
@@ -201,7 +206,7 @@ v0.1は`HOLD`だけを実装する。入力Emissionのinterval内にある発火
 
 rate/frameの正規形は`flow.rate(...).frame(...)`とする。`frame(...).rate(...)`は、完成済みframeをHOLDして複製するか、一部のframeを使わない経路を作れるためcompile errorとする。preserve MAPを挟んでも旧frame格子は継続するため同じく拒否する。
 
-frame列を入力に取る数値resamplingが必要な場合は、外部Kernelを`time_transform="explicit"`としてFlowへ置き、旧格子を終了する。その出力を直接frame化せず、`rate(...).frame(...)`で新しい有理周期とframe境界を宣言する。RATEを含む完全同期入力はdurationとperiodの一致を静的に証明できなければcompile errorとし、runtimeのdropやstallで帳尻を合わせない。
+frame列を入力に取る数値resamplingが必要な場合は、外部Operationを`time="explicit"`としてFlowへ置き、旧格子を終了する。その出力を直接frame化せず、`rate(...).frame(...)`で新しい有理周期とframe境界を宣言する。RATEを含む完全同期入力はdurationとperiodの一致を静的に証明できなければcompile errorとし、runtimeのdropやstallで帳尻を合わせない。
 
 下流にRATE Nodeを持つgenerated Sourceについては、compileがSourceごとの最短rate周期を求め、その周期を`SourceRequest.duration`に使用する。
 
