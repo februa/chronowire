@@ -376,8 +376,9 @@ Stage入力batchを所有結果としてadapterへ渡す。adapterはstage IDの
 `abort()`状態に従い、run-local Python session群をStageにつき一回dispatchする。Python出力は
 shape/time/statusを検証して合成SOURCE ingressへ一回copyし、C++ suffixを再開する。fan-out、
 0/複数Emission、RATE/FRAME、status/Diagnostic、例外後の再実行を照合済みである。
-複数入力、zero-copy、PlanSessionは未対応capabilityとして
-Stage/Node/Port/binding付きで拒否する。all-native hot pathは変更しない。
+native→Python複数入力は`synchronous`完全interval一致と`latest`選択を実装済みである。
+Python→native複数ingress、contains/overlaps/tolerance境界codec、zero-copy、mixed PlanSessionは
+未対応capabilityとしてStage/Node/Port/binding付きで拒否する。all-native hot pathは変更しない。
 
 ### Phase 3: 最小Cython Executor
 

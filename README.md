@@ -135,7 +135,9 @@ Python Stage境界として明示する。CppExecutorは、all-Python Planを単
 C++側の`advance()` / `resume()`状態とGIL下のadapterを通して実行できる。Python/native mixed
 Planは、Python islandの前後にnative区間を置き、固定shape f64 batchを境界ごと一回copyする。
 Sourceを含むPython prefixまたはnative prefixのどちらから始まる線形Planでも、複数Python islandを
-実行できる。複数入力境界、fixed-schema zero-copy、継続PlanSessionは段階実装中である。
+実行できる。native区間からPython islandへ入る複数Portは`synchronous`と`latest`をStage単位で
+照合できる。Pythonからnativeへの複数ingress、fixed-schema zero-copy、mixed継続PlanSessionは
+段階実装中である。
 
 C++ Executor移行判断用benchmarkは、Plan全体、Source/tick packing、RATE/FRAME、CBF、collector
 復元を分離して測定し、copy byteとPython/native境界数をJSONへ保存する。

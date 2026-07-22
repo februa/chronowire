@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import chronowire as cw
-from chronowire.cpp_executor import CppMultiIslandExecutionSession
+from chronowire.cpp_executor import CppMixedExecutionSession, CppMultiIslandExecutionSession
 
 _MODULE_SOURCE = r"""
 #include "native_operation_abi.h"
@@ -387,6 +387,91 @@ def test_operation_implementation_selection_is_independent_from_executor(
     with pytest.raises(cw.KernelExecutionError, match="intentional multi-island failure"):
         retryable.run(executor="cpp")
     assert retryable.run(executor="cpp").outputs[0].emissions
+
+
+@pytest.mark.parametrize("input_mode", ["synchronous", "latest"])
+def test_cpp_executor_runs_multiple_input_python_stage_boundary(
+    tmp_path: Path,
+    input_mode: str,
+) -> None:
+    """native分岐から同期・latestの複数Portを一つのPython islandへ渡す。"""
+
+    native = _operation()
+
+    @cw.operation(
+        operation_id=f"test.multi_input_{input_mode}.v1",
+        inputs={
+            "signal": cw.OperationInputSpec(
+                primary=True,
+                value=cw.ValueSpec(dtype="float64", shape=(2,)),
+            ),
+            "reference": cw.OperationInputSpec(
+                mode=input_mode,
+                value=cw.ValueSpec(dtype="float64", shape=(2,)),
+            ),
+        },
+        output="same",
+    )
+    def combine(inputs: Mapping[str, object], config: cw.ConfigView) -> object:
+        del config
+        signal = inputs["signal"]
+        reference = inputs["reference"]
+        assert isinstance(signal, tuple)
+        assert isinstance(reference, tuple)
+        return tuple(
+            float(signal_value) + float(reference_value)
+            for signal_value, reference_value in zip(signal, reference, strict=True)
+        )
+
+    backend = cw.NativeModuleBackend(cw.NativeOperationModule(_build_module(tmp_path)))
+    source = cw.Flow(
+        cw.f64_vector_source([(1.0, 2.0), (3.0, 4.0)], width=2),
+        cw.Config(dsp={"scale": {"factor": 2.0}}),
+    )
+    reference = source.map(native)
+    signal = reference.map(native)
+    reference_input: object = reference if input_mode == "synchronous" else reference.latest()
+    combined = signal.map(combine, reference=reference_input)
+    terminal_plan = cw.compile(
+        [cw.output(combined, collector=cw.Bounded(2))],
+        backend="python",
+        implementations={native.operation_id: backend},
+    )
+    terminal_session = terminal_plan.create_session(executor="cpp")
+
+    assert isinstance(terminal_session, CppMixedExecutionSession)
+    assert [
+        stage.input_port_ids
+        for stage in terminal_plan.portable_ir.stages
+        if stage.execution_domain == "python"
+    ] == [(2, 1)]
+    assert terminal_session.run() == terminal_plan.run(executor="python")
+    assert terminal_session.last_metrics is not None
+    assert terminal_session.last_metrics.stage_boundary_batches == 2
+    assert terminal_session.last_metrics.copied_batches == 2
+
+    # 二つ目のPython islandも置き、multi-island sessionが複数入力境界を扱うことを確認する。
+    result_flow = combined.map(native).map(lambda value: value)
+    plan = cw.compile(
+        [cw.output(result_flow, collector=cw.Bounded(2))],
+        backend="python",
+        implementations={native.operation_id: backend},
+    )
+
+    python_result = plan.run(executor="python")
+    cpp_session = plan.create_session(executor="cpp")
+    cpp_result = cpp_session.run()
+
+    assert cpp_result == python_result
+    assert [item.value for item in cpp_result.outputs[0].emissions] == [
+        (12.0, 24.0),
+        (36.0, 48.0),
+    ]
+    assert isinstance(cpp_session, CppMultiIslandExecutionSession)
+    assert cpp_session.last_metrics is not None
+    assert cpp_session.last_metrics.stage_python_dispatches == 2
+    assert cpp_session.last_metrics.stage_boundary_batches == 4
+    assert cpp_session.last_metrics.copied_batches == 4
 
 
 def test_compile_rejects_unknown_operation_implementation_selector(tmp_path: Path) -> None:
