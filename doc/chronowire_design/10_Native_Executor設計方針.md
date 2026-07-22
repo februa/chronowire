@@ -158,6 +158,12 @@ version付きC ABI module tableがoperation ID、implementation ID、create/proc
 symbolic shapeはOperationSpecでcompile時に解決し、native moduleはresolved schemaとBufferViewだけを
 再検証する。詳細は[14_Operation設計.md](14_Operation設計.md#8-native-moduleとc-abi)を参照する。
 
+v0.4では`NativeOperationModule`が明示された共有libraryをloadし、module ABI、entry size、重複ID、
+function table、flush flag、alignmentを検証する。`NativeModuleBackend`はConfigをimmutable parameterへ
+固定し、CppExecutorはfunction addressからrun-local sessionをcreate/process/destroyする。moduleが返した
+statusとDiagnosticはC++内でcopyし、collector境界でNode、Port、interval付き公開Diagnosticへ戻す。
+共有libraryのpathとhandleはPortablePlanIRへ含めず、別processではImplementationBindingを再注入する。
+
 Kernel ABIは少なくともversion、session生成、process、flush、session破棄、workspace requirement、error codeを持つ。C++例外をABI境界外へ出さず、失敗はerror codeとDiagnosticへ変換する。
 
 compile時にはworkspaceのsize、alignment、device要件だけを決定し、実bufferはrun-local sessionが確保・解放する。PortablePlanIRにはABI IDとdescriptorを置き、pointerやallocator instanceはExecutionBindingsへ置く。

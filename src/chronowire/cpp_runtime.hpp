@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "native_operation_abi.h"
+
 namespace chronowire::cpp_runtime {
 
 /**
@@ -110,7 +112,11 @@ private:
     int overflow_policy_;
 };
 
-/** @brief PortablePlanIRの一NodeをC++ DAG runtimeへ渡す固定descriptor。 */
+/**
+ * @brief PortablePlanIRの一NodeをC++ DAG runtimeへ渡す固定descriptor。
+ *
+ * native function addressはprocess-local bindingから設定し、IRへserializeしない。
+ */
 struct GraphNodeSpec {
     std::int64_t node_id = -1;
     int opcode = -1;
@@ -129,6 +135,10 @@ struct GraphNodeSpec {
     std::vector<double> kernel_parameters;
     std::vector<std::size_t> parameter_shape;
     std::vector<std::size_t> output_shape;
+    std::uintptr_t native_create = 0;
+    std::uintptr_t native_process = 0;
+    std::uintptr_t native_flush = 0;
+    std::uintptr_t native_destroy = 0;
 };
 
 /** @brief 一つの観測Portに適用するnative collector descriptor。 */
@@ -155,6 +165,11 @@ struct GraphRuntimeResult {
     std::vector<std::vector<std::size_t>> invalid_node_offsets;
     std::vector<std::vector<std::int64_t>> degraded_nodes;
     std::vector<std::vector<std::size_t>> degraded_node_offsets;
+    std::vector<std::vector<std::int64_t>> native_diagnostic_nodes;
+    std::vector<std::vector<std::uint8_t>> native_diagnostic_severities;
+    std::vector<std::vector<std::string>> native_diagnostic_codes;
+    std::vector<std::vector<std::string>> native_diagnostic_messages;
+    std::vector<std::vector<std::size_t>> native_diagnostic_offsets;
     std::vector<std::vector<std::int64_t>> metadata_source_indices;
     std::vector<std::int64_t> status_counts;
     std::uint64_t scheduler_ns = 0;

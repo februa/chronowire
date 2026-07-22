@@ -327,7 +327,8 @@ Config scope/path/digest/leaf型、time/Emission/status/state/gap規則、implem
 宣言Operationを含むPlanだけをschema 0.4としてexportし、legacy KernelだけのPlanはschema 0.3を維持する。
 schema 0.1〜0.3 readerは維持し、identity/固定CBF等の既存ABIを黙って別Operationへ変換しない。schema 0.4
 Python Operationはprocess-local `ImplementationBinding`のoperation/implementation IDとABIを照合して
-再bindできる。native module探索とC ABI module tableのbindingは後続実装とする。
+再bindできる。C ABI v1 moduleは明示pathからprocess-localにloadし、binding slotのoperation ID、
+implementation ID、ABI versionと照合する。library path、module handle、function addressはIRへ保存しない。
 
 ## 8. compile時のbuffer planning
 

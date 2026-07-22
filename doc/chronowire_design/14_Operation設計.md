@@ -424,6 +424,11 @@ ImplementationBindingはcompile時に選択済みであり、利用者へ再度B
 C++/Cython sourceへPython decoratorは書かない。native moduleはversion付きC ABI module tableを
 exportする。
 
+v0.4の正本headerは`src/chronowire/native_operation_abi.h`とする。moduleは
+`chronowire_operation_module_v1()` symbolから`CwOperationModuleV1`を返す。公開loaderは
+`NativeOperationModule(path)`、Backendは`NativeModuleBackend(module)`である。library path、CDLL handle、
+function addressは`NativeOperationEntry`と`NativeOperationRuntimeBinding`だけがprocess-localに保持する。
+
 ```c
 typedef struct {
     const char* operation_id;
@@ -450,6 +455,13 @@ slot順のread-only BufferView列を受け、出力BufferView列とEmission meta
 native implementationはsymbolic shape規則を重複実装しない。Compilerが解決したschemaを受理できるか、
 runtime bufferがそのschema、byte長、stride、alignment、deviceに一致するかだけを検証する。module handle
 とfunction table pointerはImplementationBindingがprocess-localに保持する。
+
+v0.4 module ABIは成立経路を固定するため、連続float64の固定shape input、単一固定shape output、process
+一回につき一Emissionへ限定する。ConfigはOperationSpecのfield順にfloat64 scalarまたは数値tupleへflatten
+してcreateへ渡す。processは0から2のstatusと、任意のDiagnostic severity/code/messageを返せる。Executorは
+入力Diagnosticを保持し、module DiagnosticへNode、Port、intervalを付与する。create/process/destroyは必須、
+flush pointerとcapability flagは一致必須である。v0.4 CppExecutorはflush出力を要求するOperationをまだ受理
+しない。可変出力、複数output Port、typed Config table、device BufferViewはABI versionを更新して追加する。
 
 ## 9. 状態、時間、status、劣化
 
@@ -657,14 +669,14 @@ operation IDへ登録する。利用者はKernel class、ABI ID、session factor
    schema 0.1〜0.3互換reader。resolved schemaとConfig依存を保存する
 5. **初期実装済み**: Python Backendとrunごとに生成するPython OperationSession。公開のmutable state
    factoryは未実装
-6. **一部実装済み**: MissingImplementation、shape、Config scope/leaf、Python ImplementationBindingの
-   ID/ABI不一致を明示エラーにする。native module ABIエラーは手順7以降で実装する
-7. **一部実装済み**: process-local ImplementationBindingと別process相当の再bind。C ABI module manifest
-   loader、library探索、module lifetime管理は未実装
+6. **実装済み**: MissingImplementation、shape、Config scope/leaf、Python/C ABI ImplementationBindingの
+   ID/ABI不一致を明示エラーにする
+7. **初期実装済み**: process-local ImplementationBindingと別process相当の再bind。C ABI v1 module table、
+   明示path loader、module lifetime管理を実装。package discoveryと署名検証は未実装
 8. **参照経路を実装済み**: C++ Backend選択結果をPythonExecutorで実行するconformance。周期MVDRの
    累積共分散、重み生成、latest適用を同一OperationSpecで検証する。汎用module loaderは手順7の残件
-9. **一部実装済み**: schema 0.4 OperationDescriptorをCppExecutorが読み、複数入力、LATEST、SAMPLE、
-   run-local stateを登録済みMVDR ABIで実行する。generic C ABI module tableと動的bindingは未実装
+9. **初期実装済み**: schema 0.4 OperationDescriptorをCppExecutorが読み、複数入力、LATEST、SAMPLE、
+   run-local stateを登録済みABIまたは外部C ABI module tableから実行する。固定shape float64単一outputが範囲
 10. **未実装**: Fixed CBF参照packageを新APIへ移行し、旧APIをdeprecated化
 
 初期実装では`@cw.operation`と`cw.declare_operation()`を`Flow.map()`へ渡せる。receiver、同期Flow、
@@ -677,8 +689,9 @@ binding slotを正本として記録する。`ImplementationDescriptor`はID、B
 workspace、CPU featureを記録し、Python callable、shape resolver、native pointer、module handle、library
 pathは保存しない。legacy KernelだけのPlanはschema 0.3を維持し、0.1〜0.3 readerも削除しない。
 
-schema 0.4のPython Operation Planは、IR、Config、Source/Collector、およびprocess-local
-`ImplementationBinding`から再bindして実行できる。native moduleの探索と再bindは手順7の残件である。
+schema 0.4のOperation Planは、IR、Config、Source/Collector、およびprocess-local
+`ImplementationBinding`から再bindして実行できる。native moduleは明示pathからloadし、operation ID、
+implementation ID、ABI versionを照合する。暗黙のfilesystem探索は行わない。
 
 各段階でPython基準traceとの値、interval、sequence、status、Diagnostic、metadata同値を確認する。
 
@@ -715,7 +728,7 @@ OperationSpec/ImplementationSpec境界で提供する。
 1. `ValueSpec.shape`のsymbol/Config dimensionを表す最終Python構文。意味論は本書どおり固定する。
 2. 複数output Portを返す公開helper名。Port数とEmission件数を分離することは確定済み。
 3. Operation registryの発見範囲と同じoperation/implementation ID重複時の明示的解決API。
-4. native moduleの配布・署名・ABI compatibility確認とlibrary探索方法。
+4. native moduleの配布・署名、および明示pathより上位のpackage discovery規則。
 5. Config値をImplementationBindingへimmutable bytesとして渡す標準型の範囲。
 6. optional inputとdefault値をConfig、欠損同期入力、OperationSpecのどこで表すか。
 7. `time="explicit"`のportable出力interval descriptorとshape resolver DSLの最小表現。

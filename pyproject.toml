@@ -58,7 +58,13 @@ extra-compile-args = ["-std=c++17"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-chronowire = ["py.typed", "_cython_executor.pyi", "_cpp_executor.pyi", "cpp_runtime.hpp"]
+chronowire = [
+  "py.typed",
+  "_cython_executor.pyi",
+  "_cpp_executor.pyi",
+  "cpp_runtime.hpp",
+  "native_operation_abi.h",
+]
 chronowire_reference = ["_cython_cbf.pyi", "py.typed"]
 
 [tool.pytest.ini_options]

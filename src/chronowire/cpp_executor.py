@@ -16,6 +16,7 @@ from .graph import NodeKind, RatePolicy
 from .kernel import NativeRuntimeBindingProvider
 from .model import Diagnostic, Emission, EmissionStatus, LogicalInterval, LogicalTime, Severity
 from .native import F64VectorSourceValues
+from .native_module import NativeOperationRuntimeBinding
 from .runtime import (
     ExecutionPlan,
     OutputResult,
@@ -162,6 +163,7 @@ class CppExecutionSession(ExecutorSession):
             process_model = ""
             parameter_bytes = b""
             parameter_shape: tuple[int, ...] = ()
+            native_functions = (0, 0, 0, 0)
             if node.kind is NodeKind.MAP:
                 compiled = self.plan._compiled_kernels.get(node.id)
                 if not isinstance(compiled, NativeRuntimeBindingProvider):
@@ -185,6 +187,18 @@ class CppExecutionSession(ExecutorSession):
                 process_model = binding.process_model
                 parameter_bytes = binding.parameter_bytes
                 parameter_shape = binding.parameter_shape
+                if isinstance(binding, NativeOperationRuntimeBinding):
+                    if binding.flush_address:
+                        raise ValueError(
+                            "CppExecutor contract=native_module_flush is not supported; "
+                            f"node={node.id} port={node.output_port}"
+                        )
+                    native_functions = (
+                        binding.create_address,
+                        binding.process_address,
+                        binding.flush_address,
+                        binding.destroy_address,
+                    )
             shape = port_schemas[node.output_port].shape
             if shape is None:
                 raise ValueError(
@@ -211,6 +225,7 @@ class CppExecutionSession(ExecutorSession):
                     parameter_bytes,
                     parameter_shape,
                     shape,
+                    *native_functions,
                 )
             )
         portable_outputs: list[tuple[int, int, int, int]] = []
@@ -272,6 +287,7 @@ class CppExecutionSession(ExecutorSession):
             provenance,
             invalid_nodes,
             degraded_nodes,
+            native_diagnostics,
             metadata_indices,
             timebase_denominator,
             received_count,
@@ -291,6 +307,7 @@ class CppExecutionSession(ExecutorSession):
             provenance,
             invalid_nodes,
             degraded_nodes,
+            native_diagnostics,
             metadata_indices,
             strict=True,
         )
@@ -305,6 +322,7 @@ class CppExecutionSession(ExecutorSession):
             source_indices,
             skipped_nodes,
             insufficient_nodes,
+            module_diagnostics,
             metadata_index,
         ) in rows:
             if prod(shape) != value_end - value_start:
@@ -342,6 +360,18 @@ class CppExecutionSession(ExecutorSession):
                     interval=interval,
                 )
                 for node_id in insufficient_nodes
+            )
+            severity_values = (Severity.INFO, Severity.WARNING, Severity.ERROR)
+            diagnostics += tuple(
+                Diagnostic(
+                    severity_values[severity],
+                    code,
+                    message,
+                    node_id=node_id,
+                    port_id=self._node_ports[node_id],
+                    interval=interval,
+                )
+                for severity, node_id, code, message in module_diagnostics
             )
             metadata = (
                 self._source_emissions[metadata_index].metadata if metadata_index >= 0 else {}

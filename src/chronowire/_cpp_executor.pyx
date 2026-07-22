@@ -3,7 +3,7 @@
 
 from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize
 from libc.stddef cimport size_t
-from libc.stdint cimport int64_t, uint8_t, uint64_t
+from libc.stdint cimport int64_t, uint8_t, uint64_t, uintptr_t
 from libcpp.string cimport string
 from libcpp.vector cimport vector
 
@@ -83,6 +83,10 @@ cdef extern from "cpp_runtime.hpp" namespace "chronowire::cpp_runtime":
         vector[double] kernel_parameters
         vector[size_t] parameter_shape
         vector[size_t] output_shape
+        uintptr_t native_create
+        uintptr_t native_process
+        uintptr_t native_flush
+        uintptr_t native_destroy
 
     cdef cppclass GraphOutputSpec:
         GraphOutputSpec() except +
@@ -101,6 +105,11 @@ cdef extern from "cpp_runtime.hpp" namespace "chronowire::cpp_runtime":
         vector[vector[size_t]] invalid_node_offsets
         vector[vector[int64_t]] degraded_nodes
         vector[vector[size_t]] degraded_node_offsets
+        vector[vector[int64_t]] native_diagnostic_nodes
+        vector[vector[uint8_t]] native_diagnostic_severities
+        vector[vector[string]] native_diagnostic_codes
+        vector[vector[string]] native_diagnostic_messages
+        vector[vector[size_t]] native_diagnostic_offsets
         vector[vector[int64_t]] metadata_source_indices
         vector[int64_t] status_counts
         uint64_t scheduler_ns
@@ -361,6 +370,10 @@ cdef class CppGraphNativeSession:
                 node.parameter_shape.push_back(extent)
             for extent in descriptor[16]:
                 node.output_shape.push_back(extent)
+            node.native_create = descriptor[17]
+            node.native_process = descriptor[18]
+            node.native_flush = descriptor[19]
+            node.native_destroy = descriptor[20]
             native_nodes.push_back(node)
         for descriptor in outputs:
             output = GraphOutputSpec()
@@ -414,6 +427,10 @@ cdef class CppGraphNativeSession:
         cdef list provenance
         cdef list invalid_nodes
         cdef list degraded_nodes
+        cdef list native_diagnostics
+        cdef list item_native_diagnostics
+        cdef bytes code_bytes
+        cdef bytes message_bytes
         cdef bytes values
 
         # C++ sessionは全Plan/inputを所有しPython callbackを持たない。
@@ -433,6 +450,7 @@ cdef class CppGraphNativeSession:
             provenance = []
             invalid_nodes = []
             degraded_nodes = []
+            native_diagnostics = []
             for item_index in range(output.retained_count):
                 start = result.shape_offsets[output_index][item_index]
                 end = result.shape_offsets[output_index][item_index + 1]
@@ -463,6 +481,21 @@ cdef class CppGraphNativeSession:
                         for offset in range(start, end)
                     )
                 )
+                start = result.native_diagnostic_offsets[output_index][item_index]
+                end = result.native_diagnostic_offsets[output_index][item_index + 1]
+                item_native_diagnostics = []
+                for offset in range(start, end):
+                    code_bytes = result.native_diagnostic_codes[output_index][offset]
+                    message_bytes = result.native_diagnostic_messages[output_index][offset]
+                    item_native_diagnostics.append(
+                        (
+                            result.native_diagnostic_severities[output_index][offset],
+                            result.native_diagnostic_nodes[output_index][offset],
+                            code_bytes.decode("utf-8"),
+                            message_bytes.decode("utf-8"),
+                        )
+                    )
+                native_diagnostics.append(tuple(item_native_diagnostics))
             python_outputs.append(
                 (
                     values,
@@ -475,6 +508,7 @@ cdef class CppGraphNativeSession:
                     tuple(provenance),
                     tuple(invalid_nodes),
                     tuple(degraded_nodes),
+                    tuple(native_diagnostics),
                     tuple(result.metadata_source_indices[output_index]),
                     output.timebase_denominator,
                     output.received_count,

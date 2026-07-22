@@ -1,10 +1,12 @@
 #include "cpp_runtime.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <unordered_map>
@@ -391,6 +393,13 @@ struct GraphItem {
     std::vector<std::int64_t> provenance;
     std::vector<std::int64_t> invalid_nodes;
     std::vector<std::int64_t> degraded_nodes;
+    struct NativeDiagnostic {
+        std::uint8_t severity = 0;
+        std::int64_t node_id = -1;
+        std::string code;
+        std::string message;
+    };
+    std::vector<NativeDiagnostic> native_diagnostics;
     std::int64_t metadata_source_index = -1;
     std::int64_t segment = 0;
 };
@@ -414,9 +423,19 @@ enum class GraphKernelKind {
     covariance_f64,
     mvdr_weights_f64,
     apply_weights_f64,
+    external_operation,
 };
 
 GraphKernelKind resolve_graph_kernel(const GraphNodeSpec& node) {
+    const bool has_external_entry =
+        node.native_create != 0 && node.native_process != 0 && node.native_destroy != 0;
+    if (has_external_entry) {
+        return GraphKernelKind::external_operation;
+    }
+    if (node.native_create != 0 || node.native_process != 0 || node.native_flush != 0 ||
+        node.native_destroy != 0) {
+        throw std::invalid_argument("CppExecutor contract=native_module_function_table");
+    }
     if (node.kernel_abi == "chronowire.kernel.identity_f64.v1" &&
         node.process_model == "identity_f64") {
         return GraphKernelKind::identity_f64;
@@ -439,6 +458,113 @@ GraphKernelKind resolve_graph_kernel(const GraphNodeSpec& node) {
     }
     throw std::invalid_argument("CppExecutor contract=kernel_abi_table");
 }
+
+class ExternalOperationSession {
+public:
+    explicit ExternalOperationSession(const GraphNodeSpec& node) : node_(node) {
+        create_ = reinterpret_cast<CwCreateFnV1>(node.native_create);
+        process_ = reinterpret_cast<CwProcessFnV1>(node.native_process);
+        destroy_ = reinterpret_cast<CwDestroyFnV1>(node.native_destroy);
+        std::array<char, 512> error{};
+        session_ = create_(
+            node.kernel_parameters.empty() ? nullptr : node.kernel_parameters.data(),
+            node.kernel_parameters.size(),
+            error.data(),
+            error.size()
+        );
+        if (session_ == nullptr) {
+            throw std::runtime_error(
+                std::string("CppExecutor contract=native_module_create node=") +
+                std::to_string(node.node_id) + " port=" + std::to_string(node.output_port) +
+                " error=" + error.data()
+            );
+        }
+    }
+
+    ExternalOperationSession(const ExternalOperationSession&) = delete;
+    ExternalOperationSession& operator=(const ExternalOperationSession&) = delete;
+
+    ~ExternalOperationSession() {
+        if (session_ != nullptr && destroy_ != nullptr) {
+            destroy_(session_);
+        }
+    }
+
+    void process(const std::vector<const GraphItem*>& inputs, GraphItem& output) const {
+        std::vector<CwBufferViewV1> views;
+        views.reserve(inputs.size());
+        for (const GraphItem* input : inputs) {
+            views.push_back(CwBufferViewV1{
+                input->values.empty() ? nullptr : input->values.data(),
+                input->values.size(),
+                input->shape.empty() ? nullptr : input->shape.data(),
+                input->shape.size(),
+            });
+        }
+        const std::size_t output_count = checked_shape_product(node_.output_shape);
+        output.values.assign(output_count, 0.0);
+        output.shape = node_.output_shape;
+        CwMutableBufferViewV1 output_view{
+            output.values.empty() ? nullptr : output.values.data(),
+            output.values.size(),
+            output.shape.empty() ? nullptr : output.shape.data(),
+            output.shape.size(),
+        };
+        CwProcessResultV1 process_result{};
+        std::array<char, 512> error{};
+        const int status = process_(
+            session_,
+            views.data(),
+            views.size(),
+            &output_view,
+            &process_result,
+            error.data(),
+            error.size()
+        );
+        if (status != 0) {
+            throw std::runtime_error(
+                std::string("CppExecutor contract=native_module_process node=") +
+                std::to_string(node_.node_id) + " port=" +
+                std::to_string(node_.output_port) + " error=" + error.data()
+            );
+        }
+        if (process_result.output_count != output_count || process_result.status > 2 ||
+            process_result.diagnostic_severity > 2) {
+            throw std::runtime_error(
+                std::string("CppExecutor contract=native_module_result node=") +
+                std::to_string(node_.node_id) + " port=" +
+                std::to_string(node_.output_port)
+            );
+        }
+        output.status = std::max(output.status, process_result.status);
+        const bool has_code = process_result.diagnostic_code != nullptr &&
+            process_result.diagnostic_code[0] != '\0';
+        const bool has_message = process_result.diagnostic_message != nullptr &&
+            process_result.diagnostic_message[0] != '\0';
+        if (has_code != has_message) {
+            throw std::runtime_error(
+                std::string("CppExecutor contract=native_module_diagnostic node=") +
+                std::to_string(node_.node_id) + " port=" +
+                std::to_string(node_.output_port)
+            );
+        }
+        if (has_code) {
+            output.native_diagnostics.push_back(GraphItem::NativeDiagnostic{
+                process_result.diagnostic_severity,
+                node_.node_id,
+                process_result.diagnostic_code,
+                process_result.diagnostic_message,
+            });
+        }
+    }
+
+private:
+    const GraphNodeSpec& node_;
+    CwCreateFnV1 create_ = nullptr;
+    CwProcessFnV1 process_ = nullptr;
+    CwDestroyFnV1 destroy_ = nullptr;
+    void* session_ = nullptr;
+};
 
 GraphBatch run_rate_node(
     const GraphBatch& input,
@@ -535,6 +661,11 @@ GraphBatch run_frame_node(const GraphBatch& input, const GraphNodeSpec& node) {
                     item.degraded_nodes.begin(),
                     item.degraded_nodes.end()
                 );
+                frame.native_diagnostics.insert(
+                    frame.native_diagnostics.end(),
+                    item.native_diagnostics.begin(),
+                    item.native_diagnostics.end()
+                );
             }
             output.push_back(std::move(frame));
             if (node.frame_hop > segment_end - offset) {
@@ -618,6 +749,10 @@ GraphBatch run_map_node(
     std::vector<bool> has_latest(inputs.size(), false);
     std::vector<double> covariance_sums;
     std::size_t covariance_sample_count = 0;
+    std::unique_ptr<ExternalOperationSession> external_session;
+    if (kind == GraphKernelKind::external_operation) {
+        external_session = std::make_unique<ExternalOperationSession>(node);
+    }
     for (const GraphItem& item : input) {
         GraphItem mapped = item;
         mapped.sequence = static_cast<std::int64_t>(output.size());
@@ -651,6 +786,11 @@ GraphBatch run_map_node(
                 latest.degraded_nodes.begin(),
                 latest.degraded_nodes.end()
             );
+            mapped.native_diagnostics.insert(
+                mapped.native_diagnostics.end(),
+                latest.native_diagnostics.begin(),
+                latest.native_diagnostics.end()
+            );
         }
         if (missing) {
             continue;
@@ -664,6 +804,11 @@ GraphBatch run_map_node(
             if (node.output_shape != item.shape) {
                 throw std::invalid_argument("CppExecutor contract=identity_output_shape");
             }
+            output.push_back(std::move(mapped));
+            continue;
+        }
+        if (kind == GraphKernelKind::external_operation) {
+            external_session->process(selected_inputs, mapped);
             output.push_back(std::move(mapped));
             continue;
         }
@@ -1011,6 +1156,11 @@ GraphRuntimeResult GraphRuntimeSession::run(
         std::vector<std::size_t> invalid_offsets = {0};
         std::vector<std::int64_t> degraded_nodes;
         std::vector<std::size_t> degraded_offsets = {0};
+        std::vector<std::int64_t> native_diagnostic_nodes;
+        std::vector<std::uint8_t> native_diagnostic_severities;
+        std::vector<std::string> native_diagnostic_codes;
+        std::vector<std::string> native_diagnostic_messages;
+        std::vector<std::size_t> native_diagnostic_offsets = {0};
         std::vector<std::size_t> shapes;
         std::vector<std::int64_t> metadata_indices;
         if (!output.overflowed) {
@@ -1027,6 +1177,13 @@ GraphRuntimeResult GraphRuntimeSession::run(
                 append_offsets(item.provenance, output.provenance, provenance_offsets);
                 append_offsets(item.invalid_nodes, invalid_nodes, invalid_offsets);
                 append_offsets(item.degraded_nodes, degraded_nodes, degraded_offsets);
+                for (const GraphItem::NativeDiagnostic& diagnostic : item.native_diagnostics) {
+                    native_diagnostic_nodes.push_back(diagnostic.node_id);
+                    native_diagnostic_severities.push_back(diagnostic.severity);
+                    native_diagnostic_codes.push_back(diagnostic.code);
+                    native_diagnostic_messages.push_back(diagnostic.message);
+                }
+                native_diagnostic_offsets.push_back(native_diagnostic_nodes.size());
                 metadata_indices.push_back(item.metadata_source_index);
             }
         }
@@ -1047,6 +1204,11 @@ GraphRuntimeResult GraphRuntimeSession::run(
         result.invalid_node_offsets.push_back(std::move(invalid_offsets));
         result.degraded_nodes.push_back(std::move(degraded_nodes));
         result.degraded_node_offsets.push_back(std::move(degraded_offsets));
+        result.native_diagnostic_nodes.push_back(std::move(native_diagnostic_nodes));
+        result.native_diagnostic_severities.push_back(std::move(native_diagnostic_severities));
+        result.native_diagnostic_codes.push_back(std::move(native_diagnostic_codes));
+        result.native_diagnostic_messages.push_back(std::move(native_diagnostic_messages));
+        result.native_diagnostic_offsets.push_back(std::move(native_diagnostic_offsets));
         result.metadata_source_indices.push_back(std::move(metadata_indices));
     }
     result.output_select_ns = elapsed_ns(select_start, std::chrono::steady_clock::now());

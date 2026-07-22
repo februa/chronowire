@@ -100,6 +100,13 @@ from .native import (
     f64_vector_source,
     identity_f64,
 )
+from .native_module import (
+    MODULE_ABI_V1,
+    NativeModuleBackend,
+    NativeOperationEntry,
+    NativeOperationModule,
+    NativeOperationRuntimeBinding,
+)
 from .operation import (
     ConfigSpec,
     ImplementationBinding,
@@ -205,6 +212,10 @@ __all__ = [
     "NativeCompiledKernel",
     "NativeF64Ingress",
     "NativeKernelRuntimeBinding",
+    "NativeModuleBackend",
+    "NativeOperationEntry",
+    "NativeOperationModule",
+    "NativeOperationRuntimeBinding",
     "NativeRuntimeBindingProvider",
     "NativeValueBatch",
     "NativeValueSchemaProvider",
@@ -258,6 +269,7 @@ __all__ = [
     "identity_f64",
     "kernel_outputs",
     "observe",
+    "MODULE_ABI_V1",
     "operation",
     "output",
     "skip",
