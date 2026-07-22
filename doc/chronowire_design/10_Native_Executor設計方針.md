@@ -340,6 +340,13 @@ PortablePlanIR schema 0.3は最小`StageDescriptor`、`ValueSchemaDescriptor`、
 
 `ExecutionPlan.run()`、`create_session()`、`create_plan_session()`は`Executor`を選択でき、既存runtimeを`PythonExecutor`として使用する。これはExecutor差し替え境界の固定であり、まだNative実行を意味しない。
 
+Operation implementationの選択はcompile時に`backend`既定selectorとoperation IDごとの
+`implementations` overrideで確定し、Executorはrun時に独立して選ぶ。PythonExecutorはPython
+Implementationだけでなく、選択済みC ABI ImplementationをEmission単位で直接呼べるため、native
+Operationのconformanceとデバッグに使う。CppExecutorは全対象Stageがnative対応の場合に同じbindingを
+C++ runtimeから直接呼ぶ。v0.4ではPython Implementationを含むPlanをCppExecutorへ渡した場合は
+Pythonへfallbackせず、該当Nodeとbinding契約を含む明示エラーにする。
+
 ### Phase 3: 最小Cython Executor
 
 - SOURCE、RATE、FRAME、単一native MAP、collector終端に限定する

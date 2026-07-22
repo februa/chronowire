@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ctypes
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,9 @@ _MODULE_SOURCE = r"""
 #include <new>
 
 namespace {
+
+int active_sessions = 0;
+int created_sessions = 0;
 
 void write_error(char* output, size_t capacity, const char* message) {
     if (output != nullptr && capacity > 0) {
@@ -34,7 +39,12 @@ void* create_scale(
         write_error(error_message, error_capacity, "scale requires one parameter");
         return nullptr;
     }
-    return new (std::nothrow) double(parameters[0]);
+    double* session = new (std::nothrow) double(parameters[0]);
+    if (session != nullptr) {
+        ++active_sessions;
+        ++created_sessions;
+    }
+    return session;
 }
 
 int process_scale(
@@ -66,6 +76,9 @@ int process_scale(
 }
 
 void destroy_scale(void* session) {
+    if (session != nullptr) {
+        --active_sessions;
+    }
     delete static_cast<double*>(session);
 }
 
@@ -95,6 +108,14 @@ const CwOperationModuleV1 module = {
 
 extern "C" const CwOperationModuleV1* chronowire_operation_module_v1(void) {
     return &module;
+}
+
+extern "C" int chronowire_test_active_sessions(void) {
+    return active_sessions;
+}
+
+extern "C" int chronowire_test_created_sessions(void) {
+    return created_sessions;
 }
 """
 
@@ -159,13 +180,145 @@ def test_native_module_binds_without_serializing_library_path(tmp_path: Path) ->
     mapped = cw.Flow(source, config).map(_operation())
     plan = cw.compile([cw.output(mapped, collector=cw.Bounded(2))], backend=backend)
 
-    result = plan.run(executor="cpp")
-    assert [item.value for item in result.outputs[0].emissions] == [(-2.0, -4.0), (-6.0, -8.0)]
-    assert all(item.status is cw.EmissionStatus.DEGRADED for item in result.outputs[0].emissions)
-    assert all(item.diagnostics[0].code == "NEGATIVE_SCALE" for item in result.outputs[0].emissions)
+    cpp_result = plan.run(executor="cpp")
+    python_result = plan.run(executor="python")
+    assert python_result == cpp_result
+    assert [item.value for item in cpp_result.outputs[0].emissions] == [
+        (-2.0, -4.0),
+        (-6.0, -8.0),
+    ]
+    assert all(
+        item.status is cw.EmissionStatus.DEGRADED for item in cpp_result.outputs[0].emissions
+    )
+    assert all(
+        item.diagnostics[0].code == "NEGATIVE_SCALE" for item in cpp_result.outputs[0].emissions
+    )
     assert str(module.path) not in plan.portable_ir.to_json()
-    with pytest.raises(cw.KernelExecutionError, match="requires CppExecutor"):
-        plan.run(executor="python")
+
+
+def test_native_module_python_executor_destroys_run_local_session(tmp_path: Path) -> None:
+    """PythonExecutorの成功・PlanSession closeでC ABI destroyを一度だけ呼ぶ。"""
+
+    path = _build_module(tmp_path)
+    module = cw.NativeOperationModule(path)
+    library = ctypes.CDLL(str(path))
+    active_sessions = library.chronowire_test_active_sessions
+    active_sessions.argtypes = []
+    active_sessions.restype = ctypes.c_int
+    backend = cw.NativeModuleBackend(module)
+    config = cw.Config(dsp={"scale": {"factor": 2.0}})
+    mapped = cw.Flow(cw.f64_vector_source([(1.0, 2.0)], width=2), config).map(_operation())
+    plan = cw.compile([cw.output(mapped, collector=cw.Latest())], backend=backend)
+
+    plan.run(executor="python")
+    assert active_sessions() == 0
+
+    session = plan.create_plan_session(executor="python")
+    session.start()
+    assert active_sessions() == 1
+    session.close()
+    assert active_sessions() == 0
+
+
+def test_native_module_python_executor_recreates_session_at_gap(tmp_path: Path) -> None:
+    """gap reset時に旧C ABI sessionを破棄してから新規生成する。"""
+
+    path = _build_module(tmp_path)
+    module = cw.NativeOperationModule(path)
+    library = ctypes.CDLL(str(path))
+    active_sessions = library.chronowire_test_active_sessions
+    active_sessions.argtypes = []
+    active_sessions.restype = ctypes.c_int
+    created_sessions = library.chronowire_test_created_sessions
+    created_sessions.argtypes = []
+    created_sessions.restype = ctypes.c_int
+    overrun = cw.Diagnostic(cw.Severity.WARNING, "INPUT_OVERRUN", "test gap")
+    values = [
+        cw.Emission(
+            (1.0, 2.0),
+            cw.LogicalInterval(cw.LogicalTime(0), cw.LogicalTime(1)),
+            0,
+        ),
+        cw.Emission(
+            (3.0, 4.0),
+            cw.LogicalInterval(cw.LogicalTime(2), cw.LogicalTime(3)),
+            1,
+            cw.EmissionStatus.DEGRADED,
+            (overrun,),
+        ),
+    ]
+    config = cw.Config(dsp={"scale": {"factor": 2.0}})
+    mapped = cw.Flow(cw.f64_vector_source(values, width=2), config).map(_operation())
+    plan = cw.compile(
+        [cw.output(mapped, collector=cw.Bounded(2))],
+        backend=cw.NativeModuleBackend(module),
+    )
+
+    plan.run(executor="python")
+
+    assert created_sessions() == 2
+    assert active_sessions() == 0
+
+
+def test_operation_implementation_selection_is_independent_from_executor(
+    tmp_path: Path,
+) -> None:
+    """OperationごとのPython/C++実装選択とPlan Executor選択を分離する。"""
+
+    native = _operation()
+
+    @cw.operation(
+        operation_id="test.python_shift.v1",
+        inputs={
+            "input": cw.OperationInputSpec(
+                primary=True,
+                value=cw.ValueSpec(dtype="float64", shape=(2,)),
+            )
+        },
+        output="same",
+    )
+    def shift(inputs: Mapping[str, object], config: cw.ConfigView) -> object:
+        del config
+        values = inputs["input"]
+        assert isinstance(values, tuple)
+        return tuple(float(value) + 1.0 for value in values)
+
+    module = cw.NativeOperationModule(_build_module(tmp_path))
+    native_backend = cw.NativeModuleBackend(module)
+    config = cw.Config(dsp={"scale": {"factor": 2.0}})
+    source = cw.Flow(cw.f64_vector_source([(1.0, 2.0)], width=2), config)
+    shifted = source.map(native).map(shift)
+    plan = cw.compile(
+        [cw.output(shifted, collector=cw.Latest())],
+        backend="python",
+        implementations={native.operation_id: native_backend},
+    )
+
+    result = plan.run(executor="python")
+
+    assert result.outputs[0].emissions[0].value == (3.0, 5.0)
+    assert plan.portable_ir.backend == "mixed"
+    assert [stage.execution_domain for stage in plan.portable_ir.stages] == [
+        "python_source",
+        "cpp",
+        "python",
+    ]
+    assert [item.backend for item in plan.portable_ir.implementations] == ["cpp", "python"]
+    with pytest.raises(ValueError, match="contract=runtime_binding"):
+        plan.run(executor="cpp")
+
+
+def test_compile_rejects_unknown_operation_implementation_selector(tmp_path: Path) -> None:
+    """使用しないOperation selectorを黙って無視しない。"""
+
+    module = cw.NativeOperationModule(_build_module(tmp_path))
+    mapped = cw.Flow([1]).map(lambda value: value)
+
+    with pytest.raises(cw.CompileError, match="contract=known_implementation_selector"):
+        cw.compile(
+            [mapped],
+            implementations={"test.unknown.v1": cw.NativeModuleBackend(module)},
+        )
 
 
 def test_native_module_rebinds_round_tripped_plan(tmp_path: Path) -> None:

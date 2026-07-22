@@ -5,7 +5,9 @@ from __future__ import annotations
 import ctypes
 from array import array
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
+from math import prod
 from pathlib import Path
 from types import MappingProxyType
 
@@ -17,6 +19,7 @@ from .kernel import (
     CompiledKernelSession,
     RunContext,
 )
+from .model import Diagnostic, Emission, EmissionStatus, Severity
 from .operation import ImplementationBinding, ImplementationSpec, OperationSpec
 
 MODULE_ABI_V1 = "chronowire.operation-module.v1"
@@ -67,6 +70,54 @@ class _COperationModuleV1(ctypes.Structure):
         ("operation_count", ctypes.c_size_t),
         ("operations", ctypes.POINTER(_COperationEntryV1)),
     ]
+
+
+class _CBufferViewV1(ctypes.Structure):
+    _fields_ = [
+        ("values", ctypes.POINTER(ctypes.c_double)),
+        ("value_count", ctypes.c_size_t),
+        ("shape", ctypes.POINTER(ctypes.c_size_t)),
+        ("rank", ctypes.c_size_t),
+    ]
+
+
+class _CMutableBufferViewV1(ctypes.Structure):
+    _fields_ = [
+        ("values", ctypes.POINTER(ctypes.c_double)),
+        ("value_capacity", ctypes.c_size_t),
+        ("shape", ctypes.POINTER(ctypes.c_size_t)),
+        ("rank", ctypes.c_size_t),
+    ]
+
+
+class _CProcessResultV1(ctypes.Structure):
+    _fields_ = [
+        ("output_count", ctypes.c_size_t),
+        ("status", ctypes.c_uint8),
+        ("diagnostic_severity", ctypes.c_uint8),
+        ("diagnostic_code", ctypes.c_char_p),
+        ("diagnostic_message", ctypes.c_char_p),
+    ]
+
+
+_CreateFunctionV1 = ctypes.CFUNCTYPE(
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_double),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_char),
+    ctypes.c_size_t,
+)
+_ProcessFunctionV1 = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.POINTER(_CBufferViewV1),
+    ctypes.c_size_t,
+    ctypes.POINTER(_CMutableBufferViewV1),
+    ctypes.POINTER(_CProcessResultV1),
+    ctypes.POINTER(ctypes.c_char),
+    ctypes.c_size_t,
+)
+_DestroyFunctionV1 = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
 
 
 def _text(value: bytes | None, field: str) -> str:
@@ -314,15 +365,178 @@ class NativeOperationRuntimeBinding:
             raise ValueError("native Operation binding must retain its module handle")
 
 
-@dataclass(frozen=True)
-class _UnavailableNativeModuleSession:
-    operation_id: str
+def _flatten_f64(value: object, shape: tuple[int, ...], *, input_index: int) -> tuple[float, ...]:
+    """Python値を検証済みfixed shapeの連続float64列へ変換する。"""
+
+    def visit(current: object, remaining: tuple[int, ...], path: tuple[int, ...]) -> list[float]:
+        if not remaining:
+            if isinstance(current, bool) or not isinstance(current, (int, float)):
+                raise TypeError(
+                    f"input={input_index} index={path} expected=float64 actual={current!r}; "
+                    "contract=native_f64_value"
+                )
+            return [float(current)]
+        if not isinstance(current, (tuple, list)) or len(current) != remaining[0]:
+            raise ValueError(
+                f"input={input_index} index={path} expected_extent={remaining[0]} "
+                f"actual={current!r}; contract=native_fixed_shape"
+            )
+        result: list[float] = []
+        for index, item in enumerate(current):
+            result.extend(visit(item, remaining[1:], (*path, index)))
+        return result
+
+    return tuple(visit(value, shape, ()))
+
+
+def _reshape_f64(values: tuple[float, ...], shape: tuple[int, ...], offset: int = 0) -> object:
+    """連続float64列をOperationSpecのitem shapeへ戻す。"""
+
+    if not shape:
+        return values[offset]
+    child_width = prod(shape[1:])
+    return tuple(
+        _reshape_f64(values, shape[1:], offset + index * child_width) for index in range(shape[0])
+    )
+
+
+class _NativeModulePythonSession:
+    """PythonExecutorでC ABI wrapperをEmission単位に照合するrun-local session。"""
+
+    def __init__(self, compiled: _CompiledNativeModuleOperation) -> None:
+        self._compiled = compiled
+        self._create = _CreateFunctionV1(compiled.entry.create_address)
+        self._process = _ProcessFunctionV1(compiled.entry.process_address)
+        self._destroy = _DestroyFunctionV1(compiled.entry.destroy_address)
+        self._handle: int | None = None
+        parameters = (ctypes.c_double * len(compiled.parameters))(*compiled.parameters)
+        error = ctypes.create_string_buffer(512)
+        handle = self._create(parameters, len(compiled.parameters), error, len(error))
+        if not handle:
+            message = error.value.decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"node={compiled.node_id} port={compiled.output_port_id} "
+                f"operation={compiled.entry.operation_id} error={message}; "
+                "contract=native_module_create"
+            )
+        self._handle = int(handle)
 
     def run(self, inputs: tuple[object, ...], context: RunContext) -> object:
-        del inputs, context
-        raise RuntimeError(
-            f"operation={self.operation_id} is bound to a C ABI module and requires CppExecutor"
+        """Operationの物理input列をC ABI wrapperで一回処理する。"""
+
+        if self._handle is None:
+            raise RuntimeError(
+                f"operation={self._compiled.entry.operation_id} session is closed; "
+                "contract=operation_session_lifecycle"
+            )
+        if len(inputs) != len(self._compiled.input_shapes):
+            raise ValueError(
+                f"node={self._compiled.node_id} operation={self._compiled.entry.operation_id} "
+                f"expected_inputs={len(self._compiled.input_shapes)} actual={len(inputs)}"
+            )
+        value_buffers: list[object] = []
+        shape_buffers: list[object] = []
+        views: list[_CBufferViewV1] = []
+        for input_index, (value, shape) in enumerate(
+            zip(inputs, self._compiled.input_shapes, strict=True)
+        ):
+            flat = _flatten_f64(value, shape, input_index=input_index)
+            value_buffer = (ctypes.c_double * len(flat))(*flat)
+            shape_buffer = (ctypes.c_size_t * len(shape))(*shape)
+            value_buffers.append(value_buffer)
+            shape_buffers.append(shape_buffer)
+            views.append(_CBufferViewV1(value_buffer, len(flat), shape_buffer, len(shape)))
+        input_views = (_CBufferViewV1 * len(views))(*views)
+        output_count = prod(self._compiled.output_shape)
+        output_values = (ctypes.c_double * output_count)()
+        output_shape = (ctypes.c_size_t * len(self._compiled.output_shape))(
+            *self._compiled.output_shape
         )
+        output_view = _CMutableBufferViewV1(
+            output_values,
+            output_count,
+            output_shape,
+            len(self._compiled.output_shape),
+        )
+        process_result = _CProcessResultV1()
+        error = ctypes.create_string_buffer(512)
+        status = self._process(
+            self._handle,
+            input_views,
+            len(views),
+            ctypes.byref(output_view),
+            ctypes.byref(process_result),
+            error,
+            len(error),
+        )
+        if status != 0:
+            message = error.value.decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"node={self._compiled.node_id} port={self._compiled.output_port_id} "
+                f"operation={self._compiled.entry.operation_id} error={message}; "
+                "contract=native_module_process"
+            )
+        if (
+            process_result.output_count != output_count
+            or process_result.status > 2
+            or process_result.diagnostic_severity > 2
+            or output_view.value_capacity != output_count
+            or output_view.rank != len(self._compiled.output_shape)
+            or tuple(output_view.shape[index] for index in range(output_view.rank))
+            != self._compiled.output_shape
+        ):
+            raise RuntimeError(
+                f"node={self._compiled.node_id} port={self._compiled.output_port_id} "
+                f"operation={self._compiled.entry.operation_id}; "
+                "contract=native_module_result"
+            )
+        code = process_result.diagnostic_code
+        message = process_result.diagnostic_message
+        if (code is None) != (message is None) or bool(code) != bool(message):
+            raise RuntimeError(
+                f"node={self._compiled.node_id} port={self._compiled.output_port_id} "
+                f"operation={self._compiled.entry.operation_id}; "
+                "contract=native_module_diagnostic"
+            )
+        diagnostics = ()
+        if code and message:
+            diagnostics = (
+                Diagnostic(
+                    (Severity.INFO, Severity.WARNING, Severity.ERROR)[
+                        process_result.diagnostic_severity
+                    ],
+                    code.decode("utf-8", errors="replace"),
+                    message.decode("utf-8", errors="replace"),
+                    node_id=self._compiled.node_id,
+                    port_id=self._compiled.output_port_id,
+                    interval=context.interval,
+                ),
+            )
+        output = tuple(float(output_values[index]) for index in range(output_count))
+        return Emission(
+            _reshape_f64(output, self._compiled.output_shape),
+            context.interval,
+            0,
+            (
+                EmissionStatus.OK,
+                EmissionStatus.DEGRADED,
+                EmissionStatus.INVALID,
+            )[process_result.status],
+            diagnostics,
+        )
+
+    def close(self) -> None:
+        """native Operation sessionを一度だけdestroyする。"""
+
+        if self._handle is None:
+            return
+        handle = self._handle
+        self._handle = None
+        self._destroy(handle)
+
+    def __del__(self) -> None:
+        with suppress(Exception):
+            self.close()
 
 
 @dataclass(frozen=True)
@@ -330,6 +544,10 @@ class _CompiledNativeModuleOperation:
     entry: NativeOperationEntry
     parameters: tuple[float, ...]
     implementation_spec: ImplementationSpec
+    node_id: int
+    input_shapes: tuple[tuple[int, ...], ...]
+    output_shape: tuple[int, ...]
+    output_port_id: int
     abi_version: str
     process_model: str
     workspace_size_bytes: int
@@ -339,9 +557,13 @@ class _CompiledNativeModuleOperation:
     native_compatible: bool = True
 
     def create_session(self) -> CompiledKernelSession[object]:
-        """PythonExecutorでの暗黙fallbackを拒否するsessionを返す。"""
+        """PythonExecutor用のC ABI conformance sessionを生成する。"""
 
-        return _UnavailableNativeModuleSession(self.entry.operation_id)
+        if self.supports_flush:
+            raise RuntimeError(
+                f"operation={self.entry.operation_id} contract=python_executor_native_flush"
+            )
+        return _NativeModulePythonSession(self)
 
     def create_native_runtime_binding(self) -> NativeOperationRuntimeBinding:
         """module handleを保持したC++ runtime bindingを生成する。"""
@@ -429,7 +651,7 @@ class NativeModuleBackend:
             context: 不変Configを含むCompileContext。
 
         Returns:
-            CppExecutor用runtime bindingを生成するcompile済みOperation。
+            PythonExecutorとCppExecutorの両方にbindingできるcompile済みOperation。
 
         Raises:
             TypeError: contextまたはConfig parameterがv1契約外の場合。
@@ -445,11 +667,36 @@ class NativeModuleBackend:
                 "contract=missing_implementation"
             )
         config = context.config.view(operation.config.scope)
+        if context.node_id is None or len(context.output_port_ids) != 1:
+            raise TypeError(f"operation={operation.operation_id} contract=native_compile_context")
+        if (
+            not context.input_shapes
+            or any(shape is None for shape in context.input_shapes)
+            or len(context.output_shapes) != 1
+            or context.output_shapes[0] is None
+        ):
+            raise TypeError(
+                f"node={context.node_id} operation={operation.operation_id} "
+                "contract=native_fixed_shape"
+            )
+        if any(dtype != "float64" for dtype in (*context.input_dtypes, *context.output_dtypes)):
+            raise TypeError(
+                f"node={context.node_id} operation={operation.operation_id} "
+                "contract=native_float64_schema"
+            )
+        input_shapes = tuple(shape for shape in context.input_shapes if shape is not None)
+        output_shape = context.output_shapes[0]
+        if output_shape is None:
+            raise RuntimeError("validated native output shape was lost")
         specification = entry.implementation_spec(self.name)
         return _CompiledNativeModuleOperation(
             entry,
             _float64_parameters(operation, config),
             specification,
+            context.node_id,
+            input_shapes,
+            output_shape,
+            context.output_port_ids[0],
             entry.abi_version,
             entry.process_model,
             entry.workspace_size_bytes,

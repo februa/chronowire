@@ -6,6 +6,7 @@ import inspect
 import time
 from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from fractions import Fraction
@@ -1563,12 +1564,15 @@ def compile(
     outputs: Sequence[Flow[Any] | OutputSpec[Any]],
     *,
     backend: str | Backend = "python",
+    implementations: Mapping[str, str | Backend] | None = None,
     extensions: Sequence[ObservationSpec] = (),
 ) -> ExecutionPlan:
     """Flow群から不変なExecutionPlanを生成する。
 
     Args:
         outputs: 観測終端。bare FlowはNoCollectとして実行だけ行う。
+        backend: legacy Kernelと未指定Operationの既定Implementation selector。
+        implementations: operation IDごとのImplementation selector override。
         extensions: `observe()`で固定したcompile-time観測契約。
 
     Raises:
@@ -1619,18 +1623,64 @@ def compile(
     observed_ports = [extension.flow.port_id for extension in extensions]
     roots = tuple(ports + observed_ports)
     nodes = _required_nodes(graph, roots)
+    operation_ids = {
+        node.operation.operation_id
+        for node in nodes
+        if isinstance(node.operation, OperationDefinition)
+    }
+    implementation_overrides = dict(implementations or {})
+    unknown_implementations = sorted(set(implementation_overrides) - operation_ids)
+    if unknown_implementations:
+        raise CompileError(
+            f"operation={unknown_implementations[0]} contract=known_implementation_selector"
+        )
     _validate_rate_frame_boundaries(nodes)
     diagnostics = _compile_diagnostics(nodes)
     # Operationの言語非依存意味論は実装選択より先に確定する。legacy Kernelの
     # native schema providerだけは後段の互換passで補完する。
-    _value_schema_descriptors(nodes, {})
-    backend_instance: Backend
-    if isinstance(backend, str):
-        if backend != "python":
-            raise ValueError(f"unsupported backend {backend!r}")
-        backend_instance = PythonBackend()
-    else:
-        backend_instance = backend
+    semantic_schemas, semantic_schema_ids = _value_schema_descriptors(nodes, {})
+    semantic_schema_by_id = {item.value_schema_id: item for item in semantic_schemas}
+
+    def compile_context(node: NodeSpec) -> CompileContext:
+        """OperationSpecで解決済みのPort shapeをBackend境界へ渡す。"""
+
+        return CompileContext(
+            node.config,
+            node.constants or {},
+            node.id,
+            tuple(
+                semantic_schema_by_id[semantic_schema_ids[item.source_port]].shape
+                for item in node.inputs
+            ),
+            tuple(
+                semantic_schema_by_id[semantic_schema_ids[port_id]].shape
+                for port_id in node.output_ports
+            ),
+            tuple(
+                semantic_schema_by_id[semantic_schema_ids[item.source_port]].dtype
+                for item in node.inputs
+            ),
+            tuple(
+                semantic_schema_by_id[semantic_schema_ids[port_id]].dtype
+                for port_id in node.output_ports
+            ),
+            node.output_ports,
+        )
+
+    def resolve_backend(value: str | Backend) -> Backend:
+        """互換文字列またはImplementation selectorをBackend protocolへ正規化する。"""
+
+        if isinstance(value, str):
+            if value != "python":
+                raise ValueError(f"unsupported backend {value!r}")
+            return PythonBackend()
+        return value
+
+    backend_instance = resolve_backend(backend)
+    selected_implementations = {
+        operation_id: resolve_backend(value)
+        for operation_id, value in implementation_overrides.items()
+    }
     compiled_kernels: dict[int, CompiledKernel[object]] = {}
     kernel_abi_descriptors: dict[int, KernelAbiDescriptor] = {}
     node_backend_names: dict[int, str] = {
@@ -1644,6 +1694,10 @@ def compile(
         selected_backend = backend_instance
         kernel: Kernel[object]
         if isinstance(operation, OperationDefinition):
+            selected_backend = selected_implementations.get(
+                operation.operation_id,
+                backend_instance,
+            )
             input_names = tuple(item.keyword for item in node.inputs if item.keyword is not None)
             if len(input_names) != len(node.inputs):
                 raise CompileError(
@@ -1668,7 +1722,7 @@ def compile(
             elif isinstance(selected_backend, OperationBackend):
                 compiled = selected_backend.compile_operation(
                     operation.spec,
-                    CompileContext(node.config, node.constants or {}),
+                    compile_context(node),
                 )
             else:
                 raise MissingImplementationError(
@@ -1749,7 +1803,7 @@ def compile(
             raise TypeError(f"MAP node {node.id} lacks a Kernel or Python callable")
         compiled = selected_backend.compile_kernel(
             kernel,
-            CompileContext(node.config, node.constants or {}),
+            compile_context(node),
         )
         if not isinstance(compiled, CompiledKernel):
             raise TypeError(
@@ -1797,13 +1851,21 @@ def compile(
             "native_kernel" if isinstance(operation, IdentityF64Kernel) else selected_backend.name
         )
     source_request_periods = _source_request_periods(nodes)
+    map_domains = {node_backend_names[node.id] for node in nodes if node.kind is NodeKind.MAP}
+    plan_backend_name = (
+        backend_instance.name
+        if not map_domains
+        else next(iter(map_domains))
+        if len(map_domains) == 1
+        else "mixed"
+    )
     sorted_extensions = tuple(sorted(extensions, key=lambda item: item.priority))
     portable_ir = _portable_plan_ir(
         nodes=nodes,
         outputs=tuple(normalized),
         extensions=sorted_extensions,
         diagnostics=diagnostics,
-        backend_name=backend_instance.name,
+        backend_name=plan_backend_name,
         node_backend_names=node_backend_names,
         kernel_abi_descriptors=kernel_abi_descriptors,
         compiled_kernels=compiled_kernels,
@@ -1816,7 +1878,7 @@ def compile(
         observations=sorted_extensions,
         compile_diagnostics=diagnostics,
         compiled_kernels=compiled_kernels,
-        backend_name=backend_instance.name,
+        backend_name=plan_backend_name,
         node_backend_names=node_backend_names,
         source_request_periods=source_request_periods,
         portable_ir=portable_ir,
@@ -2370,9 +2432,16 @@ class _PlanRuntime:
         self.collectors: dict[int, CollectorSession[Any]] = {
             item.flow.port_id: item.collector.create_session() for item in plan._outputs
         }
-        self.kernel_sessions: dict[int, CompiledKernelSession[object]] = {
-            node_id: kernel.create_session() for node_id, kernel in plan._compiled_kernels.items()
-        }
+        self.kernel_sessions: dict[int, CompiledKernelSession[object]] = {}
+        try:
+            for node_id, kernel in plan._compiled_kernels.items():
+                self.kernel_sessions[node_id] = kernel.create_session()
+        except Exception:
+            for created_node_id, session in reversed(tuple(self.kernel_sessions.items())):
+                with suppress(Exception):
+                    self._close_kernel_session(created_node_id, session)
+            self.kernel_sessions.clear()
+            raise
         self.extensions = tuple(self._create_extension_runtime(item) for item in extensions)
         self.output_ports = set(self.collectors)
         self.root_ports: set[int] = set()
@@ -2586,8 +2655,39 @@ class _PlanRuntime:
             except Exception as error:
                 if first_error is None:
                     first_error = error
+        for node_id, session in reversed(tuple(self.kernel_sessions.items())):
+            try:
+                self._close_kernel_session(node_id, session)
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+            finally:
+                self.kernel_sessions.pop(node_id, None)
         if first_error is not None:
             raise first_error
+
+    @staticmethod
+    def _close_kernel_session(
+        node_id: int,
+        session: CompiledKernelSession[object],
+    ) -> None:
+        """optional close entrypointを持つOperationSessionを確実に解放する。"""
+
+        close = getattr(session, "close", None)
+        if close is None:
+            return
+        if not callable(close):
+            raise KernelExecutionError(
+                f"node {node_id} OperationSession close is not callable; "
+                "contract=operation_session_lifecycle"
+            )
+        try:
+            close()
+        except Exception as error:
+            raise KernelExecutionError(
+                f"node {node_id} OperationSession close failed: {error}; "
+                "contract=operation_session_lifecycle"
+            ) from error
 
     def _drive(self) -> None:
         """active rootを境界、EOF、stallのいずれかまで決定的に進める。"""
@@ -3534,6 +3634,9 @@ class _PlanRuntime:
             compiled = self.plan._compiled_kernels.get(node.id)
             if compiled is None:
                 raise RuntimeError(f"MAP Node {node.id} lacks a CompiledKernel")
+            previous = self.kernel_sessions.get(node.id)
+            if previous is not None:
+                self._close_kernel_session(node.id, previous)
             self.kernel_sessions[node.id] = compiled.create_session()
 
         if (

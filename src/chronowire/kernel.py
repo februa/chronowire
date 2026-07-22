@@ -79,10 +79,31 @@ def callable_kernel(
 
 @dataclass(frozen=True)
 class CompileContext:
-    """Kernel.compileへ渡す不変なNode設定を表す。"""
+    """Kernel.compileへ渡す不変なNode設定を表す。
+
+    Args:
+        config: Nodeが参照する不変Config。
+        constants: Flow.mapで固定したprocess-local定数。
+        node_id: compile対象Node ID。legacy BackendではNoneを許可する。
+        input_shapes: 各input Portの解決済みitem shape。Noneは静的証明不能。
+        output_shapes: 各output Portの解決済みitem shape。Noneは静的証明不能。
+        input_dtypes: 各input Portの解決済みdtype。
+        output_dtypes: 各output Portの解決済みdtype。
+        output_port_ids: output_shapesに対応するPort ID。
+
+    境界条件:
+        shapeはOperationSpecからCompilerが解決した値だけを渡し、Backendが
+        runtime値から別のshape意味論を推測してはならない。
+    """
 
     config: Config
     constants: Mapping[str, object]
+    node_id: int | None = None
+    input_shapes: tuple[tuple[int, ...] | None, ...] = ()
+    output_shapes: tuple[tuple[int, ...] | None, ...] = ()
+    input_dtypes: tuple[str | None, ...] = ()
+    output_dtypes: tuple[str | None, ...] = ()
+    output_port_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
