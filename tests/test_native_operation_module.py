@@ -304,8 +304,13 @@ def test_operation_implementation_selection_is_independent_from_executor(
         "python",
     ]
     assert [item.backend for item in plan.portable_ir.implementations] == ["cpp", "python"]
-    with pytest.raises(ValueError, match="contract=runtime_binding"):
+    with pytest.raises(ValueError, match="contract=runtime_binding") as error:
         plan.run(executor="cpp")
+    assert "node=2" in str(error.value)
+    assert "port=2" in str(error.value)
+    assert "stage=2" in str(error.value)
+    assert "binding=implementation:2" in str(error.value)
+    assert "contract=python_stage_mixed_resume_pending" in str(error.value)
 
 
 def test_compile_rejects_unknown_operation_implementation_selector(tmp_path: Path) -> None:

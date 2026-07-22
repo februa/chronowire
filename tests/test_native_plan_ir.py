@@ -17,13 +17,15 @@ def test_v03_plan_records_stage_value_schema_and_experimental_kernel_abi() -> No
     assert restored == ir
     assert ir.schema_version == "0.3"
     assert ir.value_schemas[0].representation == "python_opaque"
-    assert [stage.execution_domain for stage in ir.stages] == [
-        "python_source",
-        "executor_opcode",
-        "python",
-    ]
-    assert ir.stages[1].node_ids == (1, 2)
-    assert ir.stages[2].boundary_reasons == ("python_callback", "observation_boundary")
+    assert [stage.execution_domain for stage in ir.stages] == ["python"]
+    assert ir.stages[0].node_ids == (0, 1, 2, 3)
+    assert ir.stages[0].boundary_reasons == (
+        "python_island",
+        "observation_boundary",
+        "plan_end",
+    )
+    assert ir.stages[0].runner_capabilities == ("python_stage",)
+    assert ir.stages[0].boundary_codec == "python_object"
     assert ir.kernel_abis[0].binding_slot == "kernel:3"
     assert ir.kernel_abis[0].process_model == "python_object"
     assert not ir.kernel_abis[0].native_compatible

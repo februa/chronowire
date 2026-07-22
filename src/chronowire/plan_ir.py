@@ -465,12 +465,23 @@ class BindingDescriptor:
 
 @dataclass(frozen=True)
 class StageDescriptor:
-    """同一Executor領域で連続実行できるNode列を表す。"""
+    """同一runner領域で連続実行できるNode列を表す。
+
+    Args:
+        stage_id: Plan内で安定なStage ID。
+        node_ids: Stage内でtopological orderに並ぶNode ID。
+        execution_domain: compile時に選択した実行領域。
+        boundary_reasons: Stage分割理由。
+        runner_capabilities: Executorが満たすべきrunner種別。
+        boundary_codec: Stage境界で必要な値codec。
+    """
 
     stage_id: int
     node_ids: tuple[int, ...]
     execution_domain: str
     boundary_reasons: tuple[str, ...]
+    runner_capabilities: tuple[str, ...] = ()
+    boundary_codec: str | None = None
 
     def __post_init__(self) -> None:
         if not self.node_ids:
@@ -486,6 +497,8 @@ class StageDescriptor:
             _integer_tuple(data, "node_ids"),
             _string(data, "execution_domain"),
             _string_tuple(data, "boundary_reasons"),
+            _string_tuple(data, "runner_capabilities") if "runner_capabilities" in data else (),
+            _optional_string(data, "boundary_codec"),
         )
 
 

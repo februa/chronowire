@@ -155,7 +155,10 @@ Schedulerは内部APIとする。
 
 初期版は単一スレッド・決定的Schedulerを採用する。
 
-Python Schedulerは意味論の基準実装とする。性能向けには、同じExecutionPlanを実行するNativeExecutorを追加し、RATE、FRAME、buffer、ready判定をnative Stage内で連続実行する。Flow API、Backend、Executorの責務分離と段階的な実装方針は[10_Native_Executor設計方針.md](10_Native_Executor設計方針.md)に定める。
+Python Schedulerは実行可能な参照実装とする。意味論の正本はExecutionPlanと本書の
+契約である。性能向けには、同じExecutionPlanを実行するNativeExecutorを追加し、RATE、
+FRAME、buffer、ready判定をnative Stage内で連続実行する。Flow API、Backend、Executorの
+責務分離と段階的な実装方針は[10_Native_Executor設計方針.md](10_Native_Executor設計方針.md)に定める。
 
 ```text
 観測終端から必要intervalを逆伝播
@@ -176,6 +179,28 @@ Extensionへ通知
 同一Emissionの配送順は、Extension、観測終端collector、下流consumerの順とする。collector overflowが発生しても、Extensionが安全な劣化結果を先に保存できるようにする。Extension失敗時はcollectorと下流へ配送せず、runを停止する。
 
 SchedulerはSourceを無条件にround-robinで進めない。各Nodeの必要interval、入力cursor、producer frontierを追跡し、未充足需要を生成できる経路だけを進める。exact mergeで必要intervalが生成不能と確定した場合は`STALLED_EXACT_MERGE`を記録し、そのNodeへの需要を停止する。
+
+### 8.1 cooperative Stage実行状態
+
+CppExecutorはImplementation言語にかかわらずPlanを運用できる。現行の
+`GraphRuntimeSession.run()`はDAG全体とPort batchをstack-localに保持するため、Python Stageで
+中断できない。これをrun-localな継続可能状態へ分離し、実行APIを次に固定する。
+
+```text
+advance() -> Completed
+          | NeedsPython(stage_id, input_batches)
+
+resume(stage_id, output_batches) -> void
+```
+
+`advance()`はreadyなnative Nodeを進め、Python islandの入力が揃った時点でそのみyieldする。
+adapterはGIL下でrun-local PythonStageSessionを一回batch実行し、検証済み出力をresumeする。
+runtimeはwaiting stage IDとresume stage IDの一致、一回だけのresume、例外後のsession廃棄を保証する。
+Stage入出力のinterval、sequence、status、Diagnostic、gap segmentはbatch境界で失わない。
+
+Compilerは連続するPython Operationを、観測境界、native依存境界、fan-out ownership境界の
+範囲内で最大Python islandへまとめる。全Python Planは可能な限り単一Stageとし、
+Python関数ごとやEmissionごとにC++/Python境界を往復しない。
 
 ## 9. Push/Pullモデル
 

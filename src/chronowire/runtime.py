@@ -704,52 +704,116 @@ def _stage_descriptors(
     node_backend_names: Mapping[int, str],
     boundary_ports: set[int],
 ) -> tuple[StageDescriptor, ...]:
-    """Python callbackと観測境界を越えない最小Stage列を作る。"""
+    """native MAPを越えない最大Python islandとnative Stageを作る。"""
 
     stages: list[StageDescriptor] = []
     pending: list[int] = []
     pending_domain: str | None = None
+    pending_reasons: list[str] = []
+
+    producer_by_port = {port_id: node.id for node in nodes for port_id in node.output_ports}
+    native_map_ids = {
+        node.id
+        for node in nodes
+        if node.kind is NodeKind.MAP and node_backend_names[node.id] != "python"
+    }
+    adjacent: dict[int, set[int]] = {
+        node.id: set() for node in nodes if node.id not in native_map_ids
+    }
+    for node in nodes:
+        if node.id not in adjacent:
+            continue
+        for input_spec in node.inputs:
+            producer_id = producer_by_port[input_spec.source_port]
+            if producer_id not in adjacent:
+                continue
+            adjacent[node.id].add(producer_id)
+            adjacent[producer_id].add(node.id)
+    python_seeds = {
+        node.id
+        for node in nodes
+        if node.kind is NodeKind.MAP and node_backend_names[node.id] == "python"
+    }
+    python_island_nodes: set[int] = set()
+    remaining = set(adjacent)
+    while remaining:
+        root = remaining.pop()
+        component = {root}
+        frontier = [root]
+        while frontier:
+            current = frontier.pop()
+            for neighbor in adjacent[current] & remaining:
+                remaining.remove(neighbor)
+                component.add(neighbor)
+                frontier.append(neighbor)
+        if component & python_seeds:
+            python_island_nodes.update(component)
+
+    def execution_domain(node: NodeSpec) -> str:
+        if node.id in python_island_nodes:
+            return "python"
+        if node.kind is NodeKind.SOURCE:
+            return "python_source"
+        if node.kind is NodeKind.MAP:
+            return node_backend_names[node.id]
+        return "executor_opcode"
+
+    def stage_capability(domain: str) -> tuple[tuple[str, ...], str]:
+        if domain == "python":
+            return ("python_stage",), "python_object"
+        if domain == "python_source":
+            return ("source_runner",), "source_binding"
+        if domain == "executor_opcode":
+            return ("native_opcode",), "stream_item_v1"
+        return ("native_runner",), "value_schema"
 
     def finish(*reasons: str) -> None:
-        nonlocal pending, pending_domain
+        nonlocal pending, pending_domain, pending_reasons
         if not pending or pending_domain is None:
             return
+        capabilities, codec = stage_capability(pending_domain)
+        all_reasons = (
+            (["python_island"] if pending_domain == "python" else [])
+            + pending_reasons
+            + list(reasons or (pending_domain,))
+        )
         stages.append(
             StageDescriptor(
                 len(stages),
                 tuple(pending),
                 pending_domain,
-                tuple(dict.fromkeys(reasons or (pending_domain,))),
+                tuple(dict.fromkeys(all_reasons)),
+                capabilities,
+                codec,
             )
         )
         pending = []
         pending_domain = None
+        pending_reasons = []
 
     for node in nodes:
-        if node.kind is NodeKind.SOURCE:
+        domain = execution_domain(node)
+        if node.kind is NodeKind.MAP and domain != "python":
             finish("execution_domain_change")
             pending = [node.id]
-            pending_domain = "python_source"
-            reasons = ["python_source"]
+            pending_domain = domain
+            reasons = ["kernel_binding"]
             if any(port in boundary_ports for port in node.output_ports):
                 reasons.append("observation_boundary")
             finish(*reasons)
             continue
-        if node.kind is NodeKind.MAP:
+        if pending_domain != domain:
             finish("execution_domain_change")
-            pending = [node.id]
-            pending_domain = node_backend_names[node.id]
-            reasons = ["python_callback" if pending_domain == "python" else "kernel_binding"]
-            if any(port in boundary_ports for port in node.output_ports):
-                reasons.append("observation_boundary")
-            finish(*reasons)
-            continue
-        if pending_domain != "executor_opcode":
-            finish("execution_domain_change")
-            pending_domain = "executor_opcode"
+            pending_domain = domain
         pending.append(node.id)
         if any(port in boundary_ports for port in node.output_ports):
-            finish("observation_boundary")
+            if domain == "python":
+                pending_reasons.append("observation_boundary")
+                continue
+            finish(
+                domain,
+                "observation_boundary",
+            )
     finish("plan_end")
     return tuple(stages)
 

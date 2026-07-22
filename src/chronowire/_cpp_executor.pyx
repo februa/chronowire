@@ -5,6 +5,7 @@ from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize
 from libc.stddef cimport size_t
 from libc.stdint cimport int64_t, uint8_t, uint64_t, uintptr_t
 from libcpp.string cimport string
+from libcpp.utility cimport pair
 from libcpp.vector cimport vector
 
 
@@ -144,6 +145,12 @@ cdef extern from "cpp_runtime.hpp" namespace "chronowire::cpp_runtime":
             int64_t logical_end_denominator,
         ) except + nogil
 
+    cdef cppclass CooperativeStageSession:
+        CooperativeStageSession(const vector[int64_t]& stage_ids) except +
+        pair[int, int64_t] advance() except +
+        void resume(int64_t stage_id) except +
+        void abort() except +
+
 
 cdef vector[double] _f64_vector(bytes values):
     """immutable f64 bytesをC++所有vectorへcopyする。"""
@@ -161,6 +168,68 @@ cdef vector[double] _f64_vector(bytes values):
     for index in range(count):
         result.push_back(pointer[index])
     return result
+
+
+cdef class CppCooperativeStageSession:
+    """Python callbackをC++に保持させないyield/resume状態を所有する。
+
+    Args:
+        stage_ids: adapterが順に実行する非負で一意なStage ID列。
+
+    Raises:
+        ValueError: Stage ID列が空、重複、または負値の場合。
+
+    境界条件:
+        C++ sessionはStage順序だけを所有し、Python objectとbatch pointerを保持しない。
+    """
+
+    cdef CooperativeStageSession* _runtime
+
+    def __cinit__(self, stage_ids):
+        cdef vector[int64_t] native_stage_ids
+        cdef object stage_id
+        self._runtime = NULL
+        for stage_id in stage_ids:
+            native_stage_ids.push_back(stage_id)
+        self._runtime = new CooperativeStageSession(native_stage_ids)
+
+    def __dealloc__(self):
+        del self._runtime
+
+    def advance(self):
+        """CompletedまたはNeedsPython状態を返す。
+
+        Returns:
+            `(status, stage_id)`。status 0はNeedsPython、1はCompletedを表す。
+
+        Raises:
+            RuntimeError: resume待ちまたはabort後にadvanceした場合。
+        """
+
+        cdef pair[int, int64_t] state = self._runtime.advance()
+        return state.first, state.second
+
+    def resume(self, stage_id):
+        """adapterが実行したPython Stageを確定する。
+
+        Args:
+            stage_id: 直前のadvanceが要求したStage ID。
+
+        Raises:
+            ValueError: 待機中Stage IDと一致しない場合。
+            RuntimeError: abort後にresumeした場合。
+        """
+
+        self._runtime.resume(stage_id)
+
+    def abort(self):
+        """例外後にsessionを再開不能にする。
+
+        境界条件:
+            複数回呼び出してもPython resourceを解放せず、状態だけを破棄する。
+        """
+
+        self._runtime.abort()
 
 
 cdef class CppNativeSession:

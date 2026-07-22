@@ -180,6 +180,14 @@ class CppRuntimeMetrics:
         public_emission_reconstructions: native outputから公開Emissionを復元した件数。
         python_boundary_dispatches: Extension等のPython境界callbackを呼び出した回数。
         boundary_batch_conversions: native item batchをPython公開値へ変換したbatch数。
+        gil_acquisitions: Python Stage実行のためadapterがGILを取得した回数。
+        stage_boundary_batches: Python/native Stage境界を通過したbatch数。
+        stage_boundary_bytes: Stage境界でborrowまたはcopyした値byte数。
+        zero_copy_batches: read-only borrowまたはbuffer protocolでcopyしなかったbatch数。
+        copied_batches: 契約不適合のため一回copyしたbatch数。
+        python_stage_ns: Python island内で費やした時間。
+        native_stage_ns: native Stage内で費やした時間。
+        execution_classification: `all_native`、`hybrid`、`python_stage_dominated`の分類。
 
     境界条件:
         Pythonでの公開Emission復元時間とobject memoryは含まない。
@@ -197,6 +205,14 @@ class CppRuntimeMetrics:
     public_emission_reconstructions: int = 0
     python_boundary_dispatches: int = 0
     boundary_batch_conversions: int = 0
+    gil_acquisitions: int = 0
+    stage_boundary_batches: int = 0
+    stage_boundary_bytes: int = 0
+    zero_copy_batches: int = 0
+    copied_batches: int = 0
+    python_stage_ns: int = 0
+    native_stage_ns: int = 0
+    execution_classification: str = "all_native"
 
     @property
     def python_free_hot_path(self) -> bool:
@@ -210,7 +226,11 @@ class CppRuntimeMetrics:
             含めず、別fieldで計数する。
         """
 
-        return self.native_run_releases_gil and self.stage_python_dispatches == 0
+        return (
+            self.execution_classification == "all_native"
+            and self.native_run_releases_gil
+            and self.stage_python_dispatches == 0
+        )
 
 
 @dataclass(frozen=True)
@@ -233,6 +253,12 @@ class CppExecutor:
         from .cpp_executor import CppExecutionSession
 
         validated = plan._create_python_session(extension_bindings)
+        if plan.portable_ir.stages and all(
+            stage.execution_domain == "python" for stage in plan.portable_ir.stages
+        ):
+            from .cpp_executor import CppPythonStageExecutionSession
+
+            return CppPythonStageExecutionSession(plan, validated)
         return CppExecutionSession(plan, validated._extensions)
 
     def create_plan_session(
@@ -244,6 +270,24 @@ class CppExecutor:
         """有限native Planから継続論理時間C++ sessionを生成する。"""
 
         from .cpp_executor import CppPlanSession
+        from .errors import PlanSessionError
+
+        python_stages = tuple(
+            stage for stage in plan.portable_ir.stages if stage.execution_domain == "python"
+        )
+        if python_stages:
+            stage = python_stages[0]
+            node_id = stage.node_ids[-1]
+            node = next(item for item in plan.portable_ir.nodes if item.node_id == node_id)
+            binding = next(
+                (item.slot_id for item in plan.portable_ir.bindings if item.node_id == node_id),
+                None,
+            )
+            raise PlanSessionError(
+                "CppExecutor Python Stage PlanSession is not implemented; "
+                f"stage={stage.stage_id} node={node_id} port={node.output_port_ids[-1]} "
+                f"binding={binding}; contract=python_stage_plan_session_pending"
+            )
 
         validated = plan._create_python_session(extension_bindings)
         return CppPlanSession(plan, options, validated._extensions)

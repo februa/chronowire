@@ -347,14 +347,33 @@ Operation implementationの選択はcompile時に`backend`既定selectorとopera
 `implementations` overrideで確定し、Executorはrun時に独立して選ぶ。PythonExecutorはPython
 Implementationだけでなく、選択済みC ABI ImplementationをEmission単位で直接呼べるため、native
 Operationのconformanceとデバッグに使う。CppExecutorは全対象Stageがnative対応の場合に同じbindingを
-C++ runtimeから直接呼ぶ。v0.4ではPython Implementationを含むPlanをCppExecutorへ渡した場合は
-Pythonへfallbackせず、該当Nodeとbinding契約を含む明示エラーにする。
+C++ runtimeから直接呼ぶ。Python Implementationを含む場合はPython Stage runnerへ明示的に
+yieldする。これはfallbackではなくPortablePlanIRに固定されたStage実行である。
 
 新規DSP Operationや既存ABI上のImplementation追加はDSP package側で完結させ、Executorを
 改修しない。Python/Cpp Executorの両方を改修するのは、Scheduler、buffer、時間、
 status/Diagnostic、lifecycle、ABI/process modelなどExecutionPlanの実行意味論を拡張するときである。
 この二重実装は独立Executorの契約一致を保つための必要経費とする。段階導入は認め、
 未対応capabilityはNode、Port、binding、違反契約を伴う明示エラーで拒否する。
+
+### Phase 2.5: cooperative Python Stage
+
+C++ runtimeのDAG実行状態をstack-localな`run()`からrun-local継続状態へ分離する。
+
+1. `advance()`が`Completed`または`NeedsPython(stage_id, input_batches)`を返す
+2. adapterがGIL取得後に最大Python islandの`PythonStageSession`をbatch実行する
+3. schema、0/1/複数Emission、時間、sequence、status、Diagnosticを境界で検証する
+4. `resume(stage_id, output_batches)`が出力batchのownershipを確定してSchedulerを再開する
+
+C++ runtime内にPython C API、`PyObject*`、callback function pointerを持ち込まない。固定schemaは
+read-only memoryviewでborrowし、適合するbuffer出力はzero-copy、それ以外は境界ごと1回copyとする。
+`python_opaque`を扱うRATE/FRAMEは初期実装でPython islandに含めてよい。
+
+初期実装済みの範囲はall-Python one-shot Planの単一islandである。C++ sessionは
+stage IDの`advance()` / `resume()` / `abort()`状態を所有し、実行本体はadapter側の
+run-local Python sessionが一回だけ実行する。mixed Planのinput/output batchをC++ Schedulerへ
+resumeする経路は未実装であり、現時点では`python_stage_mixed_resume_pending`として
+Stage/Node/Port/binding付きで拒否する。all-nativeの既存hot pathは変更しない。
 
 ### Phase 3: 最小Cython Executor
 

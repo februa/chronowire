@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import replace
 from fractions import Fraction
 from math import prod
+from time import perf_counter_ns
 from typing import Any
 
-from ._cpp_executor import CppGraphNativeSession
+from ._cpp_executor import CppCooperativeStageSession, CppGraphNativeSession
 from .collector import BufferOverflowError
 from .errors import ExtensionExecutionError, PlanSessionError
 from .executor import CppRuntimeMetrics, ExecutorSession
@@ -19,6 +20,7 @@ from .native import F64VectorSourceValues
 from .native_module import NativeOperationRuntimeBinding
 from .runtime import (
     ExecutionPlan,
+    ExecutionSession,
     OutputResult,
     PlanSessionState,
     RunResult,
@@ -36,6 +38,89 @@ _COLLECTOR_KIND = {"none": 0, "latest": 1, "bounded": 2}
 _OVERFLOW_POLICY = {None: 0, "fail": 0, "drop_oldest": 1, "drop_newest": 2}
 _INPUT_SEMANTICS = {"synchronous": 0, "latest": 1}
 _RATE_POLICY = {None: 0, RatePolicy.HOLD: 0, RatePolicy.SAMPLE: 1}
+
+
+class CppPythonStageExecutionSession(ExecutorSession):
+    """all-Python Planを単一の協調的Python islandとして実行する。
+
+    Args:
+        plan: 全Stageが`python_stage` runnerを要求するExecutionPlan。
+        python_session: run-local Operation/collector/Extension状態を所有するadapter側session。
+
+    境界条件:
+        v0.4最小実装はSourceからoutputまでを1つのPython islandに含む。
+        C++側はstage IDのyield/resume状態だけを所有し、Python callbackを保持しない。
+    """
+
+    def __init__(self, plan: ExecutionPlan, python_session: ExecutionSession) -> None:
+        stages = plan.portable_ir.stages
+        if len(stages) != 1 or stages[0].execution_domain != "python":
+            stage_ids = tuple(stage.stage_id for stage in stages)
+            raise ValueError(
+                "CppExecutor contract=single_python_island is the current cooperative scope; "
+                f"stages={stage_ids}"
+            )
+        stage = stages[0]
+        if "python_stage" not in stage.runner_capabilities:
+            raise ValueError(
+                "CppExecutor contract=python_stage_runner; "
+                f"stage={stage.stage_id} nodes={stage.node_ids}"
+            )
+        self.plan = plan
+        self._python_session = python_session
+        self._stage_id = stage.stage_id
+        self._runtime = CppCooperativeStageSession((stage.stage_id,))
+        self._last_metrics: CppRuntimeMetrics | None = None
+
+    @property
+    def last_metrics(self) -> CppRuntimeMetrics | None:
+        """直前のPython Stage協調実行指標を返す。"""
+
+        return self._last_metrics
+
+    def run(
+        self,
+        *,
+        duration: float | None = None,
+        options: RuntimeOptions | None = None,
+    ) -> RunResult:
+        """C++ advance/yield後に最大Python islandを一回batch実行する。"""
+
+        state, stage_id = self._runtime.advance()
+        if state != 0 or stage_id != self._stage_id:
+            raise RuntimeError(
+                "CppExecutor contract=python_stage_advance; "
+                f"stage={self._stage_id} actual_state={state} actual_stage={stage_id}"
+            )
+        started = perf_counter_ns()
+        try:
+            result = self._python_session.run(duration=duration, options=options)
+        except Exception:
+            self._runtime.abort()
+            raise
+        python_stage_ns = perf_counter_ns() - started
+        self._runtime.resume(stage_id)
+        completed, completed_stage = self._runtime.advance()
+        if completed != 1 or completed_stage != -1:
+            raise RuntimeError(
+                "CppExecutor contract=python_stage_complete; "
+                f"stage={stage_id} actual_state={completed}"
+            )
+        self._last_metrics = CppRuntimeMetrics(
+            scheduler_ns=0,
+            kernel_ns=0,
+            output_select_ns=0,
+            owned_input_bytes=0,
+            output_boundary_bytes=0,
+            python_native_transitions=2,
+            stage_python_dispatches=1,
+            executed_node_count=len(self.plan.portable_ir.nodes),
+            native_run_releases_gil=False,
+            gil_acquisitions=1,
+            python_stage_ns=python_stage_ns,
+            execution_classification="python_stage_dominated",
+        )
+        return result
 
 
 def _reshape_item(
@@ -170,9 +255,20 @@ class CppExecutionSession(ExecutorSession):
             if node.kind is NodeKind.MAP:
                 compiled = self.plan._compiled_kernels.get(node.id)
                 if not isinstance(compiled, NativeRuntimeBindingProvider):
+                    stage = next(
+                        (item for item in ir.stages if node.id in item.node_ids),
+                        None,
+                    )
+                    binding = next(
+                        (item for item in ir.bindings if item.node_id == node.id),
+                        None,
+                    )
                     raise ValueError(
                         "CppExecutor contract=runtime_binding requires native Kernel parameters; "
-                        f"node={node.id} port={node.output_port}"
+                        f"node={node.id} port={node.output_port} "
+                        f"stage={None if stage is None else stage.stage_id} "
+                        f"binding={None if binding is None else binding.slot_id}; "
+                        "contract=python_stage_mixed_resume_pending"
                     )
                 binding = compiled.create_native_runtime_binding()
                 abi = next((item for item in ir.kernel_abis if item.node_id == node.id), None)

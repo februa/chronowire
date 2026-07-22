@@ -1231,4 +1231,49 @@ GraphRuntimeResult GraphRuntimeSession::run(
     return result;
 }
 
+CooperativeStageSession::CooperativeStageSession(
+    const std::vector<std::int64_t>& stage_ids
+) : stage_ids_(stage_ids) {
+    if (stage_ids_.empty()) {
+        throw std::invalid_argument("CppExecutor contract=nonempty_python_stage_sequence");
+    }
+    std::unordered_map<std::int64_t, bool> seen;
+    for (const std::int64_t stage_id : stage_ids_) {
+        if (stage_id < 0 || seen.find(stage_id) != seen.end()) {
+            throw std::invalid_argument("CppExecutor contract=unique_python_stage_id");
+        }
+        seen.emplace(stage_id, true);
+    }
+}
+
+std::pair<int, std::int64_t> CooperativeStageSession::advance() {
+    if (aborted_) {
+        throw std::runtime_error("CppExecutor contract=python_stage_session_aborted");
+    }
+    if (waiting_stage_id_ >= 0) {
+        throw std::runtime_error("CppExecutor contract=python_stage_resume_required");
+    }
+    if (cursor_ >= stage_ids_.size()) {
+        return {1, -1};
+    }
+    waiting_stage_id_ = stage_ids_[cursor_];
+    return {0, waiting_stage_id_};
+}
+
+void CooperativeStageSession::resume(std::int64_t stage_id) {
+    if (aborted_) {
+        throw std::runtime_error("CppExecutor contract=python_stage_session_aborted");
+    }
+    if (waiting_stage_id_ < 0 || waiting_stage_id_ != stage_id) {
+        throw std::invalid_argument("CppExecutor contract=python_stage_resume_id");
+    }
+    waiting_stage_id_ = -1;
+    ++cursor_;
+}
+
+void CooperativeStageSession::abort() {
+    aborted_ = true;
+    waiting_stage_id_ = -1;
+}
+
 }  // namespace chronowire::cpp_runtime

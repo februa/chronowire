@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "native_operation_abi.h"
@@ -225,6 +226,46 @@ private:
     std::size_t source_count_;
     std::size_t source_width_;
     std::int64_t source_timebase_denominator_;
+};
+
+/**
+ * @brief Python StageをC++ runtimeから直接callbackせず協調的に運用する状態。
+ *
+ * v0.4最小経路はall-Python Planの単一islandを扱う。stage IDの待機と
+ * resume順序だけをC++が所有し、Python objectやcallback pointerを保持しない。
+ */
+class CooperativeStageSession {
+public:
+    /**
+     * @brief run-localなPython Stage順序をvalueとして所有する。
+     * @param stage_ids 非負で一意なStage ID列。入力vectorの寿命に依存しない。
+     * @throws std::invalid_argument 空列、負値、重複IDの場合。
+     */
+    explicit CooperativeStageSession(const std::vector<std::int64_t>& stage_ids);
+
+    /**
+     * @brief 次のPython Stageまで進む。
+     * @return 0=NeedsPython、1=Completedと対象Stage ID。
+     * @throws std::runtime_error resume待ちまたはabort後の場合。
+     */
+    std::pair<int, std::int64_t> advance();
+
+    /**
+     * @brief 待機中Stageのbatch実行完了を確定する。
+     * @param stage_id 直前のadvanceが返したStage ID。
+     * @throws std::invalid_argument 待機中IDと一致しない場合。
+     * @throws std::runtime_error abort後の場合。
+     */
+    void resume(std::int64_t stage_id);
+
+    /** @brief Python Stage例外後に再開不能状態へ遷移する。 */
+    void abort();
+
+private:
+    std::vector<std::int64_t> stage_ids_;
+    std::size_t cursor_ = 0;
+    std::int64_t waiting_stage_id_ = -1;
+    bool aborted_ = false;
 };
 
 }  // namespace chronowire::cpp_runtime
