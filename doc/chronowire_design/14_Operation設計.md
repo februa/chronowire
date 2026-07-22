@@ -453,12 +453,12 @@ Emission単位で往復しない。
 貸し、buffer protocol適合出力はborrow/zero-copyを優先する。不連続または契約不適合の
 場合だけ境界で1回copyし、fan-outはread-only batchを共有する。
 
-2026-07-22時点では、all-Python one-shot Planと、native prefixから末尾の単一Python islandへ
-進むmixed Planを実装済みである。StageDescriptorは外部入力・出力Port IDを保持し、mixed境界は
-C++所有結果からadapterへ一回copyしてStage単位でdispatchする。0/1/複数Emission、fan-out、
-status/Diagnostic、例外後の再実行をPythonExecutorと照合済みである。Pythonからnativeへ戻る境界、
-fixed-schema zero-copy、複数island、複数入力、Cpp PlanSessionは次段階であり、未対応時は
-Node/Port/Stage/bindingを含む明示エラーにする。
+2026-07-22時点では、all-Python one-shot Planと、単一Python islandの前後へnative prefix/suffixを
+置くmixed Planを実装済みである。StageDescriptorは外部入力・出力Port IDを保持し、mixed境界は
+C++所有結果からadapterへ、Python出力から合成native ingressへ、それぞれ一回copyする。
+0/1/複数Emission、RATE/FRAME、fan-out、status/Diagnostic、例外後の再実行をPythonExecutorと
+照合済みである。fixed-schema zero-copy、複数island、複数入力、Cpp PlanSessionは次段階であり、
+未対応時はNode/Port/Stage/bindingを含む明示エラーにする。
 
 意味論の正本はどちらのExecutor実装でもない。`OperationSpec`、`PortablePlanIR`、および
 論理時間、Emission件数、status、Diagnostic、buffer、lifecycleの設計契約を正本とする。
@@ -771,9 +771,9 @@ operation IDへ登録する。利用者はKernel class、ABI ID、session factor
 10. **未実装**: Fixed CBF参照packageを新APIへ移行し、旧APIをdeprecated化
 11. **初期実装済み**: `native_operation_include_dir()`でwrapper向けABI headerを公開し、
    DSP本体をChronowireに依存させない外部module build境界を固定
-12. **末尾Python islandまで初期実装済み**: CppRuntimeMetricsでGIL解放契約、native Stage dispatch、
-   Python境界callback、公開Emission復元、batch変換を分離計数。native prefixからplain callableへ
-   一回batch dispatchできる。Pythonからnativeへ戻る境界とzero-copyは未実装
+12. **単一Python island往復まで初期実装済み**: CppRuntimeMetricsでGIL解放契約、native Stage dispatch、
+   Python境界callback、公開Emission復元、batch変換を分離計数。native prefix/plain callable/
+   native suffix間を一回copyで往復できる。複数islandとzero-copyは未実装
 
 初期実装では`@cw.operation`と`cw.declare_operation()`を`Flow.map()`へ渡せる。receiver、同期Flow、
 latest StateFlowを宣言名へbindし、Python実装へ不変な`inputs` mappingと選択済み`ConfigView`だけを渡す。

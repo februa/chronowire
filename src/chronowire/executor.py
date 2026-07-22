@@ -260,8 +260,13 @@ class CppExecutor:
 
             return CppPythonStageExecutionSession(plan, validated)
         if any(stage.execution_domain == "python" for stage in plan.portable_ir.stages):
-            from .cpp_executor import CppMixedExecutionSession
+            from .cpp_executor import (
+                CppMixedExecutionSession,
+                CppPythonPrefixExecutionSession,
+            )
 
+            if plan.portable_ir.stages[0].execution_domain == "python":
+                return CppPythonPrefixExecutionSession(plan)
             return CppMixedExecutionSession(plan)
         return CppExecutionSession(plan, validated._extensions)
 

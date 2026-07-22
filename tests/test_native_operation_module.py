@@ -317,8 +317,30 @@ def test_operation_implementation_selection_is_independent_from_executor(
         backend="python",
         implementations={native.operation_id: native_backend},
     )
+    assert unsupported.run(executor="cpp") == unsupported.run(executor="python")
+
+    round_trip = source.map(native).map(shift).map(native)
+    resumed = cw.compile(
+        [cw.output(round_trip, collector=cw.Latest())],
+        backend="python",
+        implementations={native.operation_id: native_backend},
+    )
+    assert [stage.execution_domain for stage in resumed.portable_ir.stages] == [
+        "python_source",
+        "cpp",
+        "python",
+        "cpp",
+    ]
+    assert resumed.run(executor="cpp") == resumed.run(executor="python")
+
+    two_islands = source.map(native).map(shift).map(native).map(shift)
+    pending = cw.compile(
+        [cw.output(two_islands, collector=cw.Latest())],
+        backend="python",
+        implementations={native.operation_id: native_backend},
+    )
     with pytest.raises(ValueError, match="contract=mixed_stage_order") as captured:
-        unsupported.run(executor="cpp")
+        pending.run(executor="cpp")
     message = str(captured.value)
     assert "stage=" in message
     assert "node=" in message
@@ -337,6 +359,52 @@ def test_compile_rejects_unknown_operation_implementation_selector(tmp_path: Pat
             [mapped],
             implementations={"test.unknown.v1": cw.NativeModuleBackend(module)},
         )
+
+
+def test_cpp_python_prefix_preserves_zero_and_many_before_native_suffix(
+    tmp_path: Path,
+) -> None:
+    """Python→native境界でSkipとEmitManyを一つのfixed-shape batchへpackする。"""
+
+    calls = 0
+
+    @cw.operation(
+        operation_id="test.prefix_many.v1",
+        inputs={
+            "input": cw.OperationInputSpec(
+                primary=True,
+                value=cw.ValueSpec(dtype="float64", shape=(2,)),
+            )
+        },
+        output=cw.OperationOutputSpec(value="same", emissions="many", max_items=2),
+    )
+    def expand(inputs: Mapping[str, object], config: cw.ConfigView) -> object:
+        nonlocal calls
+        del config
+        calls += 1
+        value = inputs["input"]
+        if calls == 1:
+            return cw.skip()
+        return cw.emit_many((value, value))
+
+    native = _operation()
+    backend = cw.NativeModuleBackend(cw.NativeOperationModule(_build_module(tmp_path)))
+    source = cw.Flow(
+        cw.f64_vector_source([(1.0, 2.0), (3.0, 4.0)], width=2),
+        cw.Config(dsp={"scale": {"factor": 2.0}}),
+    )
+    mapped = source.map(expand).map(native)
+    plan = cw.compile(
+        [cw.output(mapped, collector=cw.Bounded(2))],
+        backend="python",
+        implementations={native.operation_id: backend},
+    )
+
+    cpp = plan.run(executor="cpp")
+    calls = 0
+
+    assert cpp == plan.run(executor="python")
+    assert [item.value for item in cpp.outputs[0].emissions] == [(6.0, 8.0)] * 2
 
 
 def test_native_module_rebinds_round_tripped_plan(tmp_path: Path) -> None:

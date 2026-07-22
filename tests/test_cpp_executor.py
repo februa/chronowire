@@ -1,6 +1,6 @@
 """compile済みPlanを自立運用する最小CppExecutorを検証する。"""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from fractions import Fraction
 
 import pytest
@@ -11,6 +11,7 @@ from chronowire.collector import Collector
 from chronowire.cpp_executor import (
     CppExecutionSession,
     CppMixedExecutionSession,
+    CppPythonPrefixExecutionSession,
     CppPythonStageExecutionSession,
 )
 from chronowire_reference import CythonCbfBackend, FixedCbfKernel
@@ -256,6 +257,59 @@ def test_cpp_mixed_python_failure_does_not_poison_next_plan_run() -> None:
         plan.run(executor="cpp")
 
     assert plan.run(executor="cpp").outputs[0].emissions
+
+
+def test_cpp_python_prefix_resumes_native_cbf_suffix() -> None:
+    """Python前処理とRATE/FRAMEのbatchをnative CBF suffixへresumeする。"""
+
+    @cw.operation(
+        operation_id="test.cpp_prefix_scale.v1",
+        inputs={
+            "input": cw.OperationInputSpec(
+                primary=True,
+                value=cw.ValueSpec(dtype="float64", shape=(2,)),
+            )
+        },
+        output="same",
+    )
+    def scale(inputs: Mapping[str, object], config: cw.ConfigView) -> object:
+        del config
+        value = inputs["input"]
+        assert isinstance(value, tuple)
+        return tuple(float(item) * 2.0 for item in value)
+
+    diagnostic = cw.Diagnostic(cw.Severity.WARNING, "PREFIX_DEGRADED", "safe fallback")
+    values = [
+        cw.Emission(
+            (float(index + 1), float(index + 1)),
+            cw.LogicalInterval(cw.LogicalTime(index), cw.LogicalTime(index + 1)),
+            index,
+            cw.EmissionStatus.DEGRADED if index == 0 else cw.EmissionStatus.OK,
+            (diagnostic,) if index == 0 else (),
+        )
+        for index in range(4)
+    ]
+    source = cw.Flow(cw.f64_vector_source(values, width=2))
+    frames = source.map(scale).rate(1).frame(2)
+    beams = frames.map(FixedCbfKernel(((0.5, 0.5),)))
+    plan = cw.compile(
+        [cw.output(beams, collector=cw.Bounded(2))],
+        backend=CythonCbfBackend(),
+        implementations={scale.operation_id: "python"},
+    )
+    session = plan.create_session(executor="cpp")
+
+    result = session.run()
+
+    assert isinstance(session, CppPythonPrefixExecutionSession)
+    assert result == plan.run(executor="python")
+    assert result.outputs[0].emissions[0].status is cw.EmissionStatus.DEGRADED
+    assert result.outputs[0].emissions[0].diagnostics == (diagnostic,)
+    assert session.last_metrics is not None
+    assert session.last_metrics.execution_classification == "hybrid"
+    assert session.last_metrics.stage_python_dispatches == 1
+    assert session.last_metrics.stage_boundary_batches == 1
+    assert session.last_metrics.copied_batches == 1
 
 
 def test_cpp_python_island_exception_does_not_poison_next_plan_run() -> None:

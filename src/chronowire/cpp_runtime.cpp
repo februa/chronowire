@@ -993,6 +993,10 @@ GraphRuntimeSession::GraphRuntimeSession(
         }
         if (node.opcode == 0) {
             ++source_nodes;
+            if (!node.output_shape.empty() &&
+                checked_shape_product(node.output_shape) != source_width_) {
+                throw std::invalid_argument("CppExecutor contract=source_output_shape");
+            }
         } else {
             if (node.input_ports.empty() ||
                 node.input_ports.size() != node.input_semantics.size()) {
@@ -1075,7 +1079,10 @@ GraphRuntimeResult GraphRuntimeSession::run(
                     source_values_.begin() + static_cast<std::ptrdiff_t>(offset),
                     source_values_.begin() + static_cast<std::ptrdiff_t>(offset + source_width_)
                 );
-                item.shape = {source_width_};
+                // 合成Stage ingressでもresolved item shapeを失わない。旧IRだけ幅一次元へ戻す。
+                item.shape = node.output_shape.empty()
+                    ? std::vector<std::size_t>{source_width_}
+                    : node.output_shape;
                 item.start = start;
                 item.end = end;
                 item.sequence = static_cast<std::int64_t>(batch.size());
