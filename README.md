@@ -135,10 +135,13 @@ RATE/FRAMEをbatch化してCython CBFへ一回で渡し、C++ ExecutorはRATE/FR
 compile時に`beams × frame_size`へ固定される。Python callbackを含む混在Planは引き続き
 Python Stage境界として明示する。CppExecutorは、all-Python Planを単一の最大Python islandとし、
 C++側の`advance()` / `resume()`状態とGIL下のadapterを通して実行できる。Python/native mixed
-Planは、Python islandの前後にnative区間を置き、固定shape f64 batchを境界ごと一回copyする。
+PlanはPython islandの前後にnative区間を置ける。通常のPython実装は固定shape f64 batchを境界で
+一回copyするが、`@cw.operation(..., accepts_readonly_buffers=True)`を明示した実装にはC++所有値を
+read-only一次元`memoryview`として貸し、同じviewを返す連続batchはnative suffixへcopyせずbindする。
+このopt-in実装はExecutor非依存性のため、通常のPython値とmemoryviewの両方を受理する。
 Sourceを含むPython prefixまたはnative prefixのどちらから始まる線形Planでも、複数Python islandを
 実行できる。native区間からPython islandへ入る複数Portは`synchronous`と`latest`をStage単位で
-照合できる。Pythonからnativeへの複数ingress、fixed-schema zero-copy、mixed継続Sessionは
+照合できる。Pythonからnativeへの複数ingress、計算で新規生成したbufferのzero-copy、mixed継続Sessionは
 段階実装中である。
 
 C++ Executor移行判断用benchmarkは、Plan全体、Source/tick packing、RATE/FRAME、CBF、collector

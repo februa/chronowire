@@ -388,6 +388,131 @@ def test_operation_implementation_selection_is_independent_from_executor(
     assert retryable.run(executor="cpp").outputs[0].emissions
 
 
+def test_cpp_executor_borrows_opted_in_fixed_schema_python_boundary(
+    tmp_path: Path,
+) -> None:
+    """明示opt-inしたPython Operationの前後で同じread-only bufferを共有する。"""
+
+    seen_views: list[memoryview] = []
+
+    @cw.operation(
+        operation_id="test.borrowed_identity.v1",
+        inputs={
+            "input": cw.OperationInputSpec(
+                primary=True,
+                value=cw.ValueSpec(dtype="float64", shape=(2,)),
+            )
+        },
+        output="same",
+        accepts_readonly_buffers=True,
+    )
+    def borrowed_identity(inputs: Mapping[str, object], config: cw.ConfigView) -> object:
+        del config
+        value = inputs["input"]
+        if isinstance(value, memoryview):
+            assert value.readonly
+            assert value.format == "d"
+            seen_views.append(value)
+        return value
+
+    native = _operation()
+    backend = cw.NativeModuleBackend(cw.NativeOperationModule(_build_module(tmp_path)))
+    source = cw.Flow(
+        cw.f64_vector_source([(1.0, 2.0), (3.0, 4.0)], width=2),
+        cw.Config(dsp={"scale": {"factor": 2.0}}),
+    )
+    flow = source.map(native).map(borrowed_identity).map(native)
+    plan = cw.compile(
+        [cw.output(flow, collector=cw.Bounded(2))],
+        backend="python",
+        implementations={native.operation_id: backend},
+    )
+    session = plan.create_session(executor="cpp")
+
+    result = session.run()
+
+    assert result == plan.run(executor="python")
+    assert [item.value for item in result.outputs[0].emissions] == [
+        (4.0, 8.0),
+        (12.0, 16.0),
+    ]
+    assert len(seen_views) == 2
+    assert seen_views[0].obj is seen_views[1].obj
+    assert session.last_metrics is not None
+    assert session.last_metrics.stage_boundary_batches == 2
+    assert session.last_metrics.zero_copy_batches == 2
+    assert session.last_metrics.copied_batches == 0
+    first_owner = seen_views[0].obj
+    seen_views.clear()
+
+    assert session.run() == result
+    assert len(seen_views) == 2
+    assert seen_views[0].obj is not first_owner
+    assert session.last_metrics is not None
+    assert session.last_metrics.zero_copy_batches == 2
+    implementation = next(
+        item
+        for item in plan.portable_ir.implementations
+        if item.operation_id == borrowed_identity.operation_id
+    )
+    assert implementation.accepts_readonly_buffers
+    round_tripped = cw.PortablePlanIR.from_json(plan.portable_ir.to_json())
+    assert next(
+        item
+        for item in round_tripped.implementations
+        if item.operation_id == borrowed_identity.operation_id
+    ).accepts_readonly_buffers
+
+    seen_views.clear()
+    shared = source.map(native)
+    fanout_plan = cw.compile(
+        [
+            cw.output(shared.map(borrowed_identity), collector=cw.Bounded(2)),
+            cw.output(shared.map(borrowed_identity), collector=cw.Bounded(2)),
+        ],
+        backend="python",
+        implementations={native.operation_id: backend},
+    )
+    fanout_session = fanout_plan.create_session(executor="cpp")
+
+    assert fanout_session.run() == fanout_plan.run(executor="python")
+    assert len(seen_views) == 4
+    assert seen_views[0] is seen_views[2]
+    assert seen_views[1] is seen_views[3]
+    assert fanout_session.last_metrics is not None
+    assert fanout_session.last_metrics.zero_copy_batches == 1
+    assert fanout_session.last_metrics.copied_batches == 0
+
+    @cw.operation(
+        operation_id="test.borrowed_copy_fallback.v1",
+        inputs={
+            "input": cw.OperationInputSpec(
+                primary=True,
+                value=cw.ValueSpec(dtype="float64", shape=(2,)),
+            )
+        },
+        output="same",
+        accepts_readonly_buffers=True,
+    )
+    def copy_fallback(inputs: Mapping[str, object], config: cw.ConfigView) -> object:
+        del config
+        value = inputs["input"]
+        assert isinstance(value, (tuple, memoryview))
+        return tuple(float(item) + 1.0 for item in value)
+
+    copied_plan = cw.compile(
+        [cw.output(source.map(native).map(copy_fallback).map(native), collector=cw.Bounded(2))],
+        backend="python",
+        implementations={native.operation_id: backend},
+    )
+    copied_session = copied_plan.create_session(executor="cpp")
+
+    assert copied_session.run() == copied_plan.run(executor="python")
+    assert copied_session.last_metrics is not None
+    assert copied_session.last_metrics.zero_copy_batches == 1
+    assert copied_session.last_metrics.copied_batches == 1
+
+
 @pytest.mark.parametrize("input_mode", ["synchronous", "latest"])
 def test_cpp_executor_runs_multiple_input_python_stage_boundary(
     tmp_path: Path,

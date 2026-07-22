@@ -456,10 +456,14 @@ Emission単位で往復しない。
 
 2026-07-22時点では、all-Python one-shot Plan、単一Python island往復、およびnative Source側から
 始まる線形複数island Planを実装済みである。StageDescriptorは外部入力・出力Port IDを保持し、mixed境界は
-C++所有結果からadapterへ、Python出力から合成native ingressへ、それぞれ一回copyする。
+C++結果vectorはread-only Python buffer ownerへmoveする。通常のPython実装へはtupleへ一回copyするが、
+`accepts_readonly_buffers=True`を持つImplementationへは各itemをflatなread-only memoryviewで貸し、
+同じowner上の連続viewを返した場合は合成native ingressもborrowする。この能力はcanonical Python値を
+拒否する指定ではなく追加受理能力であり、同じImplementationはPythonExecutorの通常値も扱う。
 0/1/複数Emission、RATE/FRAME、fan-out、status/Diagnostic、例外後の再実行をPythonExecutorと
 照合済みである。native→Python複数入力は`synchronous`完全interval一致と`latest`選択を
-単一・複数islandで実装済みである。fixed-schema zero-copy、Python→native複数ingress、
+単一・複数islandで実装済みである。fixed-schemaの明示opt-in borrowと単一copy fallbackも実装済みである。
+Python→native複数ingress、Pythonが新規生成したbufferのborrow、
 mixed Cpp Sessionは次段階であり、未対応時はNode/Port/Stage/bindingを含む明示エラーにする。
 
 意味論の正本はどちらのExecutor実装でもない。`OperationSpec`、`PortablePlanIR`、および
@@ -793,7 +797,8 @@ operation IDへ登録する。利用者はKernel class、ABI ID、session factor
 12. **線形複数Python islandまで初期実装済み**: CppRuntimeMetricsでGIL解放契約、native Stage dispatch、
    Python境界callback、公開Emission復元、batch変換を分離計数。native prefix/plain callable/
    native区間間を一回copyで往復できる。native→Pythonのsynchronous/latest複数入力境界も
-   実装済み。zero-copyとPython→native複数ingressは未実装
+   実装済み。明示opt-inした固定shape単一ingressはzero-copyで往復できる。Python生成bufferの
+   zero-copyとPython→native複数ingressは未実装
 
 初期実装では`@cw.operation`と`cw.declare_operation()`を`Flow.map()`へ渡せる。receiver、同期Flow、
 latest StateFlowを宣言名へbindし、Python実装へ不変な`inputs` mappingと選択済み`ConfigView`だけを渡す。

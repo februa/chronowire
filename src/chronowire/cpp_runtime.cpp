@@ -44,6 +44,20 @@ std::vector<T> copy_buffer(const char* data, std::size_t byte_count, std::size_t
     return result;
 }
 
+template <typename T>
+const T* borrow_buffer(const char* data, std::size_t byte_count, std::size_t count) {
+    if (byte_count != checked_size_multiply(count, sizeof(T))) {
+        throw std::invalid_argument("CppExecutor contract=binding_byte_length");
+    }
+    if (byte_count == 0) {
+        return nullptr;
+    }
+    if (data == nullptr || reinterpret_cast<std::uintptr_t>(data) % alignof(T) != 0) {
+        throw std::invalid_argument("CppExecutor contract=borrowed_buffer_alignment");
+    }
+    return reinterpret_cast<const T*>(data);
+}
+
 std::int64_t checked_lcm(std::int64_t left, std::int64_t right) {
     if (left <= 0 || right <= 0) {
         throw std::invalid_argument("CppExecutor contract=positive_timebase");
@@ -957,15 +971,25 @@ GraphRuntimeSession::GraphRuntimeSession(
     std::size_t source_reset_bytes,
     std::size_t source_count,
     std::size_t source_width,
-    std::int64_t source_timebase_denominator
+    std::int64_t source_timebase_denominator,
+    bool borrow_source_values
 ) :
     nodes_(nodes),
     outputs_(outputs),
-    source_values_(copy_buffer<double>(
-        source_values,
-        source_value_bytes,
-        checked_size_multiply(source_count, source_width)
-    )),
+    owned_source_values_(borrow_source_values
+        ? std::vector<double>{}
+        : copy_buffer<double>(
+            source_values,
+            source_value_bytes,
+            checked_size_multiply(source_count, source_width)
+        )),
+    source_values_(borrow_source_values
+        ? borrow_buffer<double>(
+            source_values,
+            source_value_bytes,
+            checked_size_multiply(source_count, source_width)
+        )
+        : owned_source_values_.data()),
     source_starts_(copy_buffer<std::int64_t>(source_starts, source_start_bytes, source_count)),
     source_ends_(copy_buffer<std::int64_t>(source_ends, source_end_bytes, source_count)),
     source_statuses_(copy_buffer<std::uint8_t>(
@@ -1076,8 +1100,8 @@ GraphRuntimeResult GraphRuntimeSession::run(
                 GraphItem item;
                 const std::size_t offset = index * source_width_;
                 item.values.assign(
-                    source_values_.begin() + static_cast<std::ptrdiff_t>(offset),
-                    source_values_.begin() + static_cast<std::ptrdiff_t>(offset + source_width_)
+                    source_values_ + offset,
+                    source_values_ + offset + source_width_
                 );
                 // 合成Stage ingressでもresolved item shapeを失わない。旧IRだけ幅一次元へ戻す。
                 item.shape = node.output_shape.empty()
@@ -1221,7 +1245,7 @@ GraphRuntimeResult GraphRuntimeSession::run(
     result.output_select_ns = elapsed_ns(select_start, std::chrono::steady_clock::now());
     result.owned_input_bytes = 0;
     for (const std::size_t byte_count : {
-             checked_size_multiply(source_values_.size(), sizeof(double)),
+             checked_size_multiply(owned_source_values_.size(), sizeof(double)),
              checked_size_multiply(source_starts_.size(), sizeof(std::int64_t)),
              checked_size_multiply(source_ends_.size(), sizeof(std::int64_t)),
              checked_size_multiply(source_statuses_.size(), sizeof(std::uint8_t)),

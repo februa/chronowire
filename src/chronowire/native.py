@@ -41,7 +41,7 @@ class NativeValueBatch:
     """native Kernel境界を通るread-only contiguous f64 item batch。
 
     Args:
-        values: native endian float64を連続格納したimmutable bytes。
+        values: native endian float64を連続格納したread-only buffer。
         item_count: batch内の論理item数。
         item_shape: 一つのitemの固定shape。
 
@@ -49,7 +49,7 @@ class NativeValueBatch:
         ValueError: 件数、shape、buffer byte数が契約と一致しない場合。
     """
 
-    values: bytes
+    values: bytes | memoryview
     item_count: int
     item_shape: tuple[int, ...]
 
@@ -57,13 +57,16 @@ class NativeValueBatch:
         if self.item_count < 0 or any(item <= 0 for item in self.item_shape):
             raise ValueError("native value batch count and shape must be valid")
         item_width = reduce(mul, self.item_shape, 1)
-        if len(self.values) != self.item_count * item_width * 8:
+        value_view = memoryview(self.values)
+        if not value_view.readonly or not value_view.c_contiguous:
+            raise ValueError("native value batch values must be a read-only contiguous buffer")
+        if value_view.nbytes != self.item_count * item_width * 8:
             raise ValueError("native value batch byte length does not match its shape")
 
     def f64_view(self) -> memoryview[float]:
         """copyせずread-only float64一次元viewを返す。"""
 
-        return memoryview(self.values).cast("d")
+        return memoryview(self.values).cast("B").cast("d")
 
 
 @dataclass(frozen=True)
@@ -87,7 +90,7 @@ class NativeF64Ingress:
         Diagnostic本体はPython bindingが所有し、native runtimeはsource indexだけを伝播する。
     """
 
-    values: bytes
+    values: bytes | memoryview
     start_ticks: bytes
     end_ticks: bytes
     statuses: bytes
@@ -99,7 +102,10 @@ class NativeF64Ingress:
     def __post_init__(self) -> None:
         if self.item_count < 0 or self.width <= 0 or self.timebase_denominator <= 0:
             raise ValueError("native ingress count, width, and timebase must be valid")
-        if len(self.values) != self.item_count * self.width * 8:
+        value_view = memoryview(self.values)
+        if not value_view.readonly or not value_view.c_contiguous:
+            raise ValueError("native ingress values must be a read-only contiguous buffer")
+        if value_view.nbytes != self.item_count * self.width * 8:
             raise ValueError("native ingress value byte length does not match its shape")
         if len(self.start_ticks) != self.item_count * 8:
             raise ValueError("native ingress start tick byte length does not match item count")

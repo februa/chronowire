@@ -678,6 +678,7 @@ class ImplementationDescriptor:
         workspace_alignment_bytes: workspace alignment。
         supports_flush: flush entrypointを持つ場合にTrue。
         session_local: mutable状態がrun-localならTrue。
+        accepts_readonly_buffers: Python Stageがread-only固定schema viewを受理する場合にTrue。
     """
 
     operation_id: str
@@ -693,6 +694,7 @@ class ImplementationDescriptor:
     workspace_alignment_bytes: int | None
     supports_flush: bool
     session_local: bool
+    accepts_readonly_buffers: bool
 
     def __post_init__(self) -> None:
         if not all(
@@ -730,6 +732,7 @@ class ImplementationDescriptor:
             _optional_integer(data, "workspace_alignment_bytes"),
             _boolean(data, "supports_flush"),
             _boolean(data, "session_local"),
+            _boolean(data, "accepts_readonly_buffers"),
         )
 
 

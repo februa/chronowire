@@ -1284,6 +1284,7 @@ def _portable_plan_ir(
                 implementation.workspace_alignment_bytes,
                 implementation.supports_flush,
                 implementation.session_local,
+                implementation.accepts_readonly_buffers,
             )
         )
         inputs_by_name = {item.keyword: item for item in node.inputs}

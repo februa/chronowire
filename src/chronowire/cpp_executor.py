@@ -9,7 +9,11 @@ from math import isfinite, lcm, prod
 from time import perf_counter_ns
 from typing import Any
 
-from ._cpp_executor import CppCooperativeStageSession, CppGraphNativeSession
+from ._cpp_executor import (
+    CppCooperativeStageSession,
+    CppGraphNativeSession,
+    _readonly_buffer_address,
+)
 from .collector import BufferOverflowError
 from .errors import ExtensionExecutionError, KernelExecutionError, SessionError
 from .executor import CppRuntimeMetrics, RunSessionRunner
@@ -58,6 +62,19 @@ _STATUS_TO_NATIVE = {
 def _flatten_f64(value: object, shape: tuple[int, ...], *, port_id: int) -> tuple[float, ...]:
     """固定shape Python値をnative item-major f64へ検証付きで平坦化する。"""
 
+    if isinstance(value, memoryview):
+        if value.format != "d" or not value.readonly or not value.c_contiguous:
+            raise ValueError(
+                "CppExecutor contract=readonly_contiguous_f64_boundary; "
+                f"port={port_id} format={value.format} readonly={value.readonly}"
+            )
+        expected_width = prod(shape) if shape else 1
+        if len(value) != expected_width:
+            raise ValueError(
+                "CppExecutor contract=fixed_stage_boundary_shape; "
+                f"port={port_id} expected_width={expected_width} actual={len(value)}"
+            )
+        return tuple(float(item) for item in value)
     if not shape:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(
@@ -79,13 +96,70 @@ def _flatten_f64(value: object, shape: tuple[int, ...], *, port_id: int) -> tupl
     )
 
 
+def _borrow_stage_values(
+    emissions: tuple[Emission[object], ...],
+    shape: tuple[int, ...],
+) -> memoryview[int] | None:
+    """同じC++ batchの連続item列ならread-only byte viewを返す。"""
+
+    if not emissions:
+        return None
+    first = emissions[0].value
+    if not isinstance(first, memoryview):
+        return None
+    width = prod(shape) if shape else 1
+    if first.format != "d" or not first.readonly or not first.c_contiguous or len(first) != width:
+        return None
+    owner = first.obj
+    owner_view = memoryview(owner).cast("B")
+    owner_address, owner_bytes = _readonly_buffer_address(owner_view)
+    first_address, _ = _readonly_buffer_address(first)
+    if first_address % 8 != 0:
+        return None
+    expected_address = first_address
+    for emission in emissions:
+        item = emission.value
+        if (
+            not isinstance(item, memoryview)
+            or item.obj is not owner
+            or item.format != "d"
+            or not item.readonly
+            or not item.c_contiguous
+            or len(item) != width
+        ):
+            return None
+        address, byte_count = _readonly_buffer_address(item)
+        if address != expected_address or byte_count != width * 8:
+            return None
+        expected_address += byte_count
+    start = first_address - owner_address
+    end = expected_address - owner_address
+    if start < 0 or end > owner_bytes:
+        return None
+    return owner_view[start:end]
+
+
+def _public_emission(
+    emission: Emission[object],
+    shape: tuple[int, ...] | None,
+) -> Emission[object]:
+    """公開境界で内部buffer所有型を漏らさないEmissionを返す。"""
+
+    if not isinstance(emission.value, memoryview):
+        return emission
+    if shape is None:
+        raise RuntimeError("CppExecutor contract=public_buffer_shape")
+    value = _reshape_item(emission.value, 0, shape)
+    return replace(emission, value=value)
+
+
 def _pack_stage_ingress(
     emissions: tuple[Emission[object], ...],
     shape: tuple[int, ...],
     *,
     port_id: int,
-) -> NativeF64Ingress:
-    """Python Stage出力をC++所有ingressへ一回copyする。"""
+) -> tuple[NativeF64Ingress, bool]:
+    """Python Stage出力をborrowし、不適合時だけC++ ingress用にcopyする。"""
 
     denominator = 1
     for emission in emissions:
@@ -94,12 +168,17 @@ def _pack_stage_ingress(
             emission.interval.start.as_fraction().denominator,
             emission.interval.end.as_fraction().denominator,
         )
-    flattened = tuple(
-        value
-        for emission in emissions
-        for value in _flatten_f64(emission.value, shape, port_id=port_id)
-    )
-    values = array("d", flattened)
+    borrowed_values = _borrow_stage_values(emissions, shape)
+    values: bytes | memoryview
+    if borrowed_values is None:
+        flattened = tuple(
+            value
+            for emission in emissions
+            for value in _flatten_f64(emission.value, shape, port_id=port_id)
+        )
+        values = array("d", flattened).tobytes()
+    else:
+        values = borrowed_values
     starts = array(
         "q",
         (int(emission.interval.start.as_fraction() * denominator) for emission in emissions),
@@ -109,7 +188,7 @@ def _pack_stage_ingress(
         (int(emission.interval.end.as_fraction() * denominator) for emission in emissions),
     )
     return NativeF64Ingress(
-        values.tobytes(),
+        values,
         starts.tobytes(),
         ends.tobytes(),
         bytes(_STATUS_TO_NATIVE[emission.status] for emission in emissions),
@@ -120,7 +199,7 @@ def _pack_stage_ingress(
         len(emissions),
         prod(shape) if shape else 1,
         denominator,
-    )
+    ), borrowed_values is not None
 
 
 def _status_max(first: EmissionStatus, second: EmissionStatus) -> EmissionStatus:
@@ -132,6 +211,38 @@ def _status_max(first: EmissionStatus, second: EmissionStatus) -> EmissionStatus
         EmissionStatus.INVALID: 2,
     }
     return first if order[first] >= order[second] else second
+
+
+def _python_consumers_accept_buffer(plan: Plan, nodes: tuple[Any, ...], port_id: int) -> bool:
+    """境界Portを直接読む全Python Kernelがread-only viewを宣言したか返す。"""
+
+    consumers = tuple(
+        node for node in nodes if any(item.source_port == port_id for item in node.inputs)
+    )
+    if not consumers:
+        return False
+    return all(
+        bool(
+            getattr(
+                getattr(plan._kernels.get(node.id), "implementation_spec", None),
+                "accepts_readonly_buffers",
+                False,
+            )
+        )
+        for node in consumers
+    )
+
+
+def _port_shape(plan: Plan, port_id: int) -> tuple[int, ...] | None:
+    """PortablePlanIRからPortのresolved item shapeを返す。"""
+
+    port = next(item for item in plan.portable_ir.ports if item.port_id == port_id)
+    schema = next(
+        item
+        for item in plan.portable_ir.value_schemas
+        if item.value_schema_id == port.value_schema_id
+    )
+    return schema.shape
 
 
 def _run_python_map_nodes(
@@ -506,6 +617,7 @@ class CppSession(RunSessionRunner):
         self._public_emission_reconstructions = 0
         self._python_boundary_dispatches = 0
         self._boundary_batch_conversions = 0
+        self._ingress_zero_copy = False
         self._contract_context = "node=None port=None"
         self._source_emissions: tuple[Emission[object], ...]
         self._node_ports: dict[int, int] = {}
@@ -754,7 +866,7 @@ class CppSession(RunSessionRunner):
             if self._ingress_shape is None:
                 raise RuntimeError("CppExecutor contract=bound_stage_ingress_shape")
             self._source_emissions = self._ingress_emissions
-            ingress = _pack_stage_ingress(
+            ingress, self._ingress_zero_copy = _pack_stage_ingress(
                 self._ingress_emissions,
                 self._ingress_shape,
                 port_id=self._ingress_port,
@@ -783,8 +895,9 @@ class CppSession(RunSessionRunner):
         native_output: tuple[Any, ...],
         *,
         port_id: int,
+        borrow_values: bool = False,
     ) -> tuple[tuple[Emission[object], ...], int, int, bool]:
-        """C++ collector境界の可変shape itemを公開Emissionへ復元する。"""
+        """C++ collector境界を公開値またはread-only Stage viewへ復元する。"""
 
         (
             output_bytes,
@@ -886,9 +999,14 @@ class CppSession(RunSessionRunner):
             metadata = (
                 self._source_emissions[metadata_index].metadata if metadata_index >= 0 else {}
             )
+            item_value: object
+            if borrow_values:
+                item_value = values[value_start:value_end]
+            else:
+                item_value = _reshape_item(values, value_start, shape)
             emissions.append(
                 Emission(
-                    _reshape_item(values, value_start, shape),
+                    item_value,
                     interval,
                     sequence,
                     status,
@@ -1206,6 +1324,11 @@ class CppMixedSession(RunSessionRunner):
         self._stage = stage
         self._python_nodes = python_nodes
         self._boundary_ports = boundary_ports
+        self._borrow_boundary_ports = frozenset(
+            port_id
+            for port_id in boundary_ports
+            if _python_consumers_accept_buffer(plan, python_nodes, port_id)
+        )
         self._suffix_boundary_port = suffix_boundary_port
         self._suffix_boundary_shape = suffix_boundary_shape
         self._native_suffix_node_ids = native_suffix_node_ids
@@ -1258,6 +1381,7 @@ class CppMixedSession(RunSessionRunner):
                 boundary, _, _, overflowed = self._native._decode_native_output(
                     native_output,
                     port_id=boundary_port,
+                    borrow_values=boundary_port in self._borrow_boundary_ports,
                 )
                 if overflowed:
                     raise RuntimeError(
@@ -1277,6 +1401,7 @@ class CppMixedSession(RunSessionRunner):
             self._coordinator.resume(stage_id)
             suffix_result: RunResult | None = None
             suffix_metrics: CppRuntimeMetrics | None = None
+            suffix_ingress_zero_copy = False
             suffix_boundary: tuple[Emission[object], ...] = ()
             if self._native_suffix_node_ids:
                 if self._suffix_boundary_port is None or self._suffix_boundary_shape is None:
@@ -1291,6 +1416,7 @@ class CppMixedSession(RunSessionRunner):
                 )
                 suffix_result = suffix.run()
                 suffix_metrics = suffix.last_metrics
+                suffix_ingress_zero_copy = suffix._ingress_zero_copy
             completed, completed_stage = self._coordinator.advance()
             if completed != 1 or completed_stage != -1:
                 raise RuntimeError(
@@ -1341,8 +1467,16 @@ class CppMixedSession(RunSessionRunner):
                 gil_acquisitions=1,
                 stage_boundary_batches=len(boundaries) + 1,
                 stage_boundary_bytes=metrics[4] + suffix_boundary_bytes,
-                copied_batches=sum(bool(batch) for batch in boundaries.values())
-                + (1 if suffix_boundary else 0),
+                zero_copy_batches=sum(
+                    bool(batch) and port_id in self._borrow_boundary_ports
+                    for port_id, batch in boundaries.items()
+                )
+                + (1 if suffix_boundary and suffix_ingress_zero_copy else 0),
+                copied_batches=sum(
+                    bool(batch) and port_id not in self._borrow_boundary_ports
+                    for port_id, batch in boundaries.items()
+                )
+                + (1 if suffix_boundary and not suffix_ingress_zero_copy else 0),
                 python_stage_ns=python_stage_ns,
                 native_stage_ns=(
                     metrics[0]
@@ -1359,8 +1493,9 @@ class CppMixedSession(RunSessionRunner):
         outputs: list[OutputResult[object]] = []
         for output_spec in self.plan._outputs:
             collector = output_spec.collector.create_session()
+            output_shape = _port_shape(self.plan, output_spec.flow.port_id)
             for emission in batches[output_spec.flow.port_id]:
-                collector.add(emission)
+                collector.add(_public_emission(emission, output_shape))
             snapshot = collector.snapshot()
             emissions = snapshot.emissions
             outputs.append(
@@ -1394,7 +1529,14 @@ class CppMixedSession(RunSessionRunner):
             gil_acquisitions=1,
             stage_boundary_batches=len(boundaries),
             stage_boundary_bytes=boundary_bytes,
-            copied_batches=sum(bool(batch) for batch in boundaries.values()),
+            zero_copy_batches=sum(
+                bool(batch) and port_id in self._borrow_boundary_ports
+                for port_id, batch in boundaries.items()
+            ),
+            copied_batches=sum(
+                bool(batch) and port_id not in self._borrow_boundary_ports
+                for port_id, batch in boundaries.items()
+            ),
             python_stage_ns=python_stage_ns,
             native_stage_ns=metrics[0] + metrics[1] + metrics[2],
             execution_classification="hybrid",
@@ -1592,7 +1734,8 @@ class CppPythonPrefixSession(RunSessionRunner):
             gil_acquisitions=1,
             stage_boundary_batches=1,
             stage_boundary_bytes=boundary_bytes,
-            copied_batches=1 if boundary else 0,
+            zero_copy_batches=1 if boundary and native._ingress_zero_copy else 0,
+            copied_batches=1 if boundary and not native._ingress_zero_copy else 0,
             python_stage_ns=python_stage_ns,
             native_stage_ns=metrics.scheduler_ns + metrics.kernel_ns + metrics.output_select_ns,
             execution_classification="hybrid",
@@ -1792,6 +1935,7 @@ class CppMultiIslandSession(RunSessionRunner):
         boundary_batches = 0
         boundary_bytes = 0
         copied_batches = 0
+        zero_copy_batches = 0
         python_stage_ns = 0
         native_stage_ns = 0
         cursor = 0
@@ -1828,6 +1972,11 @@ class CppMultiIslandSession(RunSessionRunner):
                         ingress_emissions=ingress_batch,
                         ingress_shape=ingress_shape,
                     )
+                    if ingress_batch:
+                        if native._ingress_zero_copy:
+                            zero_copy_batches += 1
+                        else:
+                            copied_batches += 1
                     raw_outputs, raw_counts, raw_metrics = native._runtime.run(
                         None if cursor or logical_end is None else logical_end.numerator,
                         None if cursor or logical_end is None else logical_end.denominator,
@@ -1842,9 +1991,15 @@ class CppMultiIslandSession(RunSessionRunner):
                         executed_node_count -= 1
                     self._merge_counts(status_counts, native_counts)
                     for input_port, raw_output in zip(input_ports, raw_outputs, strict=True):
+                        borrow_boundary = _python_consumers_accept_buffer(
+                            self.plan,
+                            self._stage_nodes[stage.stage_id],
+                            input_port,
+                        )
                         boundary, _, _, overflowed = native._decode_native_output(
                             raw_output,
                             port_id=input_port,
+                            borrow_values=borrow_boundary,
                         )
                         if overflowed:
                             raise RuntimeError(
@@ -1853,7 +2008,11 @@ class CppMultiIslandSession(RunSessionRunner):
                             )
                         stage_inputs[input_port] = boundary
                         public_reconstructions += len(boundary)
-                        copied_batches += 1 if boundary else 0
+                        if boundary:
+                            if borrow_boundary:
+                                zero_copy_batches += 1
+                            else:
+                                copied_batches += 1
                     scheduler_ns += raw_metrics[0]
                     kernel_ns += raw_metrics[1]
                     output_select_ns += raw_metrics[2]
@@ -1898,7 +2057,6 @@ class CppMultiIslandSession(RunSessionRunner):
                     pack_bytes = len(ingress_batch) * prod(ingress_shape) * 8
                     boundary_batches += 1
                     boundary_bytes += pack_bytes
-                    copied_batches += 1 if ingress_batch else 0
                 else:
                     final_batches = batches
 
@@ -1932,6 +2090,11 @@ class CppMultiIslandSession(RunSessionRunner):
                     + suffix_metrics.output_select_ns
                 )
                 public_reconstructions += suffix_metrics.public_emission_reconstructions
+                if ingress_batch:
+                    if suffix._ingress_zero_copy:
+                        zero_copy_batches += 1
+                    else:
+                        copied_batches += 1
 
             completed, completed_stage = self._coordinator.advance()
             if completed != 1 or completed_stage != -1:
@@ -1959,6 +2122,7 @@ class CppMultiIslandSession(RunSessionRunner):
             stage_boundary_batches=boundary_batches,
             stage_boundary_bytes=boundary_bytes,
             copied_batches=copied_batches,
+            zero_copy_batches=zero_copy_batches,
             python_stage_ns=python_stage_ns,
             native_stage_ns=native_stage_ns,
             execution_classification="hybrid",
@@ -1970,8 +2134,9 @@ class CppMultiIslandSession(RunSessionRunner):
         outputs: list[OutputResult[object]] = []
         for output_spec in self.plan._outputs:
             collector = output_spec.collector.create_session()
+            output_shape = _port_shape(self.plan, output_spec.flow.port_id)
             for emission in final_batches[output_spec.flow.port_id]:
-                collector.add(emission)
+                collector.add(_public_emission(emission, output_shape))
             snapshot = collector.snapshot()
             emissions = snapshot.emissions
             outputs.append(

@@ -1,7 +1,9 @@
 # cython: language_level=3
 # distutils: language = c++
 
+from cpython.buffer cimport Py_buffer, PyBuffer_FillInfo
 from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize
+from cpython.memoryview cimport PyMemoryView_GET_BUFFER
 from libc.stddef cimport size_t
 from libc.stdint cimport int64_t, uint8_t, uint64_t, uintptr_t
 from libcpp.string cimport string
@@ -138,6 +140,7 @@ cdef extern from "cpp_runtime.hpp" namespace "chronowire::cpp_runtime":
             size_t source_count,
             size_t source_width,
             int64_t source_timebase_denominator,
+            bint borrow_source_values,
         ) except +
         GraphRuntimeResult run(
             bint has_logical_end,
@@ -168,6 +171,43 @@ cdef vector[double] _f64_vector(bytes values):
     for index in range(count):
         result.push_back(pointer[index])
     return result
+
+
+cdef class _CppF64Buffer:
+    """C++ vectorのstorageをread-only Python bufferとして所有する。"""
+
+    cdef vector[double] _values
+
+    def __getbuffer__(self, Py_buffer* view, int flags):
+        cdef void* pointer = NULL
+        if self._values.size() != 0:
+            pointer = <void*>&self._values[0]
+        if PyBuffer_FillInfo(
+            view,
+            self,
+            pointer,
+            self._values.size() * sizeof(double),
+            1,
+            flags,
+        ) < 0:
+            raise BufferError("failed to export C++ f64 result buffer")
+
+
+cdef _CppF64Buffer _move_f64_buffer(vector[double]& values):
+    """vector storageをcopyせずPython所有bufferへ移す。"""
+
+    cdef _CppF64Buffer owner = _CppF64Buffer.__new__(_CppF64Buffer)
+    owner._values.swap(values)
+    return owner
+
+
+def _readonly_buffer_address(value):
+    """read-only contiguous bufferの先頭addressとbyte数を内部adapterへ返す。"""
+
+    cdef const unsigned char[::1] view = memoryview(value).cast("B")
+    if view.shape[0] == 0:
+        return 0, 0
+    return <uintptr_t>&view[0], view.shape[0]
 
 
 cdef class CppCooperativeStageSession:
@@ -385,13 +425,14 @@ cdef class CppGraphNativeSession:
     """PortablePlanIR DAGを所有して実行するC++ runtime session。"""
 
     cdef GraphRuntimeSession* _runtime
+    cdef object _source_values_owner
 
     def __cinit__(
         self,
         schema_version,
         nodes,
         outputs,
-        bytes source_values,
+        source_values,
         bytes source_starts,
         bytes source_ends,
         bytes source_statuses,
@@ -412,8 +453,13 @@ cdef class CppGraphNativeSession:
         cdef object extent
         cdef object input_port
         cdef object input_semantic
+        cdef Py_buffer* source_value_buffer
 
         self._runtime = NULL
+        self._source_values_owner = memoryview(source_values).cast("B")
+        if not self._source_values_owner.readonly:
+            raise ValueError("CppExecutor borrowed source values must be read-only")
+        source_value_buffer = PyMemoryView_GET_BUFFER(self._source_values_owner)
         for descriptor in nodes:
             node = GraphNodeSpec()
             node.node_id = descriptor[0]
@@ -451,13 +497,13 @@ cdef class CppGraphNativeSession:
             output.collector_capacity = descriptor[2]
             output.overflow_policy = descriptor[3]
             native_outputs.push_back(output)
-        # 全pointerはborrowedだが、C++ constructorが戻る前にsession所有領域へcopyする。
+        # 値bufferはCython sessionがownerを保持し、時刻/status列はC++が所有copyする。
         self._runtime = new GraphRuntimeSession(
             native_schema,
             native_nodes,
             native_outputs,
-            PyBytes_AS_STRING(source_values),
-            len(source_values),
+            <const char*>source_value_buffer.buf,
+            source_value_buffer.len,
             PyBytes_AS_STRING(source_starts),
             len(source_starts),
             PyBytes_AS_STRING(source_ends),
@@ -469,6 +515,7 @@ cdef class CppGraphNativeSession:
             source_count,
             source_width,
             source_timebase_denominator,
+            True,
         )
 
     def __dealloc__(self):
@@ -478,7 +525,7 @@ cdef class CppGraphNativeSession:
         """DAGを指定論理境界まで実行し、collector別batchを返す。"""
 
         cdef GraphRuntimeResult result
-        cdef RuntimeResult output
+        cdef RuntimeResult* output
         cdef bint has_logical_end = logical_end_numerator is not None
         cdef int64_t end_numerator = (
             0 if logical_end_numerator is None else logical_end_numerator
@@ -500,27 +547,21 @@ cdef class CppGraphNativeSession:
         cdef list item_native_diagnostics
         cdef bytes code_bytes
         cdef bytes message_bytes
-        cdef bytes values
+        cdef object values
 
         # C++ sessionは全Plan/inputを所有しPython callbackを持たない。
         with nogil:
             result = self._runtime.run(has_logical_end, end_numerator, end_denominator)
 
         for output_index in range(result.outputs.size()):
-            output = result.outputs[output_index]
-            if output.values.size() == 0:
-                values = b""
-            else:
-                values = PyBytes_FromStringAndSize(
-                    <const char*>&output.values[0],
-                    output.values.size() * sizeof(double),
-                )
+            output = &result.outputs[output_index]
+            values = _move_f64_buffer(output[0].values)
             shapes = []
             provenance = []
             invalid_nodes = []
             degraded_nodes = []
             native_diagnostics = []
-            for item_index in range(output.retained_count):
+            for item_index in range(output[0].retained_count):
                 start = result.shape_offsets[output_index][item_index]
                 end = result.shape_offsets[output_index][item_index + 1]
                 shapes.append(
@@ -532,7 +573,7 @@ cdef class CppGraphNativeSession:
                 start = result.provenance_offsets[output_index][item_index]
                 end = result.provenance_offsets[output_index][item_index + 1]
                 provenance.append(
-                    tuple(output.provenance[offset] for offset in range(start, end))
+                    tuple(output[0].provenance[offset] for offset in range(start, end))
                 )
                 start = result.invalid_node_offsets[output_index][item_index]
                 end = result.invalid_node_offsets[output_index][item_index + 1]
@@ -555,7 +596,9 @@ cdef class CppGraphNativeSession:
                 item_native_diagnostics = []
                 for offset in range(start, end):
                     code_bytes = result.native_diagnostic_codes[output_index][offset]
-                    message_bytes = result.native_diagnostic_messages[output_index][offset]
+                    message_bytes = (
+                        result.native_diagnostic_messages[output_index][offset]
+                    )
                     item_native_diagnostics.append(
                         (
                             result.native_diagnostic_severities[output_index][offset],
@@ -570,19 +613,19 @@ cdef class CppGraphNativeSession:
                     values,
                     tuple(result.value_offsets[output_index]),
                     tuple(shapes),
-                    tuple(output.sequences),
-                    tuple(output.starts),
-                    tuple(output.ends),
-                    tuple(output.statuses),
+                    tuple(output[0].sequences),
+                    tuple(output[0].starts),
+                    tuple(output[0].ends),
+                    tuple(output[0].statuses),
                     tuple(provenance),
                     tuple(invalid_nodes),
                     tuple(degraded_nodes),
                     tuple(native_diagnostics),
                     tuple(result.metadata_source_indices[output_index]),
-                    output.timebase_denominator,
-                    output.received_count,
-                    output.dropped_count,
-                    output.overflowed,
+                    output[0].timebase_denominator,
+                    output[0].received_count,
+                    output[0].dropped_count,
+                    output[0].overflowed,
                 )
             )
         return (

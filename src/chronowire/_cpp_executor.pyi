@@ -51,7 +51,7 @@ class CppGraphNativeSession:
         schema_version: str,
         nodes: tuple[tuple[object, ...], ...],
         outputs: tuple[tuple[int, int, int, int], ...],
-        source_values: bytes,
+        source_values: bytes | memoryview,
         source_starts: bytes,
         source_ends: bytes,
         source_statuses: bytes,
@@ -71,3 +71,5 @@ class CppCooperativeStageSession:
     def advance(self) -> tuple[int, int]: ...
     def resume(self, stage_id: int) -> None: ...
     def abort(self) -> None: ...
+
+def _readonly_buffer_address(value: object) -> tuple[int, int]: ...

@@ -184,11 +184,16 @@ struct GraphRuntimeResult {
 /**
  * @brief PortablePlanIRのSOURCE/RATE/FRAME/MAP DAGを自立運用するrun-local session。
  *
- * Source buffer、reset境界、Kernel parameter、Node/Output descriptorをconstructor中に
- * 所有領域へcopyする。各Portは一度だけ評価し、fan-out consumerは同じimmutable batchを読む。
+ * Source時刻/status/reset、Kernel parameter、Node/Output descriptorはconstructor中に所有領域へ
+ * copyする。Source値はCython Sessionがread-only ownerを保持する場合にborrowできる。各Portは
+ * 一度だけ評価し、fan-out consumerは同じimmutable batchを読む。
  */
 class GraphRuntimeSession {
 public:
+    /**
+     * @brief DAG descriptorとSource列からrun-local runtimeを構築する。
+     * @param borrow_source_values trueではcallerが値bufferをSession寿命以上保持する。
+     */
     GraphRuntimeSession(
         const std::string& schema_version,
         const std::vector<GraphNodeSpec>& nodes,
@@ -205,7 +210,8 @@ public:
         std::size_t source_reset_bytes,
         std::size_t source_count,
         std::size_t source_width,
-        std::int64_t source_timebase_denominator
+        std::int64_t source_timebase_denominator,
+        bool borrow_source_values
     );
 
     /** @brief 全有限入力、または排他的logical_end以前の入力をDAGへ流す。 */
@@ -218,7 +224,8 @@ public:
 private:
     std::vector<GraphNodeSpec> nodes_;
     std::vector<GraphOutputSpec> outputs_;
-    std::vector<double> source_values_;
+    std::vector<double> owned_source_values_;
+    const double* source_values_ = nullptr;
     std::vector<std::int64_t> source_starts_;
     std::vector<std::int64_t> source_ends_;
     std::vector<std::uint8_t> source_statuses_;

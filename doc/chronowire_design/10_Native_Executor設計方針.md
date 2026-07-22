@@ -374,10 +374,13 @@ Python/nativeどちらのprefixから始まる線形Planでも複数Python islan
 C++ GraphRuntimeSessionがnative区間を自立実行し、終端なしcollectorで
 Stage入力batchを所有結果としてadapterへ渡す。adapterはstage IDの`advance()` / `resume()` /
 `abort()`状態に従い、run-local Python session群をStageにつき一回dispatchする。Python出力は
-shape/time/statusを検証して合成SOURCE ingressへ一回copyし、C++ suffixを再開する。fan-out、
+shape/time/statusを検証し、通常値は合成SOURCE ingressへ一回copyしてC++ suffixを再開する。
+`accepts_readonly_buffers=True`のPython OperationにはC++所有batchのitemをflatなread-only
+`memoryview`として貸す。同じowner上の連続viewを返した場合はsuffix ingressもborrowし、fan-outは
+同じownerを共有する。fan-out、
 0/複数Emission、RATE/FRAME、status/Diagnostic、例外後の再実行を照合済みである。
 native→Python複数入力は`synchronous`完全interval一致と`latest`選択を実装済みである。
-Python→native複数ingress、contains/overlaps/tolerance境界codec、zero-copy、mixed Sessionは
+Python→native複数ingress、contains/overlaps/tolerance境界codec、Python生成bufferのzero-copy、mixed Sessionは
 未対応capabilityとしてStage/Node/Port/binding付きで拒否する。all-native hot pathは変更しない。
 
 ### Phase 3: 最小Cython Executor

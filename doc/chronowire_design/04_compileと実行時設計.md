@@ -201,11 +201,12 @@ Stage入出力のinterval、sequence、status、Diagnostic、gap segmentはbatch
 現在のmixed実装は、Python islandの前後にnative区間を置ける。Sourceを含むPython prefixまたは
 native prefixのどちらから始まる線形Planでも、複数Python islandをStage順にyield/resumeできる。
 `StageDescriptor.input_port_ids/output_port_ids`から境界を特定し、native所有結果をadapterへ、
-Python出力を合成native ingressへ、それぞれ一回copyする。Python prefix内のRATE/FRAMEも
+通常のPython出力は合成native ingressへ一回copyする。固定shape入力を受理すると明示したOperationには
+C++所有bufferのread-only memoryviewを渡し、同じ連続viewを返す場合はnative ingressもborrowする。Python prefix内のRATE/FRAMEも
 Stage単位で処理し、`resume(output_batches)`後はC++ runtimeだけでsuffixを実行する。
 native区間からPython islandへ入る複数Portは、`synchronous`の完全interval一致と`latest`の
 primary開始時刻以前の最新値をadapterが照合する。Pythonからnativeへの複数ingress、
-contains/overlaps/tolerance境界codec、zero-copyは次の継続状態実装で扱う。
+contains/overlaps/tolerance境界codec、Python生成bufferと複数ingressのzero-copyは次の継続状態実装で扱う。
 
 Compilerは連続するPython Operationを、観測境界、native依存境界、fan-out ownership境界の
 範囲内で最大Python islandへまとめる。全Python Planは可能な限り単一Stageとし、

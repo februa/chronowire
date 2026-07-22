@@ -245,6 +245,7 @@ class ImplementationSpec:
         workspace_alignment_bytes: workspace先頭alignment。
         supports_flush: EOF時のflush entrypointを持つ場合にTrue。
         session_local: mutable状態がrun-local sessionへ閉じる場合にTrue。
+        accepts_readonly_buffers: Python実装が固定schema入力をread-only viewで受理する場合にTrue。
 
     Raises:
         ValueError: 必須ID、Backend名、ABI versionが空の場合。
@@ -262,6 +263,7 @@ class ImplementationSpec:
     workspace_alignment_bytes: int | None = None
     supports_flush: bool = False
     session_local: bool = True
+    accepts_readonly_buffers: bool = False
 
     def __post_init__(self) -> None:
         if not all(
@@ -481,6 +483,7 @@ def operation(
     state: str = "stateless",
     gap: GapPolicy | str = GapPolicy.RESET,
     accepts_invalid: bool = False,
+    accepts_readonly_buffers: bool = False,
     shape_resolver: ShapeResolver | None = None,
 ) -> Callable[[Callable[..., object]], OperationDefinition]:
     """Python参照実装を持つOperationDefinitionを生成するdecorator。
@@ -494,6 +497,8 @@ def operation(
         state: `stateless`または`session`。
         gap: 入力欠落後の状態規則。
         accepts_invalid: INVALID入力を実装へ渡す場合にTrue。
+        accepts_readonly_buffers: canonical Python値に加え、固定schema入力をflatなread-only
+            memoryviewでも受けられる場合にTrue。
         shape_resolver: compile時だけ使う単一出力shape resolver。
 
     Returns:
@@ -525,6 +530,7 @@ def operation(
                 f"{operation_id}.python",
                 "python",
                 "chronowire.operation.python.v1",
+                accepts_readonly_buffers=accepts_readonly_buffers,
             ),
             implementation,
         )
