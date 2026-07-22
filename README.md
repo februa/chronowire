@@ -166,13 +166,13 @@ GILを解放し、NoCollectではKernel出力値をPythonへ戻さない。
 
 ```python
 import chronowire as cw
-from chronowire_reference import CythonCbfBackend, FixedCbfKernel
+from chronowire_reference import CythonCbfBackend, fixed_cbf, fixed_cbf_operation
 
 source = cw.Flow(cw.f64_vector_source([(1.0, 1.0), (2.0, 2.0)], width=2))
-beam = source.rate(1).frame(2).map(FixedCbfKernel(((0.5, 0.5),)))
+beam = fixed_cbf(source.rate(1).frame(2), ((0.5, 0.5),))
 plan = cw.compile(
     [cw.output(beam, collector=cw.Latest())],
-    backend=CythonCbfBackend(),
+    implementations={fixed_cbf_operation.operation_id: CythonCbfBackend()},
 )
 
 result = plan.run(executor="cpp")
@@ -228,15 +228,16 @@ INVALID、DEGRADED、metadata、Diagnostic provenanceをPython基準意味論と
 cancelのlifecycleを提供する。one-shot実行ではcompile済み観測PortをC++で取得した後、Python Stage境界で
 Extensionへpriority順に配送する。
 
-v0.4のC++経路は単一有限Source、`FRAME(pad_end=False)`、既定`RuntimeOptions`に限定する。realtime
-push、複数Source/merge、任意Python Kernel、native内部のPython callback、継続Sessionで状態を持つ
-Extension、manifestから読み込む汎用mutable native workspaceは暗黙fallbackせず明示エラーにする。
+v0.4の完全native経路は単一有限Source、`FRAME(pad_end=False)`、既定`RuntimeOptions`に限定する。
+Python Operation／plain callableを含むPlanは協調的なPython islandとしてCppExecutorで実行できるが、
+realtime push、複数Source/merge、mixed Planのincremental cursor、継続Sessionで状態を持つExtension、
+manifestから読み込む汎用mutable native workspaceは暗黙fallbackせず明示エラーにする。
 登録済みMVDR参照ABIのrun-local共分散状態だけは受入経路として対応する。残りはv0.5で
 実測しながら拡張する。
 
 ## 実行例
 
-chunk入力をsampleへ展開し、rate、frame、EOF padding、固定CBFへ流す例を実行できる。
+固定shape sample入力をrate、frame、EOF padding、固定CBFへ流す例を実行できる。
 
 ```bash
 uv run python -m examples.streaming_cbf
@@ -247,14 +248,14 @@ uv run python -m examples.streaming_cbf
 0.x releaseはGit tagを指定してrevisionを固定できる。
 
 ```bash
-uv add "chronowire @ git+https://github.com/februa/chronowire.git@v0.2.0"
+uv add "chronowire @ git+https://github.com/februa/chronowire.git@v0.4.0"
 ```
 
 ```bash
-python -m pip install "chronowire @ git+https://github.com/februa/chronowire.git@v0.2.0"
+python -m pip install "chronowire @ git+https://github.com/februa/chronowire.git@v0.4.0"
 ```
 
-`0.1.0`と`0.2.0`はGitHub tagからinstallする。PyPIへは、Python/C++ Executor、継続streaming、評価例、API usabilityを確認したv1.0から正式公開する。release方針は[RELEASING.md](RELEASING.md)を参照する。
+`0.4.0`を含む0.x版はGitHub tagからinstallする。PyPIへは、Python/C++ Executor、継続streaming、評価例、API usabilityを確認したv1.0から正式公開する。release方針は[RELEASING.md](RELEASING.md)を参照する。
 
 ## 開発環境
 

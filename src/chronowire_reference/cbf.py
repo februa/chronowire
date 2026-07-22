@@ -1,18 +1,22 @@
-"""Python/Cython Backend交換を検証する固定CBF参照Kernel。"""
+"""Python/Cython Backend交換を検証する固定CBF参照Operation。"""
 
 from __future__ import annotations
 
 from array import array
+from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from math import isfinite
+from typing import TypeVar
 
 import chronowire as cw
+from chronowire.kernel import KernelProvider
 
 from ._cython_cbf import run_fixed_cbf, run_fixed_cbf_batch
 
 Sample = tuple[float, ...]
 BeamFrame = tuple[tuple[float, ...], ...]
+FrameValue = TypeVar("FrameValue")
 
 
 def _normalize_weights(
@@ -41,6 +45,9 @@ def _normalize_frame(value: object, channel_count: int) -> tuple[Sample, ...]:
         raise TypeError("CBF input must be a tuple frame")
     samples: list[Sample] = []
     for sample in value:
+        if sample is None:
+            samples.append((0.0,) * channel_count)
+            continue
         if not isinstance(sample, tuple) or len(sample) != channel_count:
             raise ValueError("CBF sample shape must match the weight channel count")
         normalized = tuple(float(item) for item in sample)
@@ -50,32 +57,72 @@ def _normalize_frame(value: object, channel_count: int) -> tuple[Sample, ...]:
     return tuple(samples)
 
 
-@dataclass(frozen=True)
-class _PythonCbfState:
-    weights: tuple[tuple[float, ...], ...]
+def _cbf_shape(inputs: Mapping[str, object], config: cw.ConfigView) -> tuple[int, ...]:
+    """frame schemaと固定係数から`beams x samples` shapeを解決する。"""
 
-    def process(self, inputs: tuple[object, ...], context: cw.RunContext) -> BeamFrame:
-        """Python loopで固定CBFを実行する。"""
+    schema = inputs["signal"]
+    shape = getattr(schema, "shape", None)
+    weights = config.weights
+    if not isinstance(shape, tuple) or len(shape) != 2 or not isinstance(weights, tuple):
+        raise ValueError("fixed CBF requires samples x channels and tuple weights")
+    normalized = _normalize_weights(weights)
+    if shape[1] != len(normalized[0]):
+        raise ValueError("fixed CBF input channels must match Config weights")
+    return (len(normalized), shape[0])
 
-        del context
-        samples = _normalize_frame(inputs[0], len(self.weights[0]))
-        return tuple(
-            tuple(
-                sum(weight * value for weight, value in zip(beam, sample, strict=True))
-                for sample in samples
-            )
-            for beam in self.weights
+
+@cw.operation(
+    operation_id="chronowire.reference.fixed_cbf_f64.v1",
+    inputs={
+        "signal": cw.OperationInputSpec(
+            primary=True,
+            value=cw.ValueSpec(dtype="float64", shape=("samples", "channels")),
         )
+    },
+    output=cw.OperationOutputSpec(value=cw.ValueSpec(dtype="float64", shape=(None, None))),
+    config=cw.ConfigSpec(scope="cbf", fields={"weights": tuple}),
+    shape_resolver=_cbf_shape,
+)
+def fixed_cbf_operation(inputs: Mapping[str, object], config: cw.ConfigView) -> BeamFrame:
+    """Configのbeam-major固定係数をsample-major frameへ適用する。"""
+
+    weights = config.weights
+    if not isinstance(weights, tuple):
+        raise ValueError("fixed CBF weights must be a tuple")
+    normalized = _normalize_weights(weights)
+    samples = _normalize_frame(inputs["signal"], len(normalized[0]))
+    return tuple(
+        tuple(
+            sum(weight * value for weight, value in zip(beam, sample, strict=True))
+            for sample in samples
+        )
+        for beam in normalized
+    )
 
 
-@dataclass(frozen=True)
-class _PythonCbfKernel:
-    weights: tuple[tuple[float, ...], ...]
+def fixed_cbf(
+    frames: cw.Flow[FrameValue],
+    weights: tuple[tuple[float, ...], ...],
+) -> cw.Flow[BeamFrame]:
+    """固定係数をConfig scopeへ記録してCBF OperationをFlowへ追加する。
 
-    def create_state(self) -> _PythonCbfState:
-        """状態を共有しないPython CBF sessionを生成する。"""
+    Args:
+        frames: sample-major固定shape frame Flow。
+        weights: beam-majorの有限float64係数。
 
-        return _PythonCbfState(self.weights)
+    Returns:
+        同じGraph上で`fixed_cbf_operation`を適用したbeam Flow。
+
+    Raises:
+        ValueError: 係数が空、非矩形、または非有限の場合。
+
+    境界条件:
+        係数はprocess-local定数ではなく不変ConfigとしてPlanへ記録し、時変重みには使わない。
+    """
+
+    normalized = _normalize_weights(weights)
+    configured = frames.with_config(frames.config.scope(cbf={"weights": normalized}))
+    return configured.map(fixed_cbf_operation)
 
 
 @dataclass(frozen=True)
@@ -131,6 +178,7 @@ class _CythonCbfState:
 @dataclass(frozen=True)
 class _CythonCbfKernel:
     weights: tuple[tuple[float, ...], ...]
+    implementation_spec: cw.ImplementationSpec
     abi_version: str = "chronowire.reference.fixed_cbf_f64.v1"
     process_model: str = "fixed_cbf_f64_frame"
     workspace_size_bytes: int = 0
@@ -168,44 +216,55 @@ class _CythonCbfKernel:
 
 
 @dataclass(frozen=True)
-class FixedCbfKernel:
-    """Backendに依存しない固定実数CBFアルゴリズム宣言。"""
-
-    weights: tuple[tuple[float, ...], ...]
-
-    def __init__(self, weights: tuple[tuple[float, ...], ...]) -> None:
-        object.__setattr__(self, "weights", _normalize_weights(weights))
-
-    def compile(self, context: cw.CompileContext) -> cw.Kernel[object]:
-        """Python基準実装をcompileする。"""
-
-        del context
-        return _PythonCbfKernel(self.weights)
-
-
-@dataclass(frozen=True)
 class CythonCbfBackend:
-    """FixedCbfKernelだけをCython実装へcompileする参照Backend。"""
+    """固定CBF OperationをCython実装へcompileする参照Backend。"""
 
     name: str = "cython_cbf"
 
     def compile_kernel(
         self,
-        kernel: object,
+        kernel: KernelProvider[object],
         context: cw.CompileContext,
     ) -> cw.Kernel[object]:
-        """CBF宣言をCython Kernelへ変換する。
+        """Operation以外の既存Kernelは標準Python compileへ委譲する。
 
         Raises:
-            TypeError: この参照Backendの対象外Kernelの場合。
+            Exception: Kernel自身のcompileが失敗した場合。
         """
 
-        if isinstance(kernel, cw.IdentityF64Kernel):
-            return kernel.compile(context)
-        if not isinstance(kernel, FixedCbfKernel):
-            raise TypeError("CythonCbfBackend supports FixedCbfKernel and native identity")
-        del context
-        return _CythonCbfKernel(kernel.weights)
+        return cw.PythonBackend().compile_kernel(kernel, context)
+
+    def compile_operation(
+        self,
+        operation: cw.OperationSpec,
+        context: object,
+    ) -> cw.Kernel[object]:
+        """Config係数とresolved schemaからCython CBF Kernelを生成する。"""
+
+        if operation.operation_id != fixed_cbf_operation.operation_id:
+            raise cw.MissingImplementationError(
+                f"operation={operation.operation_id} backend={self.name} "
+                "contract=missing_implementation"
+            )
+        if not isinstance(context, cw.CompileContext):
+            raise TypeError("CythonCbfBackend requires CompileContext")
+        weights = context.config.view(operation.config.scope).weights
+        if not isinstance(weights, tuple):
+            raise TypeError("fixed CBF Config weights must be a tuple")
+        normalized = _normalize_weights(weights)
+        return _CythonCbfKernel(
+            normalized,
+            cw.ImplementationSpec(
+                operation.operation_id,
+                "chronowire.reference.fixed_cbf_f64.cython.v1",
+                self.name,
+                "chronowire.reference.fixed_cbf_f64.v1",
+                native_compatible=True,
+                process_model="fixed_cbf_f64_frame",
+                workspace_size_bytes=0,
+                workspace_alignment_bytes=8,
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -259,16 +318,30 @@ def _source() -> tuple[cw.Emission[Sample], ...]:
     return tuple(result)
 
 
-def _identity_sample(sample: object) -> object:
-    """混在Stageを明示するPython前処理境界。"""
-
-    return sample
-
-
 def _identity_beams(beams: object) -> object:
     """混在Stageを明示するPython後処理境界。"""
 
     return beams
+
+
+@cw.operation(
+    operation_id="chronowire.reference.identity_sample_f64.v1",
+    inputs={
+        "value": cw.OperationInputSpec(
+            primary=True,
+            value=cw.ValueSpec(dtype="float64", shape=("channels",)),
+        )
+    },
+    output="same",
+)
+def _identity_sample_operation(
+    inputs: Mapping[str, object],
+    config: cw.ConfigView,
+) -> object:
+    """固定schemaを保ったままPython Stage境界を作る。"""
+
+    del config
+    return inputs["value"]
 
 
 def _run(
@@ -277,14 +350,18 @@ def _run(
     backend: str | cw.Backend,
     mixed: bool,
 ) -> CbfRun:
-    source = cw.Flow(_source())
-    prepared = source.map(_identity_sample) if mixed else source
+    source = cw.Flow(
+        cw.f64_vector_source(_source(), width=2),
+        cw.Config(cbf={"weights": ((0.5, 0.5),)}),
+    )
+    prepared = source.map(_identity_sample_operation) if mixed else source
     frames = prepared.frame(4)
-    beams = frames.map(FixedCbfKernel(((0.5, 0.5),)))
+    beams = frames.map(fixed_cbf_operation)
     result_flow = beams.map(_identity_beams) if mixed else beams
+    implementations = {fixed_cbf_operation.operation_id: backend} if backend != "python" else None
     plan = cw.compile(
         [cw.output(result_flow, collector=cw.Bounded(2))],
-        backend=backend,
+        implementations=implementations,
     )
     result = plan.run(executor=cw.PythonExecutor())
     map_abis = tuple(item for item in plan.portable_ir.kernel_abis if item.native_compatible)
@@ -312,12 +389,15 @@ def _run(
 def _run_native_executor(name: str, executor: cw.Executor) -> CbfRun:
     """固定shape SourceからCBFまでを指定したnative Executorでbatch実行する。"""
 
-    source = cw.Flow(cw.f64_vector_source(_source(), width=2))
+    source = cw.Flow(
+        cw.f64_vector_source(_source(), width=2),
+        cw.Config(cbf={"weights": ((0.5, 0.5),)}),
+    )
     frames = source.rate(4).frame(4)
-    beams = frames.map(FixedCbfKernel(((0.5, 0.5),)))
+    beams = frames.map(fixed_cbf_operation)
     plan = cw.compile(
         [cw.output(beams, collector=cw.Bounded(2))],
-        backend=CythonCbfBackend(),
+        implementations={fixed_cbf_operation.operation_id: CythonCbfBackend()},
     )
     result = plan.run(executor=executor)
     abi = next(item for item in plan.portable_ir.kernel_abis if item.native_compatible)

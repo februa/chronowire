@@ -21,7 +21,7 @@ from pathlib import Path
 
 import chronowire as cw
 from chronowire._cython_executor import run_f64_vector_rate_frame
-from chronowire_reference import CythonCbfBackend, FixedCbfKernel
+from chronowire_reference import CythonCbfBackend, fixed_cbf
 from chronowire_reference._cython_cbf import run_fixed_cbf_batch
 
 _SCHEMA_VERSION = "0.2"
@@ -299,7 +299,7 @@ def _run_case(
     source_values_contract = cw.f64_vector_source(values, width=channels)
     source = cw.Flow(source_values_contract)
     frames = source.rate(1).frame(block_size)
-    output = frames.map(FixedCbfKernel(weights))
+    output = fixed_cbf(frames, weights)
     plan = cw.compile(
         [cw.output(output, collector=cw.NoCollect())],
         backend=CythonCbfBackend(),

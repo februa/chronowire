@@ -8,7 +8,7 @@ import pytest
 import chronowire as cw
 from chronowire._cpp_executor import CppCooperativeStageSession
 from chronowire.collector import Collector
-from chronowire_reference import CythonCbfBackend, FixedCbfKernel
+from chronowire_reference import CythonCbfBackend, fixed_cbf
 
 
 def _plan(
@@ -23,7 +23,7 @@ def _plan(
         else source_values
     )
     source = cw.Flow(cw.f64_vector_source(values, width=2))
-    beams = source.rate(1).frame(2).map(FixedCbfKernel(((0.5, 0.5),)))
+    beams = fixed_cbf(source.rate(1).frame(2), ((0.5, 0.5),))
     resolved_collector = cw.Bounded(4) if collector is None else collector
     return cw.compile(
         [cw.output(beams, collector=resolved_collector)],
@@ -160,7 +160,7 @@ def test_cpp_mixed_native_prefix_dispatches_one_python_island_batch() -> None:
         for index in range(4)
     ]
     source = cw.Flow(cw.f64_vector_source(source_values, width=2))
-    native = source.rate(1).frame(2).map(FixedCbfKernel(((0.5, 0.5),)))
+    native = fixed_cbf(source.rate(1).frame(2), ((0.5, 0.5),))
     calls = {"left": 0, "right": 0}
 
     def left(value: object) -> object:
@@ -205,7 +205,7 @@ def test_cpp_mixed_python_stage_preserves_zero_and_multiple_emissions() -> None:
             width=2,
         )
     )
-    native = source.rate(1).frame(2).map(FixedCbfKernel(((0.5, 0.5),)))
+    native = fixed_cbf(source.rate(1).frame(2), ((0.5, 0.5),))
     calls = 0
 
     def expand(value: object) -> object:
@@ -232,7 +232,7 @@ def test_cpp_mixed_python_failure_does_not_poison_next_plan_run() -> None:
     """mixed Python Stage例外後も新しいrun-local sessionで同じPlanを再実行する。"""
 
     source = cw.Flow(cw.f64_vector_source([(1.0, 1.0), (2.0, 2.0)], width=2))
-    native = source.rate(1).frame(2).map(FixedCbfKernel(((0.5, 0.5),)))
+    native = fixed_cbf(source.rate(1).frame(2), ((0.5, 0.5),))
     should_fail = True
 
     def fail_once(value: object) -> object:
@@ -285,7 +285,7 @@ def test_cpp_python_prefix_resumes_native_cbf_suffix() -> None:
     ]
     source = cw.Flow(cw.f64_vector_source(values, width=2))
     frames = source.map(scale).rate(1).frame(2)
-    beams = frames.map(FixedCbfKernel(((0.5, 0.5),)))
+    beams = fixed_cbf(frames, ((0.5, 0.5),))
     plan = cw.compile(
         [cw.output(beams, collector=cw.Bounded(2))],
         backend=CythonCbfBackend(),
@@ -453,7 +453,7 @@ def test_cpp_executor_preserves_invalid_partition_and_metadata() -> None:
     ]
     source = cw.Flow(cw.f64_vector_source(values, width=2))
     rated = source.rate(1)
-    beams = rated.frame(2).map(FixedCbfKernel(((0.5, 0.5),)))
+    beams = fixed_cbf(rated.frame(2), ((0.5, 0.5),))
     plan = cw.compile(
         [
             cw.output(rated, collector=cw.Bounded(2)),
@@ -536,8 +536,8 @@ def test_cpp_executor_runs_kernel_chain_and_fanout_ancestor_once() -> None:
         )
     )
     frames = source.rate(1).frame(2)
-    first = frames.map(FixedCbfKernel(((0.5, 0.5),))).map(cw.identity_f64())
-    second = frames.map(FixedCbfKernel(((1.0, 0.0),)))
+    first = fixed_cbf(frames, ((0.5, 0.5),)).map(cw.identity_f64())
+    second = fixed_cbf(frames, ((1.0, 0.0),))
     plan = cw.compile(
         [
             cw.output(first, collector=cw.Bounded(2)),
@@ -569,10 +569,9 @@ def test_cpp_executor_long_streaming_cbf_matches_python() -> None:
             width=4,
         )
     )
-    beams = (
-        source.rate(1)
-        .frame(64, hop=32)
-        .map(FixedCbfKernel(((0.25, 0.25, 0.25, 0.25), (1.0, 0.0, 0.0, 0.0))))
+    beams = fixed_cbf(
+        source.rate(1).frame(64, hop=32),
+        ((0.25, 0.25, 0.25, 0.25), (1.0, 0.0, 0.0, 0.0)),
     )
     plan = cw.compile(
         [cw.output(beams, collector=cw.Bounded(8, cw.OverflowPolicy.DROP_OLDEST))],
@@ -600,7 +599,7 @@ def test_cpp_executor_resets_rate_and_frame_at_input_overrun() -> None:
         for index, tick in enumerate((0, 1, 4, 5))
     ]
     source = cw.Flow(cw.f64_vector_source(values, width=2))
-    beams = source.rate(1).frame(2).map(FixedCbfKernel(((0.5, 0.5),)))
+    beams = fixed_cbf(source.rate(1).frame(2), ((0.5, 0.5),))
     plan = cw.compile(
         [cw.output(beams, collector=cw.Bounded(2))],
         backend=CythonCbfBackend(),
@@ -651,7 +650,7 @@ def test_cpp_executor_delivers_extension_at_python_stage_boundary() -> None:
             width=2,
         )
     )
-    beams = source.rate(1).frame(2).map(FixedCbfKernel(((0.5, 0.5),)))
+    beams = fixed_cbf(source.rate(1).frame(2), ((0.5, 0.5),))
     observation = cw.observe(beams, extension_id="record", trigger=cw.Every(2))
     plan = cw.compile(
         [cw.output(beams, collector=cw.Bounded(2))],

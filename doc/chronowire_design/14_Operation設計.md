@@ -739,23 +739,24 @@ PortablePlanIR schemaとC ABI IDはPython class名を保存しないため変更
 run中に変更しないことを意味する。SourceやExtension等のprocess-local実体とKernelStateはSessionが所有し、
 同じPlanから作る別Sessionへ共有しない。
 
-### 12.2 `FixedCbfKernel(...)`
+### 12.2 固定CBF Operation
 
-現行の次のAPIは、Flow利用者へ実装機構を見せている。
-
-```python
-beam = frames.map(FixedCbfKernel(weights))
-```
-
-移行後はDSP packageがOperationを公開する。
+固定CBF参照packageは、Flow利用者へKernel factoryを見せずOperation helperを公開する。
 
 ```python
-config = config.scope(dsp={"cbf": {"weights": weights, "beams": 2}})
-beam = frames.with_config(config).map(fixed_cbf)
+from chronowire_reference import CythonCbfBackend, fixed_cbf, fixed_cbf_operation
+
+beam = fixed_cbf(frames, weights)
+plan = cw.compile(
+    [cw.output(beam, collector=cw.Latest())],
+    implementations={fixed_cbf_operation.operation_id: CythonCbfBackend()},
+)
 ```
 
-`fixed_cbf`のOperationSpecはshape、time、status、Config leafを宣言し、Python/Cython/C++実装は同じ
-operation IDへ登録する。利用者はKernel class、ABI ID、session factoryを選ばない。
+`fixed_cbf()`は係数を不変な`cbf` Config scopeへ記録し、`fixed_cbf_operation`をFlowへ追加する。
+OperationSpecはshape、time、status、Config leafを宣言し、Python/Cython/C++実装は同じoperation IDへ
+登録する。利用者はKernel class、ABI ID、session factoryを選ばない。固定shapeを証明できない
+`python_opaque`入力は、native境界を推測せずcompile errorにする。
 
 ### 12.3 互換方針
 
@@ -764,7 +765,7 @@ operation IDへ登録する。利用者はKernel class、ABI ID、session factor
 - Configの不変scope、属性アクセス、leaf mergeを維持する
 - plain callableの`config_paths`は移行期間中維持する
 - status、Diagnostic、0/1/複数Emission、gap規則をOperationDescriptorへ移す
-- v0.4 Kernel objectはlegacy adapterがOperationSpec/ImplementationSpecへ正規化する
+- legacy Kernel objectは内部実行契約として残すが、新規DSP公開APIはOperationSpecを正本にする
 - schema 0.3の`KernelAbiDescriptor` readerを維持し、新schema exportはOperationDescriptorを正規形にする
 - CppExecutorのidentity/固定CBF/MVDR resolver tableはOperation固有知識をExecutorに持つ
   過渡的実装であり、外部C ABI module tableの汎用dynamic bindingへ置換する。
@@ -791,7 +792,8 @@ operation IDへ登録する。利用者はKernel class、ABI ID、session factor
    同一OperationSpecで検証する。汎用module loaderは手順7の残件
 9. **初期実装済み**: schema 0.4 OperationDescriptorをCppExecutorが読み、複数入力、LATEST、SAMPLE、
    run-local stateを登録済みABIまたは外部C ABI module tableから実行する。固定shape float64単一outputが範囲
-10. **未実装**: Fixed CBF参照packageを新APIへ移行し、旧APIをdeprecated化
+10. **実装済み**: Fixed CBF参照packageを`fixed_cbf()`／`fixed_cbf_operation`へ移行し、開発中の
+    `FixedCbfKernel`公開名は互換aliasを残さず削除
 11. **初期実装済み**: `native_operation_include_dir()`でwrapper向けABI headerを公開し、
    DSP本体をChronowireに依存させない外部module build境界を固定
 12. **線形複数Python islandまで初期実装済み**: CppRuntimeMetricsでGIL解放契約、native Stage dispatch、
@@ -838,7 +840,7 @@ OperationSpec/ImplementationSpec境界で提供する。
 
 ### 14.1 破壊的変更候補
 
-- `FixedCbfKernel(...)`等の実装objectをFlowへ渡すAPIのdeprecated化
+- DSP packageが実装objectをFlowへ渡す旧APIの削除（固定CBF参照packageでは実施済み）
 - 宣言Operationでの`config_paths` map引数廃止とConfigSpecへの集約
 - named通常値をNode parameterとして渡す経路の縮小。固定値はConfig、時変値はFlowへ移す
 - PortablePlanIRのKernel中心descriptorからOperation/Implementation中心descriptorへのschema更新

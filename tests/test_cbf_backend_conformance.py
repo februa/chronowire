@@ -3,7 +3,7 @@
 import pytest
 
 import chronowire as cw
-from chronowire_reference import CythonCbfBackend, FixedCbfKernel, run_cbf_conformance
+from chronowire_reference import CythonCbfBackend, fixed_cbf, run_cbf_conformance
 
 
 def test_python_cython_and_mixed_cbf_traces_are_equivalent() -> None:
@@ -46,7 +46,7 @@ def test_cython_executor_cbf_accepts_empty_fixed_shape_source() -> None:
     """空Sourceでもshape契約を失わず空RunResultを返す。"""
 
     source = cw.Flow(cw.f64_vector_source([], width=2))
-    beams = source.rate(4).frame(4).map(FixedCbfKernel(((0.5, 0.5),)))
+    beams = fixed_cbf(source.rate(4).frame(4), ((0.5, 0.5),))
     plan = cw.compile(
         [cw.output(beams, collector=cw.Bounded(1))],
         backend=CythonCbfBackend(),
@@ -65,7 +65,7 @@ def test_cython_executor_cbf_rejects_invalid_partition_explicitly() -> None:
             width=2,
         )
     )
-    beams = source.rate(4).frame(4).map(FixedCbfKernel(((0.5, 0.5),)))
+    beams = fixed_cbf(source.rate(4).frame(4), ((0.5, 0.5),))
     plan = cw.compile(
         [cw.output(beams, collector=cw.Bounded(1))],
         backend=CythonCbfBackend(),

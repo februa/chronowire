@@ -441,7 +441,7 @@ class CythonSession(RunSessionRunner):
         )
 
     def _validate_plan(self) -> None:
-        """推測なしで実行できる最小schema 0.3経路だけを受理する。"""
+        """推測なしで実行できる最小fixed-schema経路だけを受理する。"""
 
         nodes = self.plan._nodes
         kinds = tuple(node.kind for node in nodes)
@@ -493,8 +493,11 @@ class CythonSession(RunSessionRunner):
         if self.plan._observations:
             raise ValueError("CythonExecutor prototype does not support Extension boundaries")
         ir = self.plan.portable_ir
-        if ir.schema_version != "0.3":
-            raise ValueError("CythonExecutor prototype requires PortablePlanIR schema 0.3")
+        if ir.schema_version not in {"0.3", "0.4"}:
+            raise ValueError(
+                "CythonExecutor contract=portable_plan_schema requires schema 0.3 or 0.4; "
+                f"actual={ir.schema_version}"
+            )
         if any(
             port.value_schema_id == "python:opaque"
             for port in ir.ports
