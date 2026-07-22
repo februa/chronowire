@@ -176,7 +176,8 @@ compileする。`sample_every()`は数値rate変換ではなく、frameを分割
 FFT bin別DSP実装ではない。PythonExecutorとCppExecutorは値、interval、sequence、status、Diagnosticを
 同じtraceとして返し、同じPlanの再実行では共分散積分状態を持ち越さない。
 
-外部DSP packageは[`native_operation_abi.h`](src/chronowire/native_operation_abi.h)をincludeし、
+外部DSP packageは`cw.native_operation_include_dir()`で配布済みinclude directoryを取得し、
+[`native_operation_abi.h`](src/chronowire/native_operation_abi.h)をincludeする。
 `chronowire_operation_module_v1`をexportする。共有libraryはprocess-localにloadし、Backendへ渡す。
 
 ```python
@@ -185,6 +186,10 @@ backend = cw.NativeModuleBackend(module)
 plan = cw.compile(outputs, backend=backend)
 result = plan.run(executor="cpp")
 ```
+
+`CppExecutionSession.last_metrics` は、native run中のGIL解放契約、Stage内Python dispatch、
+Python境界callback、公開Emission復元数、batch変換数を分離して記録する。
+`python_free_hot_path` がTrueでもRunResultやExtension境界のPython処理は隠さず、別counterとして報告する。
 
 別processでschema 0.4 IRを読む場合は、各`implementation:*` slotへ`module.binding(operation_id)`を
 指定して`bind_plan(..., backend=backend)`する。library path、module handle、function pointerは

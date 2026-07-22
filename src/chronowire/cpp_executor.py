@@ -72,6 +72,9 @@ class CppExecutionSession(ExecutorSession):
         self.plan = plan
         self._extensions = extensions
         self._last_metrics: CppRuntimeMetrics | None = None
+        self._public_emission_reconstructions = 0
+        self._python_boundary_dispatches = 0
+        self._boundary_batch_conversions = 0
         self._contract_context = "node=None port=None"
         self._source_emissions: tuple[Emission[tuple[float, ...]], ...]
         self._node_ports: dict[int, int] = {}
@@ -386,6 +389,9 @@ class CppExecutionSession(ExecutorSession):
                     metadata,
                 )
             )
+        self._public_emission_reconstructions += len(emissions)
+        if emissions:
+            self._boundary_batch_conversions += 1
         return tuple(emissions), received_count, dropped_count, overflowed
 
     def _deliver_extensions(self, native_outputs: tuple[tuple[Any, ...], ...]) -> None:
@@ -406,6 +412,7 @@ class CppExecutionSession(ExecutorSession):
                     )
                 trigger = bound.observation.trigger.create_session()
                 try:
+                    self._python_boundary_dispatches += 1
                     session.initialize(context)
                 except Exception as error:
                     raise self._extension_error(bound, "initialize", error) from error
@@ -424,6 +431,7 @@ class CppExecutionSession(ExecutorSession):
                     if not trigger.should_fire(emission):
                         continue
                     try:
+                        self._python_boundary_dispatches += 1
                         session.on_output(OutputEvent(bound.observation.flow.port_id, emission))
                     except Exception as error:
                         raise self._extension_error(bound, "on_output", error) from error
@@ -432,6 +440,7 @@ class CppExecutionSession(ExecutorSession):
         finally:
             for bound, session, _ in reversed(active):
                 try:
+                    self._python_boundary_dispatches += 1
                     session.finalize(context)
                 except Exception as error:
                     if first_error is None:
@@ -476,6 +485,9 @@ class CppExecutionSession(ExecutorSession):
 
         if options is not None and options != RuntimeOptions():
             raise ValueError("CppExecutor does not support RuntimeOptions overrides")
+        self._public_emission_reconstructions = 0
+        self._python_boundary_dispatches = 0
+        self._boundary_batch_conversions = 0
         logical_end: Fraction | None = None
         if duration is not None:
             logical_end = Fraction(str(duration))
@@ -490,7 +502,16 @@ class CppExecutionSession(ExecutorSession):
             raise RuntimeError(
                 f"CppExecutor runtime failed: {error}; {self._contract_context}"
             ) from error
-        self._last_metrics = CppRuntimeMetrics(*metrics)
+        native_metrics = CppRuntimeMetrics(
+            scheduler_ns=metrics[0],
+            kernel_ns=metrics[1],
+            output_select_ns=metrics[2],
+            owned_input_bytes=metrics[3],
+            output_boundary_bytes=metrics[4],
+            python_native_transitions=metrics[5],
+            stage_python_dispatches=metrics[6],
+            executed_node_count=metrics[7],
+        )
         output_count = len(self.plan.portable_ir.outputs)
         self._deliver_extensions(native_outputs[output_count:])
         outputs: list[OutputResult[object]] = []
@@ -520,6 +541,12 @@ class CppExecutionSession(ExecutorSession):
             for status, count in zip(_NATIVE_TO_STATUS, native_status_counts, strict=True)
             if count
         }
+        self._last_metrics = replace(
+            native_metrics,
+            public_emission_reconstructions=self._public_emission_reconstructions,
+            python_boundary_dispatches=self._python_boundary_dispatches,
+            boundary_batch_conversions=self._boundary_batch_conversions,
+        )
         return RunResult(
             tuple(outputs),
             self.plan.diagnostics,

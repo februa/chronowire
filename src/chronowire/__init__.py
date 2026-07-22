@@ -106,6 +106,7 @@ from .native_module import (
     NativeOperationEntry,
     NativeOperationModule,
     NativeOperationRuntimeBinding,
+    native_operation_include_dir,
 )
 from .operation import (
     ConfigSpec,
@@ -216,6 +217,7 @@ __all__ = [
     "NativeOperationEntry",
     "NativeOperationModule",
     "NativeOperationRuntimeBinding",
+    "native_operation_include_dir",
     "NativeRuntimeBindingProvider",
     "NativeValueBatch",
     "NativeValueSchemaProvider",

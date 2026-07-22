@@ -176,6 +176,10 @@ class CppRuntimeMetrics:
         python_native_transitions: 一回のrunでPython/native境界を跨ぐ回数。
         stage_python_dispatches: native Stage内のPython method dispatch数。
         executed_node_count: fan-outを含む一回のrunで評価したNode数。
+        native_run_releases_gil: C++ data plane実行中にGILを解放する契約ならTrue。
+        public_emission_reconstructions: native outputから公開Emissionを復元した件数。
+        python_boundary_dispatches: Extension等のPython境界callbackを呼び出した回数。
+        boundary_batch_conversions: native item batchをPython公開値へ変換したbatch数。
 
     境界条件:
         Pythonでの公開Emission復元時間とobject memoryは含まない。
@@ -189,6 +193,24 @@ class CppRuntimeMetrics:
     python_native_transitions: int = 2
     stage_python_dispatches: int = 0
     executed_node_count: int = 0
+    native_run_releases_gil: bool = True
+    public_emission_reconstructions: int = 0
+    python_boundary_dispatches: int = 0
+    boundary_batch_conversions: int = 0
+
+    @property
+    def python_free_hot_path(self) -> bool:
+        """C++ data plane内にEmission単位のPython dispatchがないかを返す。
+
+        Returns:
+            native runがGILを解放し、Stage内Python dispatchが0ならTrue。
+
+        境界条件:
+            RunResult、collector、Extension境界での復元やcallbackはhot pathに
+            含めず、別fieldで計数する。
+        """
+
+        return self.native_run_releases_gil and self.stage_python_dispatches == 0
 
 
 @dataclass(frozen=True)

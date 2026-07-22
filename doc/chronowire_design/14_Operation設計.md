@@ -424,6 +424,26 @@ ImplementationBindingはcompile時に選択済みであり、利用者へ再度B
 C++/Cython sourceへPython decoratorは書かない。native moduleはversion付きC ABI module tableを
 exportする。
 
+Chronowireの契約を課す境界はOperation wrapperだけとする。既存DSP libraryや内部の数値アルゴリズムに
+`Flow`、`Node`、`Port`、`Emission`、`PortablePlanIR`を理解させない。wrapperは次の責務を完全に引き受ける。
+
+- operation/implementation IDとABI versionの公開
+- resolved input/output schema、byte長、stride、alignment、read-onlyの検証
+- ConfigViewからDSP library固有parameterへのimmutable packing
+- `create/process/flush/destroy`とrun-local state/workspaceのライフサイクル変換
+- DSPの結果、劣化、数値失敗、例外をstatus、Diagnostic、ABI errorへ変換
+- input/output bufferのownershipと寿命をChronowire runtimeとDSP libraryの間で調停
+
+wrapperの背後は通常のPython、Cython、C++ library APIでよく、Chronowireと独立にunit testできる。
+Cython wrapperはtyped memoryviewまたはnative pointerに変換し、内側のhot loopを`nogil`のC/C++コードに
+委譲してよい。C++ wrapperも同様に、既存classやfunctionをC ABIへ適配する。これによりDSP
+packageはChronowire wrapperだけを追加し、アルゴリズム本体の責務と依存を増やさない。
+
+「wrapperだけに契約を課す」とは契約を緩めることではない。wrapperはOperationSpecとABIの全条件を
+守り、内部DSPが返したshape、status、所有権が不適合なら、Node、Port、operation ID、違反契約を
+含むcompile、bindまたはruntime境界エラーにする。アルゴリズム内部で生成された安全な劣化結果は
+`DEGRADED`とDiagnosticに変換し、例外で失わない。
+
 v0.4の正本headerは`src/chronowire/native_operation_abi.h`とする。moduleは
 `chronowire_operation_module_v1()` symbolから`CwOperationModuleV1`を返す。公開loaderは
 `NativeOperationModule(path)`、Backendは`NativeModuleBackend(module)`である。library path、CDLL handle、
@@ -678,6 +698,11 @@ operation IDへ登録する。利用者はKernel class、ABI ID、session factor
 9. **初期実装済み**: schema 0.4 OperationDescriptorをCppExecutorが読み、複数入力、LATEST、SAMPLE、
    run-local stateを登録済みABIまたは外部C ABI module tableから実行する。固定shape float64単一outputが範囲
 10. **未実装**: Fixed CBF参照packageを新APIへ移行し、旧APIをdeprecated化
+11. **初期実装済み**: `native_operation_include_dir()`でwrapper向けABI headerを公開し、
+   DSP本体をChronowireに依存させない外部module build境界を固定
+12. **初期実装済み**: CppRuntimeMetricsでGIL解放契約、native Stage dispatch、
+   Python境界callback、公開Emission復元、batch変換を分離計数。plain callableの
+   mixed native Stage実行は未実装
 
 初期実装では`@cw.operation`と`cw.declare_operation()`を`Flow.map()`へ渡せる。receiver、同期Flow、
 latest StateFlowを宣言名へbindし、Python実装へ不変な`inputs` mappingと選択済み`ConfigView`だけを渡す。

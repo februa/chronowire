@@ -106,7 +106,7 @@ def _build_module(tmp_path: Path) -> Path:
     suffix = ".dylib" if sys.platform == "darwin" else ".so"
     library = tmp_path / f"libscale_module{suffix}"
     source.write_text(_MODULE_SOURCE, encoding="utf-8")
-    include = Path(cw.__file__).parent
+    include = cw.native_operation_include_dir()
     shared_flag = "-dynamiclib" if sys.platform == "darwin" else "-shared"
     subprocess.run(
         [
@@ -128,6 +128,15 @@ def _build_module(tmp_path: Path) -> Path:
         text=True,
     )
     return library
+
+
+def test_native_operation_include_dir_exposes_packaged_wrapper_header() -> None:
+    """DSP wrapperがChronowire内部pathを推測せず公開ABI headerを参照できる。"""
+
+    include = cw.native_operation_include_dir()
+
+    assert include.is_absolute()
+    assert (include / "native_operation_abi.h").is_file()
 
 
 def _operation() -> cw.OperationDefinition:

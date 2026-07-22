@@ -97,6 +97,36 @@ def test_cpp_executor_no_collect_avoids_output_value_boundary() -> None:
     assert session.last_metrics.owned_input_bytes > 0
     assert session.last_metrics.python_native_transitions == 2
     assert session.last_metrics.stage_python_dispatches == 0
+    assert session.last_metrics.native_run_releases_gil
+    assert session.last_metrics.python_free_hot_path
+    assert session.last_metrics.public_emission_reconstructions == 0
+    assert session.last_metrics.python_boundary_dispatches == 0
+    assert session.last_metrics.boundary_batch_conversions == 0
+
+
+@pytest.mark.parametrize("sample_count", [8, 128])
+def test_cpp_executor_python_boundary_work_is_bounded_by_collector(
+    sample_count: int,
+) -> None:
+    """Emission数を増やしてもPython遷移と公開値復元をcollector上限でboundする。"""
+
+    values = [(float(index), float(index)) for index in range(sample_count)]
+    plan = _plan(
+        collector=cw.Bounded(2, cw.OverflowPolicy.DROP_OLDEST),
+        source_values=values,
+    )
+    session = plan.create_session(executor="cpp")
+
+    result = session.run()
+
+    assert len(result.outputs[0].emissions) == 2
+    assert isinstance(session, CppExecutionSession)
+    assert session.last_metrics is not None
+    assert session.last_metrics.python_native_transitions == 2
+    assert session.last_metrics.public_emission_reconstructions == 2
+    assert session.last_metrics.boundary_batch_conversions == 1
+    assert session.last_metrics.python_boundary_dispatches == 0
+    assert session.last_metrics.python_free_hot_path
 
 
 def test_cpp_executor_session_can_run_again_without_state_leak() -> None:
@@ -324,7 +354,14 @@ def test_cpp_executor_delivers_extension_at_python_stage_boundary() -> None:
     )
     extension = _RecordingExtension()
 
-    result = plan.create_session(executor="cpp", extension_bindings={"record": extension}).run()
+    session = plan.create_session(executor="cpp", extension_bindings={"record": extension})
+    result = session.run()
 
     assert extension.sessions[0].events == [result.outputs[0].emissions[0]]
     assert extension.sessions[0].finalized
+    assert isinstance(session, CppExecutionSession)
+    assert session.last_metrics is not None
+    assert session.last_metrics.python_free_hot_path
+    assert session.last_metrics.public_emission_reconstructions == 4
+    assert session.last_metrics.boundary_batch_conversions == 2
+    assert session.last_metrics.python_boundary_dispatches == 3

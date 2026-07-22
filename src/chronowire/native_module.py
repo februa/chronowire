@@ -22,6 +22,27 @@ from .operation import ImplementationBinding, ImplementationSpec, OperationSpec
 MODULE_ABI_V1 = "chronowire.operation-module.v1"
 
 
+def native_operation_include_dir() -> Path:
+    """C/C++ Operation wrapper向け公開ABI headerのinclude directoryを返す。
+
+    Returns:
+        `native_operation_abi.h`を含むインストール済みpackage directory。
+
+    Raises:
+        RuntimeError: packageが壊れ、ABI headerが配布物に含まれない場合。
+
+    境界条件:
+        返すpathはbuild時のcontrol-plane情報であり、PortablePlanIRへ保存しない。
+        DSP本体ではなくOperation wrapperだけがこのheaderに依存する。
+    """
+
+    include_dir = Path(__file__).resolve().parent
+    header = include_dir / "native_operation_abi.h"
+    if not header.is_file():
+        raise RuntimeError(f"Chronowire native Operation ABI header is missing: {header}")
+    return include_dir
+
+
 class _COperationEntryV1(ctypes.Structure):
     _fields_ = [
         ("struct_size", ctypes.c_uint32),
