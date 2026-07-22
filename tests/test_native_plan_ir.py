@@ -26,6 +26,8 @@ def test_v03_plan_records_stage_value_schema_and_experimental_kernel_abi() -> No
     )
     assert ir.stages[0].runner_capabilities == ("python_stage",)
     assert ir.stages[0].boundary_codec == "python_object"
+    assert ir.stages[0].input_port_ids == ()
+    assert ir.stages[0].output_port_ids == (3,)
     assert ir.kernel_abis[0].binding_slot == "kernel:3"
     assert ir.kernel_abis[0].process_model == "python_object"
     assert not ir.kernel_abis[0].native_compatible

@@ -259,6 +259,10 @@ class CppExecutor:
             from .cpp_executor import CppPythonStageExecutionSession
 
             return CppPythonStageExecutionSession(plan, validated)
+        if any(stage.execution_domain == "python" for stage in plan.portable_ir.stages):
+            from .cpp_executor import CppMixedExecutionSession
+
+            return CppMixedExecutionSession(plan)
         return CppExecutionSession(plan, validated._extensions)
 
     def create_plan_session(

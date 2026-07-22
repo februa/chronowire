@@ -8,7 +8,11 @@ import pytest
 import chronowire as cw
 from chronowire._cpp_executor import CppCooperativeStageSession
 from chronowire.collector import Collector
-from chronowire.cpp_executor import CppExecutionSession, CppPythonStageExecutionSession
+from chronowire.cpp_executor import (
+    CppExecutionSession,
+    CppMixedExecutionSession,
+    CppPythonStageExecutionSession,
+)
 from chronowire_reference import CythonCbfBackend, FixedCbfKernel
 
 
@@ -144,6 +148,114 @@ def test_cpp_python_island_preserves_zero_one_many_emissions() -> None:
 
     assert result == plan.run(executor="python")
     assert [item.value for item in result.outputs[0].emissions] == [[10, 11], 20, 21]
+
+
+def test_cpp_mixed_native_prefix_dispatches_one_python_island_batch() -> None:
+    """native CBF出力をfan-out付き末尾Python islandへ一回だけ渡す。"""
+
+    diagnostic = cw.Diagnostic(cw.Severity.WARNING, "MIXED_DEGRADED", "safe fallback")
+    source_values = [
+        cw.Emission(
+            (float(index + 1), float(index + 1)),
+            cw.LogicalInterval(cw.LogicalTime(index), cw.LogicalTime(index + 1)),
+            index,
+            cw.EmissionStatus.DEGRADED if index == 0 else cw.EmissionStatus.OK,
+            (diagnostic,) if index == 0 else (),
+        )
+        for index in range(4)
+    ]
+    source = cw.Flow(cw.f64_vector_source(source_values, width=2))
+    native = source.rate(1).frame(2).map(FixedCbfKernel(((0.5, 0.5),)))
+    calls = {"left": 0, "right": 0}
+
+    def left(value: object) -> object:
+        calls["left"] += 1
+        return value
+
+    def right(value: object) -> object:
+        calls["right"] += 1
+        return value
+
+    plan = cw.compile(
+        [
+            cw.output(native.map(left), collector=cw.Bounded(2)),
+            cw.output(native.map(right), collector=cw.Bounded(2)),
+        ],
+        backend=CythonCbfBackend(),
+    )
+    session = plan.create_session(executor="cpp")
+
+    result = session.run()
+
+    assert isinstance(session, CppMixedExecutionSession)
+    assert calls == {"left": 2, "right": 2}
+    assert result == plan.run(executor="python")
+    assert result.outputs[0].emissions[0].status is cw.EmissionStatus.DEGRADED
+    assert result.outputs[0].emissions[0].diagnostics == (diagnostic,)
+    assert session.last_metrics is not None
+    assert session.last_metrics.execution_classification == "hybrid"
+    assert session.last_metrics.stage_python_dispatches == 1
+    assert session.last_metrics.gil_acquisitions == 1
+    assert session.last_metrics.stage_boundary_batches == 1
+    assert session.last_metrics.copied_batches == 1
+    assert not session.last_metrics.python_free_hot_path
+
+
+def test_cpp_mixed_python_stage_preserves_zero_and_multiple_emissions() -> None:
+    """mixed境界後もSkipとEmitManyを暗黙のlist展開なしで保持する。"""
+
+    source = cw.Flow(
+        cw.f64_vector_source(
+            [(float(index + 1), float(index + 1)) for index in range(4)],
+            width=2,
+        )
+    )
+    native = source.rate(1).frame(2).map(FixedCbfKernel(((0.5, 0.5),)))
+    calls = 0
+
+    def expand(value: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return cw.skip()
+        return cw.emit_many((value, value))
+
+    expanded = native.map(expand, max_items=2)
+    plan = cw.compile(
+        [cw.output(expanded, collector=cw.Bounded(2))],
+        backend=CythonCbfBackend(),
+    )
+
+    result = plan.run(executor="cpp")
+
+    assert len(result.outputs[0].emissions) == 2
+    calls = 0
+    assert result == plan.run(executor="python")
+
+
+def test_cpp_mixed_python_failure_does_not_poison_next_plan_run() -> None:
+    """mixed Python Stage例外後も新しいrun-local sessionで同じPlanを再実行する。"""
+
+    source = cw.Flow(cw.f64_vector_source([(1.0, 1.0), (2.0, 2.0)], width=2))
+    native = source.rate(1).frame(2).map(FixedCbfKernel(((0.5, 0.5),)))
+    should_fail = True
+
+    def fail_once(value: object) -> object:
+        nonlocal should_fail
+        if should_fail:
+            should_fail = False
+            raise RuntimeError("intentional mixed failure")
+        return value
+
+    plan = cw.compile(
+        [cw.output(native.map(fail_once), collector=cw.Latest())],
+        backend=CythonCbfBackend(),
+    )
+
+    with pytest.raises(cw.KernelExecutionError, match="intentional mixed failure"):
+        plan.run(executor="cpp")
+
+    assert plan.run(executor="cpp").outputs[0].emissions
 
 
 def test_cpp_python_island_exception_does_not_poison_next_plan_run() -> None:

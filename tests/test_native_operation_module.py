@@ -303,14 +303,27 @@ def test_operation_implementation_selection_is_independent_from_executor(
         "cpp",
         "python",
     ]
+    assert [stage.input_port_ids for stage in plan.portable_ir.stages] == [(), (0,), (1,)]
+    assert [stage.output_port_ids for stage in plan.portable_ir.stages] == [(0,), (1,), (2,)]
+    assert plan.portable_ir.stages[-1].boundary_codec == "stream_item_v1_to_python"
     assert [item.backend for item in plan.portable_ir.implementations] == ["cpp", "python"]
-    with pytest.raises(ValueError, match="contract=runtime_binding") as error:
-        plan.run(executor="cpp")
-    assert "node=2" in str(error.value)
-    assert "port=2" in str(error.value)
-    assert "stage=2" in str(error.value)
-    assert "binding=implementation:2" in str(error.value)
-    assert "contract=python_stage_mixed_resume_pending" in str(error.value)
+    cpp = plan.run(executor="cpp")
+
+    assert cpp == result
+
+    python_to_native = source.map(shift).map(native)
+    unsupported = cw.compile(
+        [cw.output(python_to_native, collector=cw.Latest())],
+        backend="python",
+        implementations={native.operation_id: native_backend},
+    )
+    with pytest.raises(ValueError, match="contract=mixed_stage_order") as captured:
+        unsupported.run(executor="cpp")
+    message = str(captured.value)
+    assert "stage=" in message
+    assert "node=" in message
+    assert "port=" in message
+    assert "binding=" in message
 
 
 def test_compile_rejects_unknown_operation_implementation_selector(tmp_path: Path) -> None:

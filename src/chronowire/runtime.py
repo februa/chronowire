@@ -815,7 +815,53 @@ def _stage_descriptors(
                 "observation_boundary",
             )
     finish("plan_end")
-    return tuple(stages)
+    stage_by_node = {node_id: stage.stage_id for stage in stages for node_id in stage.node_ids}
+    stages_by_id = {stage.stage_id: stage for stage in stages}
+    consumers_by_port: dict[int, list[int]] = defaultdict(list)
+    for node in nodes:
+        for input_spec in node.inputs:
+            consumers_by_port[input_spec.source_port].append(node.id)
+    described: list[StageDescriptor] = []
+    for stage in stages:
+        member_ids = set(stage.node_ids)
+        input_ports = tuple(
+            dict.fromkeys(
+                input_spec.source_port
+                for node in nodes
+                if node.id in member_ids
+                for input_spec in node.inputs
+                if stage_by_node[producer_by_port[input_spec.source_port]] != stage.stage_id
+            )
+        )
+        output_ports = tuple(
+            port_id
+            for node in nodes
+            if node.id in member_ids
+            for port_id in node.output_ports
+            if port_id in boundary_ports
+            or any(
+                stage_by_node[consumer_id] != stage.stage_id
+                for consumer_id in consumers_by_port[port_id]
+            )
+        )
+        input_domains = {
+            stages_by_id[stage_by_node[producer_by_port[port_id]]].execution_domain
+            for port_id in input_ports
+        }
+        boundary_codec = stage.boundary_codec
+        if stage.execution_domain == "python" and input_domains - {"python"}:
+            boundary_codec = "stream_item_v1_to_python"
+        elif stage.execution_domain != "python" and "python" in input_domains:
+            boundary_codec = "python_to_stream_item_v1"
+        described.append(
+            replace(
+                stage,
+                boundary_codec=boundary_codec,
+                input_port_ids=input_ports,
+                output_port_ids=output_ports,
+            )
+        )
+    return tuple(described)
 
 
 def _shape_product(shape: tuple[int, ...]) -> int:

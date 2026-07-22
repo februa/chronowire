@@ -474,6 +474,8 @@ class StageDescriptor:
         boundary_reasons: Stage分割理由。
         runner_capabilities: Executorが満たすべきrunner種別。
         boundary_codec: Stage境界で必要な値codec。
+        input_port_ids: 他Stageから受け取る入力Port ID。
+        output_port_ids: 他StageまたはPlan終端へ渡す出力Port ID。
     """
 
     stage_id: int
@@ -482,6 +484,8 @@ class StageDescriptor:
     boundary_reasons: tuple[str, ...]
     runner_capabilities: tuple[str, ...] = ()
     boundary_codec: str | None = None
+    input_port_ids: tuple[int, ...] = ()
+    output_port_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.node_ids:
@@ -499,6 +503,8 @@ class StageDescriptor:
             _string_tuple(data, "boundary_reasons"),
             _string_tuple(data, "runner_capabilities") if "runner_capabilities" in data else (),
             _optional_string(data, "boundary_codec"),
+            _integer_tuple(data, "input_port_ids") if "input_port_ids" in data else (),
+            _integer_tuple(data, "output_port_ids") if "output_port_ids" in data else (),
         )
 
 

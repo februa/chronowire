@@ -10,12 +10,22 @@ from typing import Any
 
 from ._cpp_executor import CppCooperativeStageSession, CppGraphNativeSession
 from .collector import BufferOverflowError
-from .errors import ExtensionExecutionError, PlanSessionError
+from .errors import ExtensionExecutionError, KernelExecutionError, PlanSessionError
 from .executor import CppRuntimeMetrics, ExecutorSession
 from .extension import ExtensionSession, OutputEvent, PlanContext
 from .graph import NodeKind, RatePolicy
-from .kernel import NativeRuntimeBindingProvider
-from .model import Diagnostic, Emission, EmissionStatus, LogicalInterval, LogicalTime, Severity
+from .kernel import NativeRuntimeBindingProvider, RunContext
+from .model import (
+    Diagnostic,
+    Emission,
+    EmissionStatus,
+    EmitMany,
+    KernelOutputs,
+    LogicalInterval,
+    LogicalTime,
+    Severity,
+    Skip,
+)
 from .native import F64VectorSourceValues
 from .native_module import NativeOperationRuntimeBinding
 from .runtime import (
@@ -153,9 +163,18 @@ class CppExecutionSession(ExecutorSession):
         realtime push Source、任意のPython Kernelは対象外である。
     """
 
-    def __init__(self, plan: ExecutionPlan, extensions: tuple[_BoundExtension, ...] = ()) -> None:
+    def __init__(
+        self,
+        plan: ExecutionPlan,
+        extensions: tuple[_BoundExtension, ...] = (),
+        *,
+        node_ids: tuple[int, ...] | None = None,
+        boundary_output_ports: tuple[int, ...] = (),
+    ) -> None:
         self.plan = plan
         self._extensions = extensions
+        self._selected_node_ids = node_ids
+        self._boundary_output_ports = boundary_output_ports
         self._last_metrics: CppRuntimeMetrics | None = None
         self._public_emission_reconstructions = 0
         self._python_boundary_dispatches = 0
@@ -172,7 +191,8 @@ class CppExecutionSession(ExecutorSession):
         return self._last_metrics
 
     def _bind_runtime(self) -> CppGraphNativeSession:
-        nodes = self.plan._nodes
+        selected = None if self._selected_node_ids is None else set(self._selected_node_ids)
+        nodes = tuple(node for node in self.plan._nodes if selected is None or node.id in selected)
         if not nodes:
             raise ValueError("CppExecutor contract=nonempty_native_graph")
         source_nodes = tuple(node for node in nodes if node.kind is NodeKind.SOURCE)
@@ -191,7 +211,8 @@ class CppExecutionSession(ExecutorSession):
         ir = self.plan.portable_ir
         if ir.schema_version not in {"0.3", "0.4"}:
             raise ValueError("CppExecutor contract=portable_plan_schema requires schema 0.3/0.4")
-        if tuple(item.node_id for item in ir.nodes) != tuple(node.id for node in nodes):
+        descriptors_by_id = {item.node_id: item for item in ir.nodes}
+        if any(node.id not in descriptors_by_id for node in nodes):
             raise ValueError(
                 "CppExecutor contract=portable_node_order does not match bound Plan; "
                 f"{self._contract_context}"
@@ -215,7 +236,8 @@ class CppExecutionSession(ExecutorSession):
             for port in ir.ports
         }
         portable_nodes: list[tuple[object, ...]] = []
-        for node, descriptor in zip(nodes, ir.nodes, strict=True):
+        for node in nodes:
+            descriptor = descriptors_by_id[node.id]
             input_ports = tuple(item.source_port for item in node.inputs)
             try:
                 input_semantics = tuple(
@@ -328,25 +350,35 @@ class CppExecutionSession(ExecutorSession):
                 )
             )
         portable_outputs: list[tuple[int, int, int, int]] = []
-        for output_descriptor in ir.outputs:
-            collector_kind = _COLLECTOR_KIND.get(output_descriptor.collector_kind)
-            overflow_policy = _OVERFLOW_POLICY.get(output_descriptor.overflow_policy)
-            if collector_kind is None or overflow_policy is None:
-                raise ValueError(
-                    "CppExecutor contract=native_collector supports none/latest/bounded; "
-                    f"port={output_descriptor.port_id}"
+        if self._boundary_output_ports:
+            produced_ports = {node.output_port for node in nodes}
+            for port_id in self._boundary_output_ports:
+                if port_id not in produced_ports:
+                    raise ValueError(
+                        "CppExecutor contract=native_stage_boundary_output; "
+                        f"port={port_id} nodes={tuple(node.id for node in nodes)}"
+                    )
+                portable_outputs.append((port_id, 3, 0, 0))
+        else:
+            for output_descriptor in ir.outputs:
+                collector_kind = _COLLECTOR_KIND.get(output_descriptor.collector_kind)
+                overflow_policy = _OVERFLOW_POLICY.get(output_descriptor.overflow_policy)
+                if collector_kind is None or overflow_policy is None:
+                    raise ValueError(
+                        "CppExecutor contract=native_collector supports none/latest/bounded; "
+                        f"port={output_descriptor.port_id}"
+                    )
+                portable_outputs.append(
+                    (
+                        output_descriptor.port_id,
+                        collector_kind,
+                        output_descriptor.max_items or 0,
+                        overflow_policy,
+                    )
                 )
-            portable_outputs.append(
-                (
-                    output_descriptor.port_id,
-                    collector_kind,
-                    output_descriptor.max_items or 0,
-                    overflow_policy,
-                )
+            portable_outputs.extend(
+                (observation.flow.port_id, 3, 0, 0) for observation in self.plan._observations
             )
-        portable_outputs.extend(
-            (observation.flow.port_id, 3, 0, 0) for observation in self.plan._observations
-        )
         ingress = source.native_ingress()
         try:
             return CppGraphNativeSession(
@@ -649,6 +681,307 @@ class CppExecutionSession(ExecutorSession):
             status_counts,
             completed=True,
         )
+
+
+class CppMixedExecutionSession(ExecutorSession):
+    """native prefixから末尾Python islandへ一回だけbatchを渡すmixed session。
+
+    Args:
+        plan: native prefixと末尾の単一Python StageからなるPlan。
+
+    Raises:
+        ValueError: 複数island、Pythonからnativeへの復帰、分岐または複数入力を含む場合。
+
+    境界条件:
+        v0.4の最初のmixed経路は固定shape native出力から線形なPython MAP列への
+        一方向境界だけを扱う。C++ runtimeはnative prefixを自立実行し、Python関数を呼ばない。
+    """
+
+    def __init__(self, plan: ExecutionPlan) -> None:
+        if plan._observations:
+            raise ValueError(
+                "CppExecutor contract=mixed_extension_boundary_pending; "
+                "stage=None node=None port=None binding=None"
+            )
+        python_stages = tuple(
+            stage for stage in plan.portable_ir.stages if stage.execution_domain == "python"
+        )
+        if len(python_stages) != 1 or python_stages[0] != plan.portable_ir.stages[-1]:
+            stage = python_stages[0] if python_stages else None
+            node_id = None if stage is None else stage.node_ids[-1]
+            node = next(
+                (item for item in plan.portable_ir.nodes if item.node_id == node_id),
+                None,
+            )
+            binding = next(
+                (item.slot_id for item in plan.portable_ir.bindings if item.node_id == node_id),
+                None,
+            )
+            raise ValueError(
+                "CppExecutor contract=mixed_stage_order requires one terminal Python island; "
+                f"stage={None if stage is None else stage.stage_id} node={node_id} "
+                f"port={None if node is None else node.output_port_ids[-1]} binding={binding}; "
+                f"stages={tuple(item.stage_id for item in plan.portable_ir.stages)}"
+            )
+        stage = python_stages[0]
+        nodes_by_id = {node.id: node for node in plan._nodes}
+        python_nodes = tuple(nodes_by_id[node_id] for node_id in stage.node_ids)
+        if not python_nodes:
+            raise ValueError(f"CppExecutor contract=nonempty_python_stage; stage={stage.stage_id}")
+        if len(stage.input_port_ids) != 1:
+            raise ValueError(
+                "CppExecutor contract=single_mixed_stage_input; "
+                f"stage={stage.stage_id} node={python_nodes[0].id} "
+                f"port={stage.input_port_ids} binding=None"
+            )
+        if stage.boundary_codec != "stream_item_v1_to_python":
+            raise ValueError(
+                "CppExecutor contract=mixed_stage_boundary_codec; "
+                f"stage={stage.stage_id} node={python_nodes[0].id} "
+                f"port={stage.input_port_ids[0]} codec={stage.boundary_codec}"
+            )
+        boundary_port = stage.input_port_ids[0]
+        available_ports = {boundary_port}
+        for node in python_nodes:
+            binding = next(
+                (item.slot_id for item in plan.portable_ir.bindings if item.node_id == node.id),
+                None,
+            )
+            if (
+                node.kind is not NodeKind.MAP
+                or len(node.inputs) != 1
+                or len(node.output_ports) != 1
+                or node.inputs[0].source_port not in available_ports
+            ):
+                raise ValueError(
+                    "CppExecutor contract=single_input_terminal_python_map_stage; "
+                    f"stage={stage.stage_id} node={node.id} port={node.output_port} "
+                    f"binding={binding}"
+                )
+            available_ports.add(node.output_port)
+        python_node_ids = set(stage.node_ids)
+        native_node_ids = tuple(node.id for node in plan._nodes if node.id not in python_node_ids)
+        producer = next(
+            (node for node in plan._nodes if boundary_port in node.output_ports),
+            None,
+        )
+        if producer is None or producer.id not in native_node_ids:
+            raise ValueError(
+                "CppExecutor contract=native_to_python_boundary; "
+                f"stage={stage.stage_id} node={python_nodes[0].id} port={boundary_port}"
+            )
+        output_ports = {item.flow.port_id for item in plan._outputs}
+        if not output_ports.issubset({node.output_port for node in python_nodes}):
+            raise ValueError(
+                "CppExecutor contract=mixed_outputs_after_python_stage; "
+                f"stage={stage.stage_id} ports={tuple(sorted(output_ports))}"
+            )
+
+        self.plan = plan
+        self._stage = stage
+        self._python_nodes = python_nodes
+        self._boundary_port = boundary_port
+        self._native = CppExecutionSession(
+            plan,
+            node_ids=native_node_ids,
+            boundary_output_ports=(boundary_port,),
+        )
+        self._coordinator = CppCooperativeStageSession((stage.stage_id,))
+        self._sessions = {
+            node.id: plan._compiled_kernels[node.id].create_session() for node in python_nodes
+        }
+        self._last_metrics: CppRuntimeMetrics | None = None
+
+    @property
+    def last_metrics(self) -> CppRuntimeMetrics | None:
+        """直前のmixed Stage実行指標を返す。"""
+
+        return self._last_metrics
+
+    @staticmethod
+    def _status_max(first: EmissionStatus, second: EmissionStatus) -> EmissionStatus:
+        order = {
+            EmissionStatus.OK: 0,
+            EmissionStatus.DEGRADED: 1,
+            EmissionStatus.INVALID: 2,
+        }
+        return first if order[first] >= order[second] else second
+
+    def _run_python_stage(
+        self,
+        boundary: tuple[Emission[object], ...],
+    ) -> tuple[dict[int, tuple[Emission[object], ...]], dict[EmissionStatus, int]]:
+        """境界batchを線形Python MAP列へ通し、Port別immutable batchを返す。"""
+
+        batches: dict[int, tuple[Emission[object], ...]] = {self._boundary_port: boundary}
+        counts: dict[EmissionStatus, int] = {}
+        for node in self._python_nodes:
+            outputs: list[Emission[object]] = []
+            sequence = 0
+            for item in batches[node.inputs[0].source_port]:
+                if item.status is EmissionStatus.INVALID and not node.accepts_invalid:
+                    diagnostic = Diagnostic(
+                        Severity.WARNING,
+                        "INVALID_INPUT_PROPAGATED",
+                        "Kernel was skipped because it does not accept INVALID input",
+                        node_id=node.id,
+                        port_id=node.output_port,
+                        interval=item.interval,
+                    )
+                    outputs.append(
+                        Emission(
+                            item.value,
+                            item.interval,
+                            sequence,
+                            EmissionStatus.INVALID,
+                            item.diagnostics + (diagnostic,),
+                            item.metadata,
+                        )
+                    )
+                    sequence += 1
+                    continue
+                try:
+                    result = self._sessions[node.id].run(
+                        (item.value,),
+                        RunContext(node.config, item.interval),
+                    )
+                except Exception as error:
+                    raise KernelExecutionError(
+                        f"node {node.id} failed for interval {item.interval}: {error}"
+                    ) from error
+                if isinstance(result, KernelOutputs):
+                    raise KernelExecutionError(
+                        f"node {node.id} port {node.output_port} returned KernelOutputs for a "
+                        "single-output contract"
+                    )
+                values = (
+                    ()
+                    if isinstance(result, Skip)
+                    else (result.values if isinstance(result, EmitMany) else (result,))
+                )
+                if len(values) > node.max_items:
+                    raise KernelExecutionError(
+                        f"node {node.id} port {node.output_port} interval {item.interval} emitted "
+                        f"{len(values)} items; contract max_items={node.max_items}"
+                    )
+                for value in values:
+                    if isinstance(value, Emission):
+                        output = Emission(
+                            value.value,
+                            value.interval,
+                            sequence,
+                            self._status_max(item.status, value.status),
+                            item.diagnostics + value.diagnostics,
+                            value.metadata,
+                        )
+                    else:
+                        output = Emission(
+                            value,
+                            item.interval,
+                            sequence,
+                            item.status,
+                            item.diagnostics,
+                            item.metadata,
+                        )
+                    outputs.append(output)
+                    sequence += 1
+            batch = tuple(outputs)
+            batches[node.output_port] = batch
+            for item in batch:
+                counts[item.status] = counts.get(item.status, 0) + 1
+        return batches, counts
+
+    def run(
+        self,
+        *,
+        duration: float | Fraction | None = None,
+        options: RuntimeOptions | None = None,
+    ) -> RunResult:
+        """native prefixを実行し、末尾Python islandを一回のbatch dispatchで完了する。"""
+
+        if options is not None and options != RuntimeOptions():
+            raise ValueError("CppExecutor does not support RuntimeOptions overrides")
+        logical_end = None if duration is None else Fraction(str(duration))
+        if logical_end is not None and logical_end <= 0:
+            raise ValueError("CppExecutor duration must be positive")
+        try:
+            native_outputs, native_counts, metrics = self._native._runtime.run(
+                None if logical_end is None else logical_end.numerator,
+                None if logical_end is None else logical_end.denominator,
+            )
+            boundary, _, _, overflowed = self._native._decode_native_output(
+                native_outputs[0],
+                port_id=self._boundary_port,
+            )
+            if overflowed:
+                raise RuntimeError(
+                    "CppExecutor contract=unbounded_stage_boundary unexpectedly overflowed; "
+                    f"port={self._boundary_port}"
+                )
+            state, stage_id = self._coordinator.advance()
+            if state != 0 or stage_id != self._stage.stage_id:
+                raise RuntimeError(
+                    "CppExecutor contract=mixed_python_stage_advance; "
+                    f"stage={self._stage.stage_id} actual_state={state} actual_stage={stage_id}"
+                )
+            started = perf_counter_ns()
+            batches, python_counts = self._run_python_stage(boundary)
+            python_stage_ns = perf_counter_ns() - started
+            self._coordinator.resume(stage_id)
+            completed, completed_stage = self._coordinator.advance()
+            if completed != 1 or completed_stage != -1:
+                raise RuntimeError(
+                    "CppExecutor contract=mixed_python_stage_complete; "
+                    f"stage={stage_id} actual_state={completed}"
+                )
+        except Exception:
+            self._coordinator.abort()
+            raise
+
+        outputs: list[OutputResult[object]] = []
+        for output_spec in self.plan._outputs:
+            collector = output_spec.collector.create_session()
+            for emission in batches[output_spec.flow.port_id]:
+                collector.add(emission)
+            snapshot = collector.snapshot()
+            emissions = snapshot.emissions
+            outputs.append(
+                OutputResult(
+                    emissions,
+                    snapshot.info.kind,
+                    snapshot.received_count,
+                    snapshot.dropped_count,
+                    emissions[0].interval.start if emissions else None,
+                    emissions[-1].interval.end if emissions else None,
+                )
+            )
+        status_counts = {
+            status: native_counts[index] + python_counts.get(status, 0)
+            for index, status in enumerate(_NATIVE_TO_STATUS)
+            if native_counts[index] + python_counts.get(status, 0)
+        }
+        boundary_bytes = metrics[4]
+        self._last_metrics = CppRuntimeMetrics(
+            scheduler_ns=metrics[0],
+            kernel_ns=metrics[1],
+            output_select_ns=metrics[2],
+            owned_input_bytes=metrics[3],
+            output_boundary_bytes=boundary_bytes,
+            python_native_transitions=4,
+            stage_python_dispatches=1,
+            executed_node_count=metrics[7] + len(self._python_nodes),
+            native_run_releases_gil=True,
+            public_emission_reconstructions=len(boundary),
+            boundary_batch_conversions=1 if boundary else 0,
+            gil_acquisitions=1,
+            stage_boundary_batches=1,
+            stage_boundary_bytes=boundary_bytes,
+            copied_batches=1 if boundary else 0,
+            python_stage_ns=python_stage_ns,
+            native_stage_ns=metrics[0] + metrics[1] + metrics[2],
+            execution_classification="hybrid",
+        )
+        return RunResult(tuple(outputs), self.plan.diagnostics, status_counts, completed=True)
 
 
 class CppPlanSession:

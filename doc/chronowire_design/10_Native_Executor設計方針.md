@@ -369,11 +369,13 @@ C++ runtime内にPython C API、`PyObject*`、callback function pointerを持ち
 read-only memoryviewでborrowし、適合するbuffer出力はzero-copy、それ以外は境界ごと1回copyとする。
 `python_opaque`を扱うRATE/FRAMEは初期実装でPython islandに含めてよい。
 
-初期実装済みの範囲はall-Python one-shot Planの単一islandである。C++ sessionは
-stage IDの`advance()` / `resume()` / `abort()`状態を所有し、実行本体はadapter側の
-run-local Python sessionが一回だけ実行する。mixed Planのinput/output batchをC++ Schedulerへ
-resumeする経路は未実装であり、現時点では`python_stage_mixed_resume_pending`として
-Stage/Node/Port/binding付きで拒否する。all-nativeの既存hot pathは変更しない。
+初期実装はall-Python one-shot Planに加え、native prefixから末尾の単一Python islandへ進む
+mixed Planを扱う。C++ GraphRuntimeSessionがnative prefixを自立実行し、終端なしcollectorで
+Stage入力batchを所有結果としてadapterへ渡す。adapterはstage IDの`advance()` / `resume()` /
+`abort()`状態に従い、run-local Python session群をStageにつき一回dispatchする。現段階の境界値は
+一回copyであり、fan-out、0/複数Emission、status/Diagnostic、例外後の再実行を照合済みである。
+Pythonからnativeへ戻る`resume(output_batches)`、複数island、複数入力、zero-copy、PlanSessionは
+未対応capabilityとしてStage/Node/Port/binding付きで拒否する。all-native hot pathは変更しない。
 
 ### Phase 3: 最小Cython Executor
 
