@@ -81,6 +81,7 @@ from .model import (
 )
 from .native import F64SourceValues, F64VectorSourceValues, IdentityF64Kernel
 from .operation import (
+    CompiledOperationMetadata,
     OperationBackend,
     OperationDefinition,
     ValueSpec,
@@ -89,11 +90,16 @@ from .operation import (
 from .plan_ir import (
     BindingDescriptor,
     BufferDescriptor,
+    ConfigFieldDescriptor,
     EdgeDescriptor,
     ExtensionDescriptor,
+    ImplementationDescriptor,
     KernelAbiDescriptor,
     NativeBufferDescriptor,
     NodeDescriptor,
+    OperationDescriptor,
+    OperationInputDescriptor,
+    OperationOutputDescriptor,
     OutputDescriptor,
     PlanDiagnosticDescriptor,
     PortablePlanIR,
@@ -1076,7 +1082,11 @@ def _portable_plan_ir(
             (
                 f"source:{node.id}"
                 if node.kind is NodeKind.SOURCE
-                else f"kernel:{node.id}"
+                else (
+                    f"implementation:{node.id}"
+                    if isinstance(node.operation, OperationDefinition)
+                    else f"kernel:{node.id}"
+                )
                 if node.kind is NodeKind.MAP
                 else None
             ),
@@ -1098,6 +1108,97 @@ def _portable_plan_ir(
         for node in nodes
     )
     value_schemas, port_schema_ids = _value_schema_descriptors(nodes, compiled_kernels)
+    operation_descriptors: list[OperationDescriptor] = []
+    implementation_descriptors: list[ImplementationDescriptor] = []
+    for node in nodes:
+        operation = node.operation
+        if not isinstance(operation, OperationDefinition):
+            continue
+        compiled = compiled_kernels[node.id]
+        if not isinstance(compiled, CompiledOperationMetadata):
+            raise CompileError(
+                f"node={node.id} port={node.output_port} operation={operation.operation_id} "
+                "contract=compiled_operation_metadata"
+            )
+        implementation = compiled.implementation_spec
+        if implementation.operation_id != operation.operation_id:
+            raise CompileError(
+                f"node={node.id} port={node.output_port} operation={operation.operation_id} "
+                f"implementation_operation={implementation.operation_id} "
+                "contract=operation_id_match"
+            )
+        slot = f"implementation:{node.id}"
+        implementation_descriptors.append(
+            ImplementationDescriptor(
+                implementation.operation_id,
+                implementation.implementation_id,
+                implementation.backend,
+                implementation.abi_version,
+                slot,
+                implementation.process_model,
+                implementation.native_compatible,
+                implementation.selected_variant,
+                implementation.required_cpu_features,
+                implementation.workspace_size_bytes,
+                implementation.workspace_alignment_bytes,
+                implementation.supports_flush,
+                implementation.session_local,
+            )
+        )
+        inputs_by_name = {item.keyword: item for item in node.inputs}
+        operation_descriptors.append(
+            OperationDescriptor(
+                node.id,
+                operation.operation_id,
+                tuple(
+                    OperationInputDescriptor(
+                        name,
+                        (inputs_by_name[name].source_port if name in inputs_by_name else None),
+                        (
+                            port_schema_ids[inputs_by_name[name].source_port]
+                            if name in inputs_by_name
+                            else None
+                        ),
+                        spec.mode,
+                        spec.required,
+                        spec.primary,
+                    )
+                    for name, spec in operation.spec.inputs
+                ),
+                tuple(
+                    OperationOutputDescriptor(
+                        name,
+                        node.output_ports[index],
+                        port_schema_ids[node.output_ports[index]],
+                        spec.time,
+                        spec.emissions,
+                        spec.max_items,
+                    )
+                    for index, (name, spec) in enumerate(operation.spec.outputs)
+                ),
+                operation.spec.config.scope,
+                node.config.scope_id,
+                node.config.digest,
+                tuple(
+                    ConfigFieldDescriptor(
+                        path,
+                        tuple(
+                            item.__module__ + "." + item.__qualname__
+                            for item in (expected if isinstance(expected, tuple) else (expected,))
+                        ),
+                    )
+                    for path, expected in operation.spec.config.fields
+                ),
+                operation.spec.state,
+                operation.spec.gap_policy.value,
+                operation.spec.accepts_invalid,
+                "preserve_worst",
+                implementation.implementation_id,
+                implementation.abi_version,
+                node_backend_names[node.id],
+                slot,
+            )
+        )
     ports = tuple(
         PortDescriptor(
             output_port,
@@ -1328,8 +1429,12 @@ def _portable_plan_ir(
         ]
         + [
             BindingDescriptor(
-                f"kernel:{node.id}",
-                "kernel",
+                (
+                    f"implementation:{node.id}"
+                    if isinstance(node.operation, OperationDefinition)
+                    else f"kernel:{node.id}"
+                ),
+                "operation" if isinstance(node.operation, OperationDefinition) else "kernel",
                 node.id,
                 node.output_port,
                 kernel_abi_descriptors[node.id].abi_version,
@@ -1397,13 +1502,15 @@ def _portable_plan_ir(
         if port.port_id in native_port_ids
     )
     return PortablePlanIR(
-        schema_version="0.3",
+        schema_version="0.4" if operation_descriptors else "0.3",
         kind="execution_plan",
         backend=backend_name,
         nodes=plan_nodes,
         value_schemas=value_schemas,
         stages=stages,
         kernel_abis=kernel_abis,
+        operations=tuple(operation_descriptors),
+        implementations=tuple(implementation_descriptors),
         stream_item_abis=stream_item_abis,
         native_buffers=native_buffers,
         ports=ports,
@@ -1515,7 +1622,10 @@ def compile(
                     f"operation={operation.operation_id} contains unnamed inputs"
                 )
             if selected_backend.name == "python":
-                if operation.python_binding is None:
+                if (
+                    operation.python_binding is None
+                    or operation.python_binding.spec.backend != "python"
+                ):
                     raise MissingImplementationError(
                         f"node={node.id} port={node.output_port} "
                         f"operation={operation.operation_id} backend=python "
@@ -1542,11 +1652,36 @@ def compile(
                     f"backend {selected_backend.name!r} returned an invalid "
                     f"CompiledOperation for node {node.id} operation={operation.operation_id}"
                 )
+            if not isinstance(compiled, CompiledOperationMetadata):
+                raise CompileError(
+                    f"node={node.id} port={node.output_port} "
+                    f"operation={operation.operation_id} "
+                    "contract=compiled_operation_metadata"
+                )
+            implementation = compiled.implementation_spec
+            if (
+                implementation.operation_id != operation.operation_id
+                or implementation.backend != selected_backend.name
+            ):
+                raise CompileError(
+                    f"node={node.id} port={node.output_port} "
+                    f"operation={operation.operation_id} "
+                    f"implementation_operation={implementation.operation_id} "
+                    f"implementation_backend={implementation.backend} "
+                    f"backend={selected_backend.name} contract=implementation_identity"
+                )
             compiled_kernels[node.id] = compiled
             if isinstance(compiled, NativeCompiledKernel):
+                if implementation.abi_version != compiled.abi_version:
+                    raise CompileError(
+                        f"node={node.id} port={node.output_port} "
+                        f"operation={operation.operation_id} "
+                        f"implementation_abi={implementation.abi_version} "
+                        f"compiled_abi={compiled.abi_version} contract=abi_match"
+                    )
                 kernel_abi_descriptors[node.id] = KernelAbiDescriptor(
                     node.id,
-                    f"kernel:{node.id}",
+                    f"implementation:{node.id}",
                     compiled.abi_version,
                     compiled.process_model,
                     compiled.workspace_size_bytes,
@@ -1558,14 +1693,14 @@ def compile(
             else:
                 kernel_abi_descriptors[node.id] = KernelAbiDescriptor(
                     node.id,
-                    f"kernel:{node.id}",
-                    "chronowire.operation.python.v1",
-                    "python_operation",
-                    None,
-                    None,
-                    False,
-                    True,
-                    False,
+                    f"implementation:{node.id}",
+                    implementation.abi_version,
+                    implementation.process_model,
+                    implementation.workspace_size_bytes,
+                    implementation.workspace_alignment_bytes,
+                    implementation.supports_flush,
+                    implementation.session_local,
+                    implementation.native_compatible,
                 )
             node_backend_names[node.id] = selected_backend.name
             continue

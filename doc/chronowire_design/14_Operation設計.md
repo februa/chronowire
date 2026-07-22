@@ -653,12 +653,14 @@ operation IDへ登録する。利用者はKernel class、ABI ID、session factor
 2. **未実装**: plain callableとlegacy KernelをOperationへ正規化するadapter
 3. **初期実装済み**: SOURCE→RATE→FRAME→MAPのcompile-time shape unification。Backend選択前に
    固定値、symbol、Config dimensionを検証する
-4. **未実装**: OperationDescriptor、ImplementationSpec、binding slotを含む新PortablePlanIR schemaと旧reader
+4. **初期実装済み**: schema 0.4のOperationDescriptor、ImplementationDescriptor、binding slotと、
+   schema 0.1〜0.3互換reader。resolved schemaとConfig依存を保存する
 5. **初期実装済み**: Python Backendとrunごとに生成するPython OperationSession。公開のmutable state
    factoryは未実装
-6. **一部実装済み**: MissingImplementation、shape、Config scope/leafの明示エラー。native bindingエラーは
-   手順7以降で実装する
-7. **未実装**: C ABI module manifest loaderとImplementationBinding
+6. **一部実装済み**: MissingImplementation、shape、Config scope/leaf、Python ImplementationBindingの
+   ID/ABI不一致を明示エラーにする。native module ABIエラーは手順7以降で実装する
+7. **一部実装済み**: process-local ImplementationBindingと別process相当の再bind。C ABI module manifest
+   loader、library探索、module lifetime管理は未実装
 8. **未実装**: C++ Backend + PythonExecutor conformance
 9. **未実装**: C++ Backend + CppExecutorのgeneric Operation ABI
 10. **未実装**: Fixed CBF参照packageを新APIへ移行し、旧APIをdeprecated化
@@ -667,8 +669,14 @@ operation IDへ登録する。利用者はKernel class、ABI ID、session factor
 latest StateFlowを宣言名へbindし、Python実装へ不変な`inputs` mappingと選択済み`ConfigView`だけを渡す。
 複数Port、DEGRADED/INVALID伝播、宣言のみOperationの明示的な実装不足も既存runtime上で検証する。
 
-PortablePlanIR schemaは互換性維持のため現時点では0.3の`KernelAbiDescriptor`へPython Operation境界を
-記録する。これは最終形ではなく、手順4で`OperationDescriptor`を正本へ移した後も旧readerを維持する。
+宣言Operationを含むPlanはPortablePlanIR schema 0.4をexportする。`OperationDescriptor`はNode/Port、
+resolved schema、Config scope/path/digest/leaf型、time/Emission/status/state/gap規則、選択implementationと
+binding slotを正本として記録する。`ImplementationDescriptor`はID、Backend、ABI、process model、
+workspace、CPU featureを記録し、Python callable、shape resolver、native pointer、module handle、library
+pathは保存しない。legacy KernelだけのPlanはschema 0.3を維持し、0.1〜0.3 readerも削除しない。
+
+schema 0.4のPython Operation Planは、IR、Config、Source/Collector、およびprocess-local
+`ImplementationBinding`から再bindして実行できる。native moduleの探索と再bindは手順7の残件である。
 
 各段階でPython基準traceとの値、interval、sequence、status、Diagnostic、metadata同値を確認する。
 

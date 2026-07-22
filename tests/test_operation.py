@@ -224,6 +224,14 @@ class _ShapeOnlySession:
 
 
 class _ShapeOnlyCompiled:
+    def __init__(self, operation_id: str) -> None:
+        self.implementation_spec = cw.ImplementationSpec(
+            operation_id,
+            f"{operation_id}.shape_only",
+            "shape_only",
+            "test.shape-only.v1",
+        )
+
     def create_session(self) -> _ShapeOnlySession:
         return _ShapeOnlySession()
 
@@ -242,8 +250,8 @@ class _ShapeOnlyBackend:
         context: object,
     ) -> cw.CompiledKernel[object]:
         self.compile_count += 1
-        del operation, context
-        return _ShapeOnlyCompiled()
+        del context
+        return _ShapeOnlyCompiled(operation.operation_id)
 
     def compile_kernel(
         self,
@@ -357,3 +365,117 @@ def test_operation_scalar_output_shape_and_missing_shape_config() -> None:
     configured_map = cw.Flow(cw.f64_source([1.0]), cw.Config(dsp={})).map(configured)
     with pytest.raises(cw.MissingConfigError, match="missing_shape_config"):
         cw.compile([configured_map], backend=_ShapeOnlyBackend())
+
+
+def test_operation_descriptor_round_trip_contains_only_portable_contract() -> None:
+    """schema 0.4へresolved意味論と実装IDだけを保存する。"""
+
+    def resolve_shape(
+        inputs: Mapping[str, object],
+        config: cw.ConfigView,
+    ) -> tuple[int, ...]:
+        del inputs
+        channels = config.channels
+        assert isinstance(channels, int)
+        return (channels,)
+
+    @cw.operation(
+        operation_id="test.portable.v1",
+        inputs={
+            "signal": cw.OperationInputSpec(
+                primary=True,
+                value=cw.ValueSpec(dtype="float64", shape=("channels",)),
+            )
+        },
+        output=cw.OperationOutputSpec(value=cw.ValueSpec(dtype="float64", shape=(None,))),
+        config=cw.ConfigSpec(scope="dsp", fields={"channels": int}),
+        shape_resolver=resolve_shape,
+    )
+    def portable(inputs: Mapping[str, object], config: cw.ConfigView) -> object:
+        del config
+        return inputs["signal"]
+
+    config = cw.Config(dsp={"channels": 2})
+    mapped = cw.Flow(cw.f64_vector_source([(1.0, 2.0)], width=2), config).map(portable)
+    ir = cw.compile([cw.output(mapped, collector=cw.Latest())]).portable_ir
+    restored = cw.PortablePlanIR.from_json(ir.to_json())
+
+    assert restored == ir
+    assert ir.schema_version == "0.4"
+    assert len(ir.operations) == 1
+    assert len(ir.implementations) == 1
+    operation_descriptor = ir.operations[0]
+    implementation = ir.implementations[0]
+    assert operation_descriptor.operation_id == "test.portable.v1"
+    assert operation_descriptor.inputs[0].value_schema_id == "native:f64:2"
+    assert operation_descriptor.outputs[0].value_schema_id.endswith("float64:2")
+    assert operation_descriptor.config_scope_path == "dsp"
+    assert operation_descriptor.config_fields[0].type_names == ("builtins.int",)
+    assert operation_descriptor.binding_slot == "implementation:1"
+    assert implementation.implementation_id == "test.portable.v1.python"
+    assert implementation.binding_slot == operation_descriptor.binding_slot
+    payload = ir.to_json()
+    assert "resolve_shape" not in payload
+    assert "python_binding" not in payload
+
+    inconsistent = ir.to_dict()
+    implementations = inconsistent["implementations"]
+    assert isinstance(implementations, (list, tuple))
+    implementations[0]["abi_version"] = "wrong-v1"
+    with pytest.raises(ValueError, match="inconsistent implementation"):
+        cw.PortablePlanIR.from_dict(inconsistent)
+
+
+def test_operation_plan_rebinds_from_implementation_binding() -> None:
+    """別process相当のIRをImplementationBindingとConfigから復元して実行する。"""
+
+    @cw.operation(
+        operation_id="test.rebind_scale.v1",
+        output="same",
+        config=cw.ConfigSpec(scope="dsp.scale", fields={"factor": int}),
+    )
+    def scale(inputs: Mapping[str, object], config: cw.ConfigView) -> object:
+        value = inputs["input"]
+        factor = config.factor
+        assert isinstance(value, int)
+        assert isinstance(factor, int)
+        return value * factor
+
+    config = cw.Config(dsp={"scale": {"factor": 4}})
+    mapped = cw.Flow([1, 2], config).map(scale)
+    plan = cw.compile([cw.output(mapped, collector=cw.Bounded(2))])
+    operation_binding = scale.python_binding
+    assert operation_binding is not None
+    values: dict[str, object] = {}
+    for descriptor in plan.portable_ir.bindings:
+        if descriptor.kind == "source":
+            values[descriptor.slot_id] = [1, 2]
+        elif descriptor.kind == "operation":
+            values[descriptor.slot_id] = operation_binding
+        elif descriptor.kind == "collector":
+            values[descriptor.slot_id] = cw.Bounded(2)
+
+    rebound = cw.bind_plan(
+        cw.PortablePlanIR.from_json(plan.portable_ir.to_json()),
+        cw.ExecutionBindings(values, {config.scope_id: config}),
+    )
+
+    assert [item.value for item in rebound.run().outputs[0].emissions] == [4, 8]
+    assert rebound.portable_ir.schema_version == "0.4"
+
+    wrong = cw.ImplementationBinding(
+        cw.ImplementationSpec(
+            "test.rebind_scale.v1",
+            "test.rebind_scale.v1.wrong",
+            "python",
+            "chronowire.operation.python.v1",
+        ),
+        operation_binding.implementation,
+    )
+    wrong_values = dict(values)
+    wrong_values["implementation:1"] = wrong
+    with pytest.raises(cw.ExecutionBindingError, match="implementation_identity"):
+        cw.bind_plan(
+            plan.portable_ir,
+            cw.ExecutionBindings(wrong_values, {config.scope_id: config}),
+        )

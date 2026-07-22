@@ -23,7 +23,22 @@ from .extension import (
 )
 from .graph import Flow, Graph, InputSemantics, InputSpec, MissingInputPolicy, NodeKind, RatePolicy
 from .kernel import Backend, CompileContext, CompiledKernel, GapPolicy, Kernel
-from .plan_ir import NodeDescriptor, PortablePlanIR, RationalDescriptor, TriggerDescriptor
+from .operation import (
+    ConfigSpec,
+    ImplementationBinding,
+    OperationDefinition,
+    OperationInputSpec,
+    OperationOutputSpec,
+    OperationSpec,
+    ValueSpec,
+)
+from .plan_ir import (
+    NodeDescriptor,
+    OperationDescriptor,
+    PortablePlanIR,
+    RationalDescriptor,
+    TriggerDescriptor,
+)
 from .runtime import ExecutionPlan, RunResult, RuntimeOptions, compile, output
 from .source import RealtimeSource, Source
 
@@ -147,6 +162,124 @@ def _config(scope_id: str, bindings: ExecutionBindings) -> Config:
     return value
 
 
+def _value_spec(ir: PortablePlanIR, value_schema_id: str | None) -> ValueSpec:
+    """resolved portable schemaを再compile可能な固定ValueSpecへ戻す。"""
+
+    if value_schema_id is None:
+        return ValueSpec()
+    schema = next(
+        (item for item in ir.value_schemas if item.value_schema_id == value_schema_id),
+        None,
+    )
+    if schema is None:
+        raise ExecutionBindingError(
+            f"missing value_schema_id={value_schema_id!r}; contract=operation_schema"
+        )
+    return ValueSpec(
+        schema.dtype,
+        schema.shape,
+        schema.device,
+        schema.representation,
+        schema.read_only,
+    )
+
+
+def _config_type(name: str, operation: OperationDescriptor) -> type[object]:
+    """portableな組込みConfig型名をPython typeへ解決する。"""
+
+    supported: dict[str, type[object]] = {
+        "builtins.bool": bool,
+        "builtins.bytes": bytes,
+        "builtins.float": float,
+        "builtins.int": int,
+        "builtins.str": str,
+        "builtins.tuple": tuple,
+    }
+    result = supported.get(name)
+    if result is None:
+        raise ExecutionBindingError(
+            f"node={operation.node_id} operation={operation.operation_id} "
+            f"config_type={name!r} contract=portable_config_type"
+        )
+    return result
+
+
+def _bound_operation(
+    descriptor: OperationDescriptor,
+    ir: PortablePlanIR,
+    bound: object,
+) -> OperationDefinition:
+    """IR意味論とprocess-local実装bindingからOperationDefinitionを再構築する。"""
+
+    if isinstance(bound, OperationDefinition):
+        if bound.operation_id != descriptor.operation_id:
+            raise ExecutionBindingError(
+                f"slot={descriptor.binding_slot!r} node={descriptor.node_id} "
+                f"operation={descriptor.operation_id} actual={bound.operation_id} "
+                "contract=operation_id_match"
+            )
+        binding = bound.python_binding
+    elif isinstance(bound, ImplementationBinding):
+        binding = bound
+    else:
+        raise ExecutionBindingError(
+            f"slot={descriptor.binding_slot!r} node={descriptor.node_id} "
+            f"operation={descriptor.operation_id} requires ImplementationBinding"
+        )
+    if binding is None:
+        raise ExecutionBindingError(
+            f"slot={descriptor.binding_slot!r} node={descriptor.node_id} "
+            f"operation={descriptor.operation_id} has no process-local implementation"
+        )
+    if (
+        binding.spec.operation_id != descriptor.operation_id
+        or binding.spec.implementation_id != descriptor.implementation_id
+        or binding.spec.abi_version != descriptor.implementation_abi_version
+    ):
+        raise ExecutionBindingError(
+            f"slot={descriptor.binding_slot!r} node={descriptor.node_id} "
+            f"operation={descriptor.operation_id} implementation={descriptor.implementation_id} "
+            f"abi={descriptor.implementation_abi_version} contract=implementation_identity"
+        )
+    fields: dict[str, type[object] | tuple[type[object], ...]] = {}
+    for field in descriptor.config_fields:
+        resolved = tuple(_config_type(name, descriptor) for name in field.type_names)
+        fields[field.path] = resolved[0] if len(resolved) == 1 else resolved
+    spec = OperationSpec(
+        descriptor.operation_id,
+        tuple(
+            (
+                item.name,
+                OperationInputSpec(
+                    _value_spec(ir, item.value_schema_id),
+                    item.primary,
+                    item.mode,
+                    item.required,
+                ),
+            )
+            for item in descriptor.inputs
+        ),
+        tuple(
+            (
+                item.name,
+                OperationOutputSpec(
+                    _value_spec(ir, item.value_schema_id),
+                    item.time_rule,
+                    item.emission_rule,
+                    item.max_items,
+                ),
+            )
+            for item in descriptor.outputs
+        ),
+        ConfigSpec(descriptor.config_scope_path, fields),
+        descriptor.state_rule,
+        GapPolicy(descriptor.gap_policy),
+        descriptor.accepts_invalid,
+        None,
+    )
+    return OperationDefinition(spec, binding)
+
+
 def _node_parameters(
     descriptor: NodeDescriptor,
     ir: PortablePlanIR,
@@ -188,7 +321,7 @@ def bind_plan(
     """PortablePlanIRを検証済みprocess-local実体へbindする。
 
     Args:
-        ir: schema 0.1、0.2、0.3のportable plan。
+        ir: schema 0.1、0.2、0.3、0.4のportable plan。
         bindings: slotとConfig scopeの完全なprocess-local対応。
         backend: KernelをcompileするBackend。既定はPython。
 
@@ -199,7 +332,7 @@ def bind_plan(
         ExecutionBindingError: schema、slot集合、型、Config scope、Graph IDが不整合な場合。
     """
 
-    if ir.schema_version not in {"0.1", "0.2", "0.3"}:
+    if ir.schema_version not in {"0.1", "0.2", "0.3", "0.4"}:
         raise ExecutionBindingError(
             f"unsupported PortablePlanIR schema_version={ir.schema_version!r}"
         )
@@ -219,8 +352,16 @@ def bind_plan(
         )
         for node in ir.nodes
     }
+    operations_by_node = {item.node_id: item for item in ir.operations}
     for descriptor in sorted(ir.nodes, key=lambda item: item.node_id):
         config = _config(descriptor.config_scope_id, bindings)
+        operation_descriptor = operations_by_node.get(descriptor.node_id)
+        if operation_descriptor is not None and config.digest != operation_descriptor.config_digest:
+            raise ExecutionBindingError(
+                f"node={descriptor.node_id} operation={operation_descriptor.operation_id} "
+                f"config_digest={operation_descriptor.config_digest!r} "
+                f"actual={config.digest!r} contract=config_digest"
+            )
         inputs = tuple(
             InputSpec(
                 edge.source_port_id,
@@ -231,7 +372,7 @@ def bind_plan(
             )
             for edge in edges_by_node[descriptor.node_id]
         )
-        operation: Callable[..., object] | Kernel[object] | None = None
+        operation: Callable[..., object] | Kernel[object] | OperationDefinition | None = None
         source: Iterable[object] | Source[object] | RealtimeSource[object] | None = None
         if descriptor.opcode == "source":
             if descriptor.binding_slot is None:
@@ -247,7 +388,9 @@ def bind_plan(
             if descriptor.binding_slot is None:
                 raise ExecutionBindingError(f"map node {descriptor.node_id} lacks binding slot")
             bound = bindings.values[descriptor.binding_slot]
-            if isinstance(bound, CompiledKernel):
+            if operation_descriptor is not None:
+                operation = _bound_operation(operation_descriptor, ir, bound)
+            elif isinstance(bound, CompiledKernel):
                 operation = _PrecompiledKernel(bound)
             elif isinstance(bound, Kernel) or callable(bound):
                 operation = bound

@@ -238,6 +238,13 @@ class ImplementationSpec:
         backend: 実装を選択するBackend名。
         abi_version: process境界で照合するABI version。
         native_compatible: Python callbackなしでnative実行できる場合にTrue。
+        process_model: 一回のprocess呼出しが扱う値・batch規則。
+        selected_variant: scalar、AVX2等の選択済みvariant。
+        required_cpu_features: 実行に必要なCPU feature名。
+        workspace_size_bytes: session workspaceの固定byte数。
+        workspace_alignment_bytes: workspace先頭alignment。
+        supports_flush: EOF時のflush entrypointを持つ場合にTrue。
+        session_local: mutable状態がrun-local sessionへ閉じる場合にTrue。
 
     Raises:
         ValueError: 必須ID、Backend名、ABI versionが空の場合。
@@ -248,10 +255,29 @@ class ImplementationSpec:
     backend: str
     abi_version: str
     native_compatible: bool = False
+    process_model: str = "python_operation"
+    selected_variant: str | None = None
+    required_cpu_features: tuple[str, ...] = ()
+    workspace_size_bytes: int | None = None
+    workspace_alignment_bytes: int | None = None
+    supports_flush: bool = False
+    session_local: bool = True
 
     def __post_init__(self) -> None:
-        if not all((self.operation_id, self.implementation_id, self.backend, self.abi_version)):
+        if not all(
+            (
+                self.operation_id,
+                self.implementation_id,
+                self.backend,
+                self.abi_version,
+                self.process_model,
+            )
+        ):
             raise ValueError("ImplementationSpec IDs, backend, and ABI must be non-empty")
+        if self.workspace_size_bytes is not None and self.workspace_size_bytes < 0:
+            raise ValueError("ImplementationSpec workspace size must not be negative")
+        if self.workspace_alignment_bytes is not None and self.workspace_alignment_bytes <= 0:
+            raise ValueError("ImplementationSpec workspace alignment must be positive")
 
 
 @dataclass(frozen=True)
@@ -260,14 +286,14 @@ class ImplementationBinding:
 
     Args:
         spec: Planへ記録可能な実装属性。
-        implementation: 現processだけで参照する実装実体。
+        implementation: 現processだけで参照するcallableまたはnative module実体。
 
     境界条件:
         callableはPortablePlanIRへ直列化せず、run-local状態も保持しない。
     """
 
     spec: ImplementationSpec
-    implementation: Callable[..., object]
+    implementation: object
 
 
 @runtime_checkable
@@ -300,6 +326,17 @@ class OperationBackend(Protocol):
         Raises:
             Exception: 対応実装不足またはABI不整合を検出した場合。
         """
+
+        ...
+
+
+@runtime_checkable
+class CompiledOperationMetadata(Protocol):
+    """compile済みOperationが選択実装のportable属性を公開する境界。"""
+
+    @property
+    def implementation_spec(self) -> ImplementationSpec:
+        """選択済み実装のportable属性を返す。"""
 
         ...
 
@@ -351,6 +388,7 @@ class _CompiledPythonOperation:
     implementation: Callable[..., object]
     input_names: tuple[str, ...]
     config: ConfigView
+    implementation_spec: ImplementationSpec
 
     def create_session(self) -> _PythonOperationSession:
         """別runと状態を共有しないPython OperationSessionを返す。"""
@@ -372,10 +410,16 @@ def compile_python_operation(
 
     if definition.python_binding is None:
         raise ValueError(f"operation {definition.operation_id!r} has no Python implementation")
+    implementation = definition.python_binding.implementation
+    if not callable(implementation):
+        raise TypeError(
+            f"operation {definition.operation_id!r} Python implementation must be callable"
+        )
     return _CompiledPythonOperation(
-        definition.python_binding.implementation,
+        implementation,
         input_names,
         config,
+        definition.python_binding.spec,
     )
 
 
