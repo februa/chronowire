@@ -2,10 +2,11 @@
 
 Chronowireは、論理時間付きストリームをFlow APIでLogical Graphとして構築し、明示的にcompileして実行するPythonフレームワークである。
 
-v0.4の実装は`Kernel`/`CompiledKernel`名称を使用する。次の公開APIではFlow利用者へABIやSessionを
-露出しないOperationSpec中心へ移行する設計を確定している。詳細は
-[14_Operation設計.md](doc/chronowire_design/14_Operation設計.md)を参照する。Operation自体の実装はまだ
-開始していない。
+v0.4の互換実装は`Kernel`/`CompiledKernel`名称を使用する。現在はFlow利用者へABIやSessionを
+露出しないOperationSpec中心APIへの段階移行を開始しており、宣言、Python参照実装、名前付き入力、
+Config subtree、compile-time shape検証まで利用できる。PortablePlanIRのOperationDescriptorとnative
+module bindingは未実装である。詳細は
+[14_Operation設計.md](doc/chronowire_design/14_Operation設計.md)を参照する。
 
 ## v0.1
 

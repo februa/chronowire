@@ -647,18 +647,28 @@ operation IDへ登録する。利用者はKernel class、ABI ID、session factor
 
 ## 13. 段階的実装順序
 
-今回は設計だけを確定し、Operation実装には進まない。実装時は次の順序を守る。
+設計確定後は次の順序で実装する。2026-07-22時点の状態も併記する。
 
-1. `OperationSpec`、input/output、ValueSpec、ConfigSpecのimmutable modelとvalidation
-2. plain callableとlegacy KernelをOperationへ正規化するadapter
-3. SOURCE→RATE→FRAME→MAPのcompile-time shape unification
-4. OperationDescriptor、ImplementationSpec、binding slotを含む新PortablePlanIR schemaと旧reader
-5. Python BackendとPython OperationSession
-6. MissingImplementation、shape、Config leaf、bindingの明示エラー
-7. C ABI module manifest loaderとImplementationBinding
-8. C++ Backend + PythonExecutor conformance
-9. C++ Backend + CppExecutorのgeneric Operation ABI
-10. Fixed CBF参照packageを新APIへ移行し、旧APIをdeprecated化
+1. **実装済み**: `OperationSpec`、input/output、ValueSpec、ConfigSpecのimmutable modelとvalidation
+2. **未実装**: plain callableとlegacy KernelをOperationへ正規化するadapter
+3. **初期実装済み**: SOURCE→RATE→FRAME→MAPのcompile-time shape unification。Backend選択前に
+   固定値、symbol、Config dimensionを検証する
+4. **未実装**: OperationDescriptor、ImplementationSpec、binding slotを含む新PortablePlanIR schemaと旧reader
+5. **初期実装済み**: Python Backendとrunごとに生成するPython OperationSession。公開のmutable state
+   factoryは未実装
+6. **一部実装済み**: MissingImplementation、shape、Config scope/leafの明示エラー。native bindingエラーは
+   手順7以降で実装する
+7. **未実装**: C ABI module manifest loaderとImplementationBinding
+8. **未実装**: C++ Backend + PythonExecutor conformance
+9. **未実装**: C++ Backend + CppExecutorのgeneric Operation ABI
+10. **未実装**: Fixed CBF参照packageを新APIへ移行し、旧APIをdeprecated化
+
+初期実装では`@cw.operation`と`cw.declare_operation()`を`Flow.map()`へ渡せる。receiver、同期Flow、
+latest StateFlowを宣言名へbindし、Python実装へ不変な`inputs` mappingと選択済み`ConfigView`だけを渡す。
+複数Port、DEGRADED/INVALID伝播、宣言のみOperationの明示的な実装不足も既存runtime上で検証する。
+
+PortablePlanIR schemaは互換性維持のため現時点では0.3の`KernelAbiDescriptor`へPython Operation境界を
+記録する。これは最終形ではなく、手順4で`OperationDescriptor`を正本へ移した後も旧readerを維持する。
 
 各段階でPython基準traceとの値、interval、sequence、status、Diagnostic、metadata同値を確認する。
 

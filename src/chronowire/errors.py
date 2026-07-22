@@ -21,6 +21,14 @@ class MissingConfigError(CompileError):
     """Kernelが宣言したConfig pathを解決できない場合の例外。"""
 
 
+class MissingImplementationError(CompileError):
+    """選択BackendにOperation実装が登録されていない場合の例外。"""
+
+
+class ShapeMismatchError(CompileError):
+    """Operation入力shapeをcompile時にunifyできない場合の例外。"""
+
+
 class DuplicateExtensionIdError(CompileError):
     """同じextension_idが一つのPlanへ複数指定された場合の例外。"""
 

@@ -12,6 +12,7 @@ from typing import Any, Generic, TypeVar
 
 from .config import Config
 from .kernel import CallableAdapter, GapPolicy, Kernel
+from .operation import OperationDefinition
 from .source import RealtimeSource, Source
 
 T = TypeVar("T")
@@ -71,7 +72,7 @@ class NodeSpec:
     output_ports: tuple[int, ...]
     inputs: tuple[InputSpec, ...]
     config: Config
-    operation: Callable[..., object] | Kernel[object] | None = None
+    operation: Callable[..., object] | Kernel[object] | OperationDefinition | None = None
     constants: Mapping[str, object] | None = None
     config_paths: tuple[str, ...] | None = None
     accepts_invalid: bool = False
@@ -152,7 +153,7 @@ class Graph:
         config: Config,
         *,
         inputs: tuple[InputSpec, ...] = (),
-        operation: Callable[..., object] | Kernel[object] | None = None,
+        operation: Callable[..., object] | Kernel[object] | OperationDefinition | None = None,
         constants: Mapping[str, object] | None = None,
         config_paths: tuple[str, ...] | None = None,
         accepts_invalid: bool = False,
@@ -194,7 +195,7 @@ class Graph:
         config: Config,
         *,
         inputs: tuple[InputSpec, ...] = (),
-        operation: Callable[..., object] | Kernel[object] | None = None,
+        operation: Callable[..., object] | Kernel[object] | OperationDefinition | None = None,
         constants: Mapping[str, object] | None = None,
         config_paths: tuple[str, ...] | None = None,
         accepts_invalid: bool = False,
@@ -478,28 +479,124 @@ class Flow(Generic[T]):
             raise ValueError("missing must be a MissingInputPolicy")
         return SynchronizedFlow(self, semantics, resolved, missing)
 
+    def _declared_operation_inputs(
+        self,
+        operation: OperationDefinition,
+        arguments: Mapping[str, object],
+    ) -> tuple[InputSpec, ...]:
+        """OperationSpecどおりにreceiverと名前付きFlow入力をbindする。"""
+
+        specs = operation.spec.input_mapping
+        primary_name = operation.spec.primary_input_name
+        unknown = set(arguments) - (set(specs) - {primary_name})
+        if unknown:
+            name = sorted(unknown)[0]
+            raise ValueError(
+                f"operation {operation.operation_id!r} received unknown input {name!r}"
+            )
+        inputs = [
+            InputSpec(
+                self._port_id,
+                InputSemantics.SYNCHRONOUS,
+                keyword=primary_name,
+            )
+        ]
+        for name, declared in operation.spec.inputs:
+            if declared.primary:
+                continue
+            if name not in arguments:
+                if declared.required:
+                    raise ValueError(
+                        f"operation {operation.operation_id!r} requires input {name!r}"
+                    )
+                continue
+            value = arguments[name]
+            if declared.mode == "latest":
+                if not isinstance(value, StateFlow):
+                    raise ValueError(
+                        f"operation {operation.operation_id!r} input {name!r} requires StateFlow"
+                    )
+                other = value.flow
+                semantics = InputSemantics.LATEST
+                tolerance = None
+                missing_policy = MissingInputPolicy.STALL
+            elif isinstance(value, SynchronizedFlow):
+                other = value.flow
+                semantics = value.semantics
+                tolerance = value.tolerance
+                missing_policy = value.missing_policy
+            elif isinstance(value, Flow):
+                other = value
+                semantics = InputSemantics.SYNCHRONOUS
+                tolerance = None
+                missing_policy = MissingInputPolicy.STALL
+            else:
+                raise ValueError(
+                    f"operation {operation.operation_id!r} input {name!r} requires Flow"
+                )
+            if other._graph is not self._graph:
+                raise ValueError(
+                    f"operation {operation.operation_id!r} input {name!r} belongs to "
+                    "a different Graph"
+                )
+            inputs.append(
+                InputSpec(
+                    other.port_id,
+                    semantics,
+                    keyword=name,
+                    tolerance=tolerance,
+                    missing_policy=missing_policy,
+                )
+            )
+        return tuple(inputs)
+
     def map(
         self,
-        operation: Callable[..., U] | Kernel[U],
+        operation: Callable[..., U] | Kernel[U] | OperationDefinition,
         *,
         config_paths: tuple[str, ...] | None = None,
         accepts_invalid: bool = False,
         max_items: int = 1,
         **arguments: object,
     ) -> Flow[U]:
-        """Python callableをMAP NodeとしてGraphへ登録する。
+        """Operationまたは試作用callableをMAP NodeとしてGraphへ登録する。
 
         Args:
-            operation: 主入力値と追加引数を受け取る処理。
+            operation: 宣言Operation、Kernel、または主入力値を受け取るcallable。
             config_paths: callableが参照するConfig属性path。Noneはscope全体への依存。
             accepts_invalid: INVALID入力でもcallableを実行する場合にTrue。
             max_items: 一回のKernel呼出しが生成できるEmission上限。
-            arguments: 定数、同期Flow、またはlatest StateFlow。
+            arguments: 名前付き入力。宣言OperationではFlow/StateFlowだけを許す。
 
         Raises:
-            ValueError: 異なるGraphのFlowを入力した場合、またはmax_itemsが正でない場合。
+            ValueError: 入力宣言、Graph、出力数、またはmax_itemsが不正な場合。
         """
 
+        if isinstance(operation, OperationDefinition):
+            if config_paths is not None or accepts_invalid or max_items != 1:
+                raise ValueError(
+                    "declared Operation owns config, status, and emission contracts; "
+                    f"operation={operation.operation_id!r}"
+                )
+            if len(operation.spec.outputs) != 1:
+                raise ValueError(
+                    f"operation {operation.operation_id!r} declares multiple outputs; "
+                    "use map_outputs"
+                )
+            inputs = self._declared_operation_inputs(operation, arguments)
+            output_spec = operation.spec.outputs[0][1]
+            port_id = self._graph.add_node(
+                NodeKind.MAP,
+                self._config,
+                inputs=inputs,
+                operation=operation,
+                constants={},
+                accepts_invalid=operation.spec.accepts_invalid,
+                max_items=output_spec.max_items,
+                time_transform=output_spec.time,
+                gap_policy=operation.spec.gap_policy,
+            )
+            return self._from_port(self._graph, port_id, self._config)
         if isinstance(operation, CallableAdapter):
             if max_items != 1 or accepts_invalid:
                 raise ValueError(
@@ -564,7 +661,7 @@ class Flow(Generic[T]):
 
     def map_outputs(
         self,
-        operation: Callable[..., object] | Kernel[object],
+        operation: Callable[..., object] | Kernel[object] | OperationDefinition,
         *,
         output_count: int,
         config_paths: tuple[str, ...] | None = None,
@@ -591,6 +688,37 @@ class Flow(Generic[T]):
 
         if output_count < 2:
             raise ValueError("map_outputs output_count must be at least two")
+        if isinstance(operation, OperationDefinition):
+            if config_paths is not None or accepts_invalid or max_items != 1:
+                raise ValueError(
+                    "declared Operation owns config, status, and emission contracts; "
+                    f"operation={operation.operation_id!r}"
+                )
+            if len(operation.spec.outputs) != output_count:
+                raise ValueError(
+                    f"operation {operation.operation_id!r} declares "
+                    f"{len(operation.spec.outputs)} outputs, requested {output_count}"
+                )
+            output_limits = {item.max_items for _, item in operation.spec.outputs}
+            output_times = {item.time for _, item in operation.spec.outputs}
+            if len(output_limits) != 1 or len(output_times) != 1:
+                raise ValueError(
+                    "current MAP Node requires equal max_items and time rules on all "
+                    f"outputs; operation={operation.operation_id!r}"
+                )
+            ports = self._graph.add_node_ports(
+                NodeKind.MAP,
+                self._config,
+                inputs=self._declared_operation_inputs(operation, arguments),
+                operation=operation,
+                constants={},
+                accepts_invalid=operation.spec.accepts_invalid,
+                max_items=next(iter(output_limits)),
+                output_count=output_count,
+                time_transform=next(iter(output_times)),
+                gap_policy=operation.spec.gap_policy,
+            )
+            return tuple(self._from_port(self._graph, port, self._config) for port in ports)
         if isinstance(operation, CallableAdapter):
             if max_items != 1 or accepts_invalid:
                 raise ValueError("CallableAdapter max_items/accepts_invalid must not be overridden")

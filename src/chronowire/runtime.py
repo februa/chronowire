@@ -21,7 +21,9 @@ from .errors import (
     ExtensionExecutionError,
     KernelExecutionError,
     MissingConfigError,
+    MissingImplementationError,
     PlanSessionError,
+    ShapeMismatchError,
     SourceExecutionError,
 )
 from .executor import (
@@ -78,6 +80,12 @@ from .model import (
     Skip,
 )
 from .native import F64SourceValues, F64VectorSourceValues, IdentityF64Kernel
+from .operation import (
+    OperationBackend,
+    OperationDefinition,
+    ValueSpec,
+    compile_python_operation,
+)
 from .plan_ir import (
     BindingDescriptor,
     BufferDescriptor,
@@ -437,6 +445,33 @@ def _compile_diagnostics(nodes: Sequence[NodeSpec]) -> tuple[Diagnostic, ...]:
         for path in node.config_paths or ():
             if not node.config.has(path):
                 raise MissingConfigError(f"node {node.id} requires missing Config path {path!r}")
+        if isinstance(node.operation, OperationDefinition):
+            operation = node.operation
+            scope = operation.spec.config.scope
+            try:
+                config_view = node.config.view(scope)
+            except (KeyError, TypeError) as error:
+                raise MissingConfigError(
+                    f"node={node.id} port={node.output_port} "
+                    f"operation={operation.operation_id} config_scope={scope!r} is unavailable"
+                ) from error
+            for path, expected in operation.spec.config.fields:
+                try:
+                    value = config_view.require(path)
+                except KeyError as error:
+                    raise MissingConfigError(
+                        f"node={node.id} port={node.output_port} "
+                        f"operation={operation.operation_id} config_scope={scope!r} "
+                        f"missing_field={path!r}"
+                    ) from error
+                if not isinstance(value, expected):
+                    expected_types = expected if isinstance(expected, tuple) else (expected,)
+                    expected_name = "|".join(item.__name__ for item in expected_types)
+                    raise MissingConfigError(
+                        f"node={node.id} port={node.output_port} "
+                        f"operation={operation.operation_id} config_field={path!r} "
+                        f"expected={expected_name} actual={type(value).__name__}"
+                    )
         sync_inputs = [item for item in node.inputs if item.semantics is InputSemantics.SYNCHRONOUS]
         if len(sync_inputs) < 2:
             continue
@@ -692,6 +727,215 @@ def _shape_product(shape: tuple[int, ...]) -> int:
     return result
 
 
+def _value_strides(dtype: str | None, shape: tuple[int, ...] | None) -> tuple[int, ...] | None:
+    """既知dtypeと固定shapeからcontiguous byte strideを求める。"""
+
+    if shape is None or dtype is None:
+        return None
+    item_size = {"float32": 4, "float64": 8, "complex64": 8, "complex128": 16}.get(dtype)
+    if item_size is None:
+        return None
+    return tuple(item_size * _shape_product(shape[index + 1 :]) for index in range(len(shape)))
+
+
+def _operation_shape_error(
+    node: NodeSpec,
+    *,
+    input_name: str,
+    expected: object,
+    actual: object,
+    dimension: int | None = None,
+) -> ShapeMismatchError:
+    operation = node.operation
+    operation_id = (
+        operation.operation_id if isinstance(operation, OperationDefinition) else "unknown"
+    )
+    suffix = "" if dimension is None else f" dimension={dimension}"
+    return ShapeMismatchError(
+        f"node={node.id} port={node.output_port} operation={operation_id} "
+        f"input={input_name!r} expected={expected!r} actual={actual!r}{suffix}"
+    )
+
+
+def _resolve_operation_schemas(
+    node: NodeSpec,
+    descriptors: Mapping[str, ValueSchemaDescriptor],
+    port_schemas: Mapping[int, str],
+) -> tuple[ValueSchemaDescriptor, ...]:
+    """OperationSpecで入力shapeをunifyし、全output schemaを解決する。"""
+
+    operation = node.operation
+    if not isinstance(operation, OperationDefinition):
+        raise TypeError("operation schema resolution requires OperationDefinition")
+    config_view = node.config.view(operation.spec.config.scope)
+    declared_inputs = operation.spec.input_mapping
+    actual_inputs: dict[str, ValueSchemaDescriptor] = {}
+    symbols: dict[str, int] = {}
+    for input_spec in node.inputs:
+        if input_spec.keyword is None:
+            raise CompileError(
+                f"node={node.id} port={node.output_port} operation={operation.operation_id} "
+                "contains an unnamed input"
+            )
+        name = input_spec.keyword
+        actual = descriptors[port_schemas[input_spec.source_port]]
+        expected = declared_inputs[name].value
+        actual_inputs[name] = actual
+        if expected.dtype is not None and actual.dtype != expected.dtype:
+            raise _operation_shape_error(
+                node,
+                input_name=name,
+                expected=expected.dtype,
+                actual=actual.dtype,
+            )
+        if expected.device != actual.device:
+            raise _operation_shape_error(
+                node,
+                input_name=name,
+                expected=expected.device,
+                actual=actual.device,
+            )
+        if expected.shape is None:
+            continue
+        if actual.shape is None or len(expected.shape) != len(actual.shape):
+            raise _operation_shape_error(
+                node,
+                input_name=name,
+                expected=expected.shape,
+                actual=actual.shape,
+            )
+        for dimension_index, (expected_dimension, actual_dimension) in enumerate(
+            zip(expected.shape, actual.shape, strict=True)
+        ):
+            if expected_dimension is None:
+                continue
+            if isinstance(expected_dimension, int):
+                resolved = expected_dimension
+            elif expected_dimension.startswith("$config."):
+                path = expected_dimension.removeprefix("$config.")
+                try:
+                    value = config_view.require(path)
+                except KeyError as error:
+                    raise MissingConfigError(
+                        f"node={node.id} port={node.output_port} "
+                        f"operation={operation.operation_id} input={name!r} "
+                        f"missing_shape_config={expected_dimension!r}"
+                    ) from error
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise _operation_shape_error(
+                        node,
+                        input_name=name,
+                        expected=expected_dimension,
+                        actual=value,
+                        dimension=dimension_index,
+                    )
+                resolved = value
+            else:
+                previous = symbols.setdefault(expected_dimension, actual_dimension)
+                resolved = previous
+            if resolved != actual_dimension:
+                raise _operation_shape_error(
+                    node,
+                    input_name=name,
+                    expected=resolved,
+                    actual=actual_dimension,
+                    dimension=dimension_index,
+                )
+
+    resolved_by_shape_resolver: tuple[int, ...] | None = None
+    if operation.spec.shape_resolver is not None:
+        if len(operation.spec.outputs) != 1:
+            raise CompileError(
+                f"node={node.id} port={node.output_port} operation={operation.operation_id} "
+                "shape_resolver currently requires one output"
+            )
+        try:
+            resolved_by_shape_resolver = operation.spec.shape_resolver(
+                actual_inputs,
+                config_view,
+            )
+        except Exception as error:
+            raise CompileError(
+                f"node={node.id} port={node.output_port} "
+                f"operation={operation.operation_id} contract=shape_resolver_failed "
+                f"error={type(error).__name__}: {error}"
+            ) from error
+        if not resolved_by_shape_resolver or any(
+            isinstance(item, bool) or not isinstance(item, int) or item <= 0
+            for item in resolved_by_shape_resolver
+        ):
+            raise CompileError(
+                f"node={node.id} port={node.output_port} operation={operation.operation_id} "
+                f"shape_resolver returned invalid shape {resolved_by_shape_resolver!r}"
+            )
+
+    primary = actual_inputs[operation.spec.primary_input_name]
+    resolved_outputs: list[ValueSchemaDescriptor] = []
+    for output_index, (_, output) in enumerate(operation.spec.outputs):
+        if output.value == "same":
+            resolved_outputs.append(primary)
+            continue
+        value_spec = output.value
+        if not isinstance(value_spec, ValueSpec):
+            raise RuntimeError("validated OperationOutputSpec lost its ValueSpec")
+        shape: tuple[int, ...] | None
+        if resolved_by_shape_resolver is not None:
+            shape = resolved_by_shape_resolver
+        elif value_spec.shape is None:
+            shape = None
+        else:
+            resolved_dimensions: list[int] = []
+            has_dynamic_dimension = False
+            for dimension in value_spec.shape:
+                if dimension is None:
+                    has_dynamic_dimension = True
+                    break
+                if isinstance(dimension, int):
+                    resolved_dimensions.append(dimension)
+                elif dimension.startswith("$config."):
+                    try:
+                        value = config_view.require(dimension.removeprefix("$config."))
+                    except KeyError as error:
+                        raise MissingConfigError(
+                            f"node={node.id} port={node.output_ports[output_index]} "
+                            f"operation={operation.operation_id} "
+                            f"missing_shape_config={dimension!r}"
+                        ) from error
+                    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                        raise CompileError(
+                            f"node={node.id} port={node.output_ports[output_index]} "
+                            f"operation={operation.operation_id} output_config_dimension="
+                            f"{dimension!r} actual={value!r}"
+                        )
+                    resolved_dimensions.append(value)
+                elif dimension in symbols:
+                    resolved_dimensions.append(symbols[dimension])
+                else:
+                    raise CompileError(
+                        f"node={node.id} port={node.output_ports[output_index]} "
+                        f"operation={operation.operation_id} unresolved_symbol={dimension!r}"
+                    )
+            shape = None if has_dynamic_dimension else tuple(resolved_dimensions)
+        dtype = value_spec.dtype
+        representation = value_spec.resolved_representation
+        schema_id = (
+            f"operation:{operation.operation_id}:{output_index}:"
+            f"{dtype or 'opaque'}:{'dynamic' if shape is None else 'x'.join(map(str, shape))}"
+        )
+        resolved_outputs.append(
+            ValueSchemaDescriptor(
+                schema_id,
+                representation,
+                dtype,
+                shape,
+                _value_strides(dtype, shape),
+                value_spec.device,
+                value_spec.read_only,
+            )
+        )
+    return tuple(resolved_outputs)
+
+
 def _value_schema_descriptors(
     nodes: tuple[NodeSpec, ...],
     compiled_kernels: dict[int, CompiledKernel[object]],
@@ -702,11 +946,12 @@ def _value_schema_descriptors(
     descriptors: dict[str, ValueSchemaDescriptor] = {opaque.value_schema_id: opaque}
     port_schemas: dict[int, str] = {}
     for node in nodes:
-        schema = opaque
+        schemas: tuple[ValueSchemaDescriptor, ...] = (opaque,) * len(node.output_ports)
         if node.kind is NodeKind.SOURCE and isinstance(node.source, F64SourceValues):
             schema = ValueSchemaDescriptor(
                 "native:f64:scalar", "contiguous_f64", "float64", (), (), "cpu", True
             )
+            schemas = (schema,)
         elif node.kind is NodeKind.SOURCE and isinstance(node.source, F64VectorSourceValues):
             schema = ValueSchemaDescriptor(
                 f"native:f64:{node.source.width}",
@@ -717,10 +962,13 @@ def _value_schema_descriptors(
                 "cpu",
                 True,
             )
+            schemas = (schema,)
         elif node.kind in {NodeKind.RATE, NodeKind.MAP}:
             input_schema = descriptors[port_schemas[node.inputs[0].source_port]]
-            if node.kind is NodeKind.RATE or isinstance(node.operation, IdentityF64Kernel):
-                schema = input_schema
+            if isinstance(node.operation, OperationDefinition):
+                schemas = _resolve_operation_schemas(node, descriptors, port_schemas)
+            elif node.kind is NodeKind.RATE or isinstance(node.operation, IdentityF64Kernel):
+                schemas = (input_schema,) * len(node.output_ports)
             elif (
                 input_schema.representation == "contiguous_f64"
                 and input_schema.shape is not None
@@ -748,6 +996,7 @@ def _value_schema_descriptors(
                     "cpu",
                     True,
                 )
+                schemas = (schema,) * len(node.output_ports)
         elif node.kind is NodeKind.FRAME:
             input_schema = descriptors[port_schemas[node.inputs[0].source_port]]
             if input_schema.representation == "contiguous_f64" and node.frame_size is not None:
@@ -764,8 +1013,14 @@ def _value_schema_descriptors(
                     "cpu",
                     True,
                 )
-        descriptors.setdefault(schema.value_schema_id, schema)
-        for output_port in node.output_ports:
+                schemas = (schema,)
+        if len(schemas) != len(node.output_ports):
+            raise CompileError(
+                f"node {node.id} resolved {len(schemas)} schemas for "
+                f"{len(node.output_ports)} output ports"
+            )
+        for output_port, schema in zip(node.output_ports, schemas, strict=True):
+            descriptors.setdefault(schema.value_schema_id, schema)
             port_schemas[output_port] = schema.value_schema_id
     return tuple(descriptors.values()), port_schemas
 
@@ -1230,6 +1485,9 @@ def compile(
     nodes = _required_nodes(graph, roots)
     _validate_rate_frame_boundaries(nodes)
     diagnostics = _compile_diagnostics(nodes)
+    # Operationの言語非依存意味論は実装選択より先に確定する。legacy Kernelの
+    # native schema providerだけは後段の互換passで補完する。
+    _value_schema_descriptors(nodes, {})
     backend_instance: Backend
     if isinstance(backend, str):
         if backend != "python":
@@ -1249,6 +1507,68 @@ def compile(
         operation = node.operation
         selected_backend = backend_instance
         kernel: Kernel[object]
+        if isinstance(operation, OperationDefinition):
+            input_names = tuple(item.keyword for item in node.inputs if item.keyword is not None)
+            if len(input_names) != len(node.inputs):
+                raise CompileError(
+                    f"node={node.id} port={node.output_port} "
+                    f"operation={operation.operation_id} contains unnamed inputs"
+                )
+            if selected_backend.name == "python":
+                if operation.python_binding is None:
+                    raise MissingImplementationError(
+                        f"node={node.id} port={node.output_port} "
+                        f"operation={operation.operation_id} backend=python "
+                        "contract=missing_implementation"
+                    )
+                compiled = compile_python_operation(
+                    operation,
+                    input_names=input_names,
+                    config=node.config.view(operation.spec.config.scope),
+                )
+            elif isinstance(selected_backend, OperationBackend):
+                compiled = selected_backend.compile_operation(
+                    operation.spec,
+                    CompileContext(node.config, node.constants or {}),
+                )
+            else:
+                raise MissingImplementationError(
+                    f"node={node.id} port={node.output_port} "
+                    f"operation={operation.operation_id} backend={selected_backend.name} "
+                    "contract=missing_implementation"
+                )
+            if not isinstance(compiled, CompiledKernel):
+                raise TypeError(
+                    f"backend {selected_backend.name!r} returned an invalid "
+                    f"CompiledOperation for node {node.id} operation={operation.operation_id}"
+                )
+            compiled_kernels[node.id] = compiled
+            if isinstance(compiled, NativeCompiledKernel):
+                kernel_abi_descriptors[node.id] = KernelAbiDescriptor(
+                    node.id,
+                    f"kernel:{node.id}",
+                    compiled.abi_version,
+                    compiled.process_model,
+                    compiled.workspace_size_bytes,
+                    compiled.workspace_alignment_bytes,
+                    compiled.supports_flush,
+                    compiled.session_local,
+                    compiled.native_compatible,
+                )
+            else:
+                kernel_abi_descriptors[node.id] = KernelAbiDescriptor(
+                    node.id,
+                    f"kernel:{node.id}",
+                    "chronowire.operation.python.v1",
+                    "python_operation",
+                    None,
+                    None,
+                    False,
+                    True,
+                    False,
+                )
+            node_backend_names[node.id] = selected_backend.name
+            continue
         if isinstance(operation, Kernel):
             kernel = operation
         elif callable(operation):

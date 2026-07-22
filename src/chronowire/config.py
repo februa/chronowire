@@ -55,6 +55,37 @@ class ConfigView:
             return ConfigView(value)
         return copy.deepcopy(value)
 
+    def get(self, path: str, default: object = None) -> object:
+        """viewからの相対pathを読み、欠落時はdefaultを返す。
+
+        Args:
+            path: 選択subtreeからの相対dot path。
+            default: pathが存在しない場合の戻り値。
+
+        Returns:
+            外部変更がConfigへ波及しないよう複製した値。
+        """
+
+        try:
+            return copy.deepcopy(_read_path(self._data, path))
+        except KeyError:
+            return default
+
+    def require(self, path: str) -> object:
+        """viewから必須の相対pathを読む。
+
+        Args:
+            path: 選択subtreeからの相対dot path。
+
+        Returns:
+            外部変更がConfigへ波及しないよう複製した値。
+
+        Raises:
+            KeyError: pathが存在しない場合。
+        """
+
+        return copy.deepcopy(_read_path(self._data, path))
+
 
 class Config:
     """Flow chainが参照する不変な階層設定を表す。
@@ -146,6 +177,22 @@ class Config:
         except KeyError:
             return False
         return True
+
+    def view(self, path: str = "") -> ConfigView:
+        """指定subtreeだけを公開する読み取り専用ConfigViewを返す。
+
+        Args:
+            path: rootからのdot区切りpath。空文字はroot全体。
+
+        Raises:
+            KeyError: subtreeが存在しない場合。
+            TypeError: pathがscalar値を指す場合。
+        """
+
+        value = self._data if not path else _read_path(self._data, path)
+        if not isinstance(value, Mapping):
+            raise TypeError(f"config scope {path!r} is not a mapping")
+        return ConfigView(value)
 
     def to_dict(self, *, resolved: bool = True) -> dict[str, object]:
         """設定を独立したdictとして返す。

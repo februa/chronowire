@@ -9,7 +9,7 @@ from .collector import (
     OverflowPolicy,
     Sink,
 )
-from .config import Config
+from .config import Config, ConfigView
 from .errors import (
     ChronowireError,
     CompileError,
@@ -21,7 +21,9 @@ from .errors import (
     GraphError,
     KernelExecutionError,
     MissingConfigError,
+    MissingImplementationError,
     PlanSessionError,
+    ShapeMismatchError,
     SourceExecutionError,
     SynchronizationError,
 )
@@ -98,6 +100,19 @@ from .native import (
     f64_vector_source,
     identity_f64,
 )
+from .operation import (
+    ConfigSpec,
+    ImplementationBinding,
+    ImplementationSpec,
+    OperationBackend,
+    OperationDefinition,
+    OperationInputSpec,
+    OperationOutputSpec,
+    OperationSpec,
+    ValueSpec,
+    declare_operation,
+    operation,
+)
 from .plan_ir import PortablePlanIR
 from .runtime import (
     BufferProfile,
@@ -139,6 +154,8 @@ __all__ = [
     "CompiledKernel",
     "CompiledKernelSession",
     "Config",
+    "ConfigSpec",
+    "ConfigView",
     "CppExecutor",
     "CppRuntimeMetrics",
     "CythonExecutor",
@@ -172,6 +189,8 @@ __all__ = [
     "KernelExecutionError",
     "KernelOutputs",
     "KernelProfile",
+    "ImplementationBinding",
+    "ImplementationSpec",
     "InputSemantics",
     "IdentityF64Kernel",
     "Kernel",
@@ -179,6 +198,7 @@ __all__ = [
     "LogicalInterval",
     "LogicalTime",
     "MissingConfigError",
+    "MissingImplementationError",
     "MissingInputPolicy",
     "NativeBatchCompiledKernel",
     "NativeBatchKernelSession",
@@ -190,6 +210,11 @@ __all__ = [
     "NativeValueSchemaProvider",
     "NoCollect",
     "ObservationSpec",
+    "OperationBackend",
+    "OperationDefinition",
+    "OperationInputSpec",
+    "OperationOutputSpec",
+    "OperationSpec",
     "OutputEvent",
     "OutputResult",
     "OutputSpec",
@@ -211,6 +236,7 @@ __all__ = [
     "SessionProfile",
     "RunContext",
     "Severity",
+    "ShapeMismatchError",
     "Sink",
     "Snapshot",
     "Source",
@@ -221,7 +247,9 @@ __all__ = [
     "StateFlow",
     "SynchronizationError",
     "SynchronizedFlow",
+    "ValueSpec",
     "compile",
+    "declare_operation",
     "bind_plan",
     "callable_kernel",
     "emit_many",
@@ -230,6 +258,7 @@ __all__ = [
     "identity_f64",
     "kernel_outputs",
     "observe",
+    "operation",
     "output",
     "skip",
 ]
