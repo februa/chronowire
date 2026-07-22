@@ -200,9 +200,11 @@ class CythonCbfBackend:
             TypeError: この参照Backendの対象外Kernelの場合。
         """
 
-        del context
+        if isinstance(kernel, cw.IdentityF64Kernel):
+            return kernel.compile(context)
         if not isinstance(kernel, FixedCbfKernel):
-            raise TypeError("CythonCbfBackend supports only FixedCbfKernel")
+            raise TypeError("CythonCbfBackend supports FixedCbfKernel and native identity")
+        del context
         return _CompiledCythonCbf(kernel.weights)
 
 

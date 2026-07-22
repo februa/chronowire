@@ -193,9 +193,9 @@ class NativeKernelRuntimeBinding:
             raise ValueError("native Kernel runtime binding requires ABI and process model")
         if self.parameter_dtype != "float64":
             raise ValueError("native Kernel runtime binding currently requires float64 parameters")
-        if not self.parameter_shape or any(item <= 0 for item in self.parameter_shape):
-            raise ValueError("native Kernel runtime binding requires a positive fixed shape")
-        element_count = 1
+        if any(item <= 0 for item in self.parameter_shape):
+            raise ValueError("native Kernel runtime binding requires a non-negative fixed shape")
+        element_count = 1 if self.parameter_shape else 0
         for item in self.parameter_shape:
             element_count *= item
         if len(self.parameter_bytes) != element_count * 8:

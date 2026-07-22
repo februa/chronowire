@@ -44,3 +44,24 @@ class CppNativeSession:
         tuple[int, int, int],
         tuple[int, int, int, int, int],
     ]: ...
+
+class CppGraphNativeSession:
+    def __init__(
+        self,
+        schema_version: str,
+        nodes: tuple[tuple[object, ...], ...],
+        outputs: tuple[tuple[int, int, int, int], ...],
+        source_values: bytes,
+        source_starts: bytes,
+        source_ends: bytes,
+        source_statuses: bytes,
+        source_resets: bytes,
+        source_count: int,
+        source_width: int,
+        source_timebase_denominator: int,
+    ) -> None: ...
+    def run(
+        self,
+        logical_end_numerator: int | None = None,
+        logical_end_denominator: int | None = None,
+    ) -> tuple[tuple[tuple[object, ...], ...], tuple[int, int, int], tuple[int, ...]]: ...

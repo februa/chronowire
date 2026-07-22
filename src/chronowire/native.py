@@ -10,7 +10,7 @@ from functools import reduce
 from math import isfinite, lcm
 from operator import mul
 
-from .kernel import CompileContext, CompiledKernel, RunContext
+from .kernel import CompileContext, CompiledKernel, NativeKernelRuntimeBinding, RunContext
 from .model import Emission, EmissionStatus, LogicalInterval, LogicalTime
 
 _I64_MIN = -(2**63)
@@ -75,6 +75,7 @@ class NativeF64Ingress:
         start_ticks: source timebase上のsigned i64 interval start列。
         end_ticks: source timebase上のsigned i64 interval end列。
         statuses: `OK=0, DEGRADED=1, INVALID=2`のu8列。
+        resets: `INPUT_OVERRUN`直後にRATE/FRAME状態を破棄するu8列。
         item_count: Source item件数。
         width: 一つのitemのf64要素数。
         timebase_denominator: 一tickを`1 / denominator`論理秒とする正の分母。
@@ -90,6 +91,7 @@ class NativeF64Ingress:
     start_ticks: bytes
     end_ticks: bytes
     statuses: bytes
+    resets: bytes
     item_count: int
     width: int
     timebase_denominator: int
@@ -105,6 +107,8 @@ class NativeF64Ingress:
             raise ValueError("native ingress end tick byte length does not match item count")
         if len(self.statuses) != self.item_count:
             raise ValueError("native ingress status byte length does not match item count")
+        if len(self.resets) != self.item_count or any(item > 1 for item in self.resets):
+            raise ValueError("native ingress reset byte length or value is invalid")
         if any(item > 2 for item in self.statuses):
             raise ValueError("native ingress status is outside the StreamItem ABI")
 
@@ -151,6 +155,10 @@ def _pack_vector_ingress(
         starts.tobytes(),
         ends.tobytes(),
         bytes(_STATUS_TO_NATIVE[emission.status] for emission in emissions),
+        bytes(
+            any(diagnostic.code == "INPUT_OVERRUN" for diagnostic in emission.diagnostics)
+            for emission in emissions
+        ),
         len(emissions),
         width,
         denominator,
@@ -353,6 +361,17 @@ class _IdentityF64Session:
 class _CompiledIdentityF64:
     def create_session(self) -> _IdentityF64Session:
         return _IdentityF64Session()
+
+    def create_native_runtime_binding(self) -> NativeKernelRuntimeBinding:
+        """parameterを持たないidentity ABI bindingを返す。"""
+
+        return NativeKernelRuntimeBinding(
+            "chronowire.kernel.identity_f64.v1",
+            "identity_f64",
+            "float64",
+            (),
+            b"",
+        )
 
 
 @dataclass(frozen=True)

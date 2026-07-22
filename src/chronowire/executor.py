@@ -175,6 +175,7 @@ class CppRuntimeMetrics:
         output_boundary_bytes: Python観測境界へcopyした値byte。
         python_native_transitions: 一回のrunでPython/native境界を跨ぐ回数。
         stage_python_dispatches: native Stage内のPython method dispatch数。
+        executed_node_count: fan-outを含む一回のrunで評価したNode数。
 
     境界条件:
         Pythonでの公開Emission復元時間とobject memoryは含まない。
@@ -187,6 +188,7 @@ class CppRuntimeMetrics:
     output_boundary_bytes: int
     python_native_transitions: int = 2
     stage_python_dispatches: int = 0
+    executed_node_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -206,11 +208,10 @@ class CppExecutor:
             ValueError: Extension bindingまたは最小C++契約外Planの場合。
         """
 
-        if extension_bindings:
-            raise ValueError("CppExecutor contract=extension_stage is not implemented")
         from .cpp_executor import CppExecutionSession
 
-        return CppExecutionSession(plan)
+        validated = plan._create_python_session(extension_bindings)
+        return CppExecutionSession(plan, validated._extensions)
 
     def create_plan_session(
         self,
@@ -218,11 +219,9 @@ class CppExecutor:
         extension_bindings: Mapping[str, Extension] | None,
         options: RuntimeOptions | None,
     ) -> ExecutorPlanSession:
-        """未実装の継続C++ sessionを暗黙fallbackせず拒否する。"""
+        """有限native Planから継続論理時間C++ sessionを生成する。"""
 
-        del plan, extension_bindings, options
-        from .errors import PlanSessionError
+        from .cpp_executor import CppPlanSession
 
-        raise PlanSessionError(
-            "CppExecutor does not support PlanSession; contract=cpp_continuous_session"
-        )
+        validated = plan._create_python_session(extension_bindings)
+        return CppPlanSession(plan, options, validated._extensions)

@@ -181,6 +181,49 @@ collector復元を引き続き行う。CppExecutorのsession生成込み約0.5 m
 - Python/Cython/C++で値、interval、sequence、status、Diagnosticを一致させる
 - 同じsessionを再実行してもcursor、status、collector状態を持ち越さない
 
-ただし、現runtimeは固定CBF ABIを直接認識する最小実証である。汎用function pointer ABI、複数native
-Kernel chain、継続PlanSession、Extension/Python callback境界、gap reset、INVALID partition、
-metadata table、fan-out共有寿命は未実装であり、CppExecutor v0.4の残件とする。
+この測定時点のruntimeは固定CBF ABIを直接認識する最小実証だった。汎用ABI table、複数native
+Kernel chain、PlanSession、Extension/Python Stage境界、gap reset、INVALID partition、metadata、
+fan-out共有寿命は、この結果を基準に第10節のv0.4確定実装へ追加した。
+
+## 10. v0.4 generic DAG runtime確定後の再測定
+
+### 10.1 追加した意味論
+
+`0.4.0`では固定線形runtimeをgeneric DAG runtimeへ置き換え、version付きKernel ABI resolver、複数
+native MAP、複数output、read-only fan-out batch共有、gap segment、可変shape INVALID pass-through、
+metadata source index、Diagnostic provenanceを一つのC++ sessionで扱う。各出力itemは独立したshapeと
+provenanceを保持するため、第9節の固定shape専用vectorより処理量は増える。性能値を比較するときは、
+この意味論差を隠さない。
+
+測定条件は8192 sample、4 channel、2 beam、warmup 3回、測定10回であり、次のcommandを使った。
+
+```bash
+uv run python -m benchmarks.native_executor_cpp_gate \
+  --sample-count 8192 --block-sizes 64 256 1024 4096 \
+  --channels 4 --beams 2 --warmups 3 --repeats 10
+```
+
+### 10.2 結果
+
+| block | Cython NoCollect p50 ms | C++生成込み p50 ms | C++構築済みsession ms | NoCollect speedup | C++ Bounded ms | Bounded speedup |
+|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 19.413 | 1.102 | 1.018 | 17.6x | 2.442 | 8.0x |
+| 256 | 19.210 | 1.058 | 0.973 | 18.2x | 2.092 | 9.3x |
+| 1024 | 19.372 | 1.035 | 1.003 | 18.7x | 2.002 | 9.7x |
+| 4096 | 19.377 | 1.045 | 0.952 | 18.5x | 1.973 | 9.7x |
+
+NoCollectのoutput boundaryは0 byte、実行Node数は4だった。generic item表現とDAG cacheにより第9節の
+約35倍から約18倍へ低下したが、Python/Cython基準と同じgap、INVALID、metadata、fan-out意味論を
+持った状態でも十分な改善が残る。固定shape専用経路へ戻して数値だけを上げることはしない。
+
+### 10.3 v0.4判定
+
+- 8192 sampleの長時間CBFをPython基準traceと比較する
+- identityと固定CBFを連結し、同じFRAMEから分岐しても共通祖先を一度だけ評価する
+- INPUT_OVERRUN前後のFRAMEを混ぜず、INVALID/DEGRADEDとDiagnosticを保存する
+- 有限PlanSessionの単調な論理時間境界、flush、close、cancelを試験する
+- one-shot ExtensionをC++観測境界からPython Stageへ配送する
+- pytest、Pyright、Ruff、Cython lint、C++ `-Werror`、distribution buildをrelease gateとする
+
+以上をv0.4の確定条件とする。realtime push、複数Source/merge、mutable workspace、incremental native
+cursor、継続Extension sessionは、性能とownership契約を別に測定する必要があるためv0.5へ送る。

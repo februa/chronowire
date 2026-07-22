@@ -138,9 +138,10 @@ uv run python -m benchmarks.native_executor_cpp_gate \
 
 ## v0.4 C++ Plan runtime
 
-`0.4.0.dev0`では、PythonでcompileしたPortablePlanIRからrun-local C++ sessionを生成し、
-有限`f64_vector_source`、RATE、FRAME、固定CBF、NoCollect/Latest/Boundedを一つのC++ state machineで
-運用できる。C++実行中はGILを解放し、NoCollectではCBF出力値をPythonへ戻さない。
+`0.4.0`では、PythonでcompileしたPortablePlanIRからrun-local C++ sessionを生成し、単一の有限
+`f64_vector_source`からなるRATE、FRAME、複数native MAP、fan-out、複数outputを一つのC++ DAG
+runtimeで運用できる。version付きKernel ABI tableにはidentity f64と固定CBFを登録する。C++実行中は
+GILを解放し、NoCollectではKernel出力値をPythonへ戻さない。
 
 ```python
 import chronowire as cw
@@ -158,11 +159,18 @@ result = plan.run(executor="cpp")
 
 Flow APIとcompileはPython、compile後のlogical tick、Scheduler、buffer、CBF、collector保持選択は
 C++が所有する。Kernel定数は`NativeKernelRuntimeBinding`としてprocess-local slotへbindし、
-PortablePlanIRへPython objectやpointerを保存しない。
+PortablePlanIRへPython objectやpointerを保存しない。共通祖先のbatchはread-onlyとしてfan-out間で
+共有し、一回のrunでNodeを一度だけ評価する。`INPUT_OVERRUN`ではRATE cursorとFRAME履歴をresetし、
+INVALID、DEGRADED、metadata、Diagnostic provenanceをPython基準意味論と一致させる。
 
-最小実装は線形`SOURCE → RATE → FRAME → fixed CBF → collector`に限定する。継続PlanSession、
-複数native Kernel、Extension/Python callback、gap reset、INVALID partition、metadata table、fan-outは
-未対応契約として明示エラーにする。
+`create_plan_session(executor="cpp")`は有限Sourceを排他的論理時間境界ごとに観測し、flush、close、
+cancelのlifecycleを提供する。one-shot実行ではcompile済み観測PortをC++で取得した後、Python Stage境界で
+Extensionへpriority順に配送する。
+
+v0.4のC++経路は単一有限Source、`FRAME(pad_end=False)`、既定`RuntimeOptions`に限定する。realtime
+push、複数Source/merge、任意Python Kernel、native内部のPython callback、継続PlanSessionで状態を持つ
+Extension、mutable native Kernel workspaceは暗黙fallbackせず明示エラーにする。これらはv0.5で
+実測しながら拡張する。
 
 ## 実行例
 

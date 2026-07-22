@@ -2,16 +2,28 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from fractions import Fraction
 from math import prod
+from typing import Any
 
-from ._cpp_executor import CppNativeSession
+from ._cpp_executor import CppGraphNativeSession
 from .collector import BufferOverflowError
+from .errors import ExtensionExecutionError, PlanSessionError
 from .executor import CppRuntimeMetrics, ExecutorSession
+from .extension import ExtensionSession, OutputEvent, PlanContext
 from .graph import NodeKind, RatePolicy
 from .kernel import NativeRuntimeBindingProvider
-from .model import Emission, EmissionStatus, LogicalInterval, LogicalTime
+from .model import Diagnostic, Emission, EmissionStatus, LogicalInterval, LogicalTime, Severity
 from .native import F64VectorSourceValues
-from .runtime import ExecutionPlan, OutputResult, RunResult, RuntimeOptions
+from .runtime import (
+    ExecutionPlan,
+    OutputResult,
+    PlanSessionState,
+    RunResult,
+    RuntimeOptions,
+    _BoundExtension,
+)
 
 _NATIVE_TO_STATUS = (
     EmissionStatus.OK,
@@ -28,6 +40,8 @@ def _reshape_item(
     offset: int,
     shape: tuple[int, ...],
 ) -> object:
+    if not shape:
+        return float(values[offset])
     if len(shape) == 1:
         return tuple(float(values[offset + index]) for index in range(shape[0]))
     child_width = prod(shape[1:])
@@ -46,14 +60,18 @@ class CppExecutionSession(ExecutorSession):
         ValueError: CppExecutor対象外Node、ABI、Source、collectorまたは境界を含む場合。
 
     境界条件:
-        v0.4最小実装は有限f64 vector Source、RATE、FRAME、固定CBF、一つのcollectorに限定する。
+        v0.4は単一の有限f64 vector SourceからなるRATE、FRAME、native MAPのDAGを扱う。
+        複数output、fan-out、version付きidentity/固定CBF ABIを実行できるが、merge、EOF padding、
+        realtime push Source、任意のPython Kernelは対象外である。
     """
 
-    def __init__(self, plan: ExecutionPlan) -> None:
+    def __init__(self, plan: ExecutionPlan, extensions: tuple[_BoundExtension, ...] = ()) -> None:
         self.plan = plan
+        self._extensions = extensions
         self._last_metrics: CppRuntimeMetrics | None = None
         self._contract_context = "node=None port=None"
         self._source_emissions: tuple[Emission[tuple[float, ...]], ...]
+        self._node_ports: dict[int, int] = {}
         self._runtime = self._bind_runtime()
 
     @property
@@ -62,21 +80,16 @@ class CppExecutionSession(ExecutorSession):
 
         return self._last_metrics
 
-    def _bind_runtime(self) -> CppNativeSession:
+    def _bind_runtime(self) -> CppGraphNativeSession:
         nodes = self.plan._nodes
-        expected = (NodeKind.SOURCE, NodeKind.RATE, NodeKind.FRAME, NodeKind.MAP)
-        kinds = tuple(node.kind for node in nodes)
-        if kinds != expected:
-            raise ValueError(
-                "CppExecutor contract=linear_native_stage requires "
-                f"SOURCE->RATE->FRAME->MAP; actual={[item.value for item in kinds]}"
-            )
-        source_node, rate_node, frame_node, map_node = nodes
+        if not nodes:
+            raise ValueError("CppExecutor contract=nonempty_native_graph")
+        source_nodes = tuple(node for node in nodes if node.kind is NodeKind.SOURCE)
+        if len(source_nodes) != 1:
+            raise ValueError("CppExecutor contract=single_native_source")
+        source_node = source_nodes[0]
         self._contract_context = (
-            f"source_node={source_node.id} source_port={source_node.output_port} "
-            f"rate_node={rate_node.id} rate_port={rate_node.output_port} "
-            f"frame_node={frame_node.id} frame_port={frame_node.output_port} "
-            f"map_node={map_node.id} map_port={map_node.output_port}"
+            f"source_node={source_node.id} source_port={source_node.output_port}"
         )
         source = source_node.source
         if not isinstance(source, F64VectorSourceValues):
@@ -84,46 +97,12 @@ class CppExecutionSession(ExecutorSession):
                 "CppExecutor contract=prepacked_f64_ingress requires cw.f64_vector_source(); "
                 f"node={source_node.id} port={source_node.output_port}"
             )
-        if rate_node.rate_policy is not RatePolicy.HOLD or rate_node.rate_period is None:
-            raise ValueError(
-                "CppExecutor contract=rate_policy requires HOLD with an exact period; "
-                f"node={rate_node.id} port={rate_node.output_port}"
-            )
-        if frame_node.pad_end or frame_node.frame_size is None or frame_node.frame_hop is None:
-            raise ValueError(
-                "CppExecutor contract=frame_eof requires fixed size/hop and pad_end=False; "
-                f"node={frame_node.id} port={frame_node.output_port}"
-            )
-        if (
-            len(self.plan._outputs) != 1
-            or self.plan._outputs[0].flow.port_id != map_node.output_port
-        ):
-            raise ValueError(
-                "CppExecutor contract=collector_boundary requires one MAP output; "
-                f"node={map_node.id} port={map_node.output_port}"
-            )
-        if self.plan._observations:
-            raise ValueError("CppExecutor contract=extension_stage is not implemented")
         ir = self.plan.portable_ir
         if ir.schema_version != "0.3":
             raise ValueError("CppExecutor contract=portable_plan_schema requires schema 0.3")
-        if tuple(item.node_id for item in ir.nodes) != tuple(node.id for node in nodes) or tuple(
-            item.opcode for item in ir.nodes
-        ) != ("source", "rate", "frame", "map"):
+        if tuple(item.node_id for item in ir.nodes) != tuple(node.id for node in nodes):
             raise ValueError(
                 "CppExecutor contract=portable_node_order does not match bound Plan; "
-                f"{self._contract_context}"
-            )
-        portable_source, portable_rate, portable_frame, portable_map = ir.nodes
-        if (
-            portable_rate.rate_policy != "hold"
-            or portable_rate.rate_period is None
-            or portable_frame.frame_size is None
-            or portable_frame.frame_hop is None
-            or portable_frame.pad_end
-        ):
-            raise ValueError(
-                "CppExecutor contract=portable_time_descriptor requires HOLD and fixed FRAME; "
                 f"{self._contract_context}"
             )
         if any(
@@ -133,110 +112,299 @@ class CppExecutionSession(ExecutorSession):
         ):
             raise ValueError(
                 "CppExecutor contract=value_schema requires explicit native f64 schemas; "
-                f"node={map_node.id} port={map_node.output_port}"
-            )
-        compiled = self.plan._compiled_kernels.get(map_node.id)
-        if not isinstance(compiled, NativeRuntimeBindingProvider):
-            raise ValueError(
-                "CppExecutor contract=runtime_binding requires native Kernel parameters; "
-                f"node={map_node.id} port={map_node.output_port}"
-            )
-        binding = compiled.create_native_runtime_binding()
-        abi = next((item for item in ir.kernel_abis if item.node_id == map_node.id), None)
-        if (
-            abi is None
-            or not abi.native_compatible
-            or abi.abi_version != binding.abi_version
-            or abi.process_model != binding.process_model
-        ):
-            raise ValueError(
-                "CppExecutor contract=kernel_abi binding does not match PortablePlanIR; "
-                f"node={map_node.id} port={map_node.output_port}"
-            )
-        if len(binding.parameter_shape) != 2:
-            raise ValueError(
-                "CppExecutor contract=kernel_parameter_shape requires beams x channels; "
-                f"node={map_node.id} port={map_node.output_port}"
-            )
-        beam_count, channel_count = binding.parameter_shape
-        if channel_count != source.width:
-            raise ValueError(
-                "CppExecutor contract=kernel_channel_shape does not match Source width; "
-                f"node={map_node.id} port={map_node.output_port}"
+                f"{self._contract_context}"
             )
         self._source_emissions = source.emissions()
-        if any(item.status is EmissionStatus.INVALID for item in self._source_emissions):
-            raise ValueError(
-                "CppExecutor contract=batch_invalid_partition is not implemented; "
-                f"node={map_node.id} port={map_node.output_port}"
+        port_schemas = {
+            port.port_id: next(
+                schema
+                for schema in ir.value_schemas
+                if schema.value_schema_id == port.value_schema_id
             )
-        if any(item.metadata for item in self._source_emissions):
-            raise ValueError(
-                "CppExecutor contract=metadata_table is not implemented; "
-                f"node={source_node.id} port={source_node.output_port}"
+            for port in ir.ports
+        }
+        portable_nodes: list[tuple[object, ...]] = []
+        for node, descriptor in zip(nodes, ir.nodes, strict=True):
+            if len(node.inputs) > 1:
+                raise ValueError(
+                    "CppExecutor contract=single_input_native_node; "
+                    f"node={node.id} port={node.output_port}"
+                )
+            input_port = -1 if not node.inputs else node.inputs[0].source_port
+            period_numerator = 0
+            period_denominator = 1
+            if node.kind is NodeKind.RATE:
+                if node.rate_policy is not RatePolicy.HOLD or node.rate_period is None:
+                    raise ValueError(
+                        "CppExecutor contract=rate_policy requires HOLD with an exact period; "
+                        f"node={node.id} port={node.output_port}"
+                    )
+                period_numerator = node.rate_period.numerator
+                period_denominator = node.rate_period.denominator
+            if node.kind is NodeKind.FRAME and (
+                node.pad_end or node.frame_size is None or node.frame_hop is None
+            ):
+                raise ValueError(
+                    "CppExecutor contract=frame_eof requires fixed size/hop and pad_end=False; "
+                    f"node={node.id} port={node.output_port}"
+                )
+            abi_version = ""
+            process_model = ""
+            parameter_bytes = b""
+            parameter_shape: tuple[int, ...] = ()
+            if node.kind is NodeKind.MAP:
+                compiled = self.plan._compiled_kernels.get(node.id)
+                if not isinstance(compiled, NativeRuntimeBindingProvider):
+                    raise ValueError(
+                        "CppExecutor contract=runtime_binding requires native Kernel parameters; "
+                        f"node={node.id} port={node.output_port}"
+                    )
+                binding = compiled.create_native_runtime_binding()
+                abi = next((item for item in ir.kernel_abis if item.node_id == node.id), None)
+                if (
+                    abi is None
+                    or not abi.native_compatible
+                    or abi.abi_version != binding.abi_version
+                    or abi.process_model != binding.process_model
+                ):
+                    raise ValueError(
+                        "CppExecutor contract=kernel_abi binding does not match PortablePlanIR; "
+                        f"node={node.id} port={node.output_port}"
+                    )
+                abi_version = binding.abi_version
+                process_model = binding.process_model
+                parameter_bytes = binding.parameter_bytes
+                parameter_shape = binding.parameter_shape
+            shape = port_schemas[node.output_port].shape
+            if shape is None:
+                raise ValueError(
+                    "CppExecutor contract=fixed_output_shape; "
+                    f"node={node.id} port={node.output_port}"
+                )
+            self._node_ports[node.id] = node.output_port
+            portable_nodes.append(
+                (
+                    descriptor.node_id,
+                    _PORTABLE_OPCODE[descriptor.opcode],
+                    input_port,
+                    node.output_port,
+                    period_numerator,
+                    period_denominator,
+                    node.frame_size or 0,
+                    node.frame_hop or 0,
+                    node.pad_end,
+                    node.accepts_invalid,
+                    abi_version,
+                    process_model,
+                    parameter_bytes,
+                    parameter_shape,
+                    shape,
+                )
             )
-        if any(
-            diagnostic.code == "INPUT_OVERRUN"
-            for emission in self._source_emissions
-            for diagnostic in emission.diagnostics
-        ):
-            raise ValueError(
-                "CppExecutor contract=gap_reset is not implemented; "
-                f"node={source_node.id} port={source_node.output_port}"
+        portable_outputs: list[tuple[int, int, int, int]] = []
+        for output_descriptor in ir.outputs:
+            collector_kind = _COLLECTOR_KIND.get(output_descriptor.collector_kind)
+            overflow_policy = _OVERFLOW_POLICY.get(output_descriptor.overflow_policy)
+            if collector_kind is None or overflow_policy is None:
+                raise ValueError(
+                    "CppExecutor contract=native_collector supports none/latest/bounded; "
+                    f"port={output_descriptor.port_id}"
+                )
+            portable_outputs.append(
+                (
+                    output_descriptor.port_id,
+                    collector_kind,
+                    output_descriptor.max_items or 0,
+                    overflow_policy,
+                )
             )
-        output_descriptor = ir.outputs[0]
-        collector_kind = _COLLECTOR_KIND.get(output_descriptor.collector_kind)
-        overflow_policy = _OVERFLOW_POLICY.get(output_descriptor.overflow_policy)
-        if collector_kind is None or overflow_policy is None:
-            raise ValueError(
-                "CppExecutor contract=native_collector supports none/latest/bounded; "
-                f"port={output_descriptor.port_id}"
-            )
-        capacity = output_descriptor.max_items or 0
+        portable_outputs.extend(
+            (observation.flow.port_id, 3, 0, 0) for observation in self.plan._observations
+        )
         ingress = source.native_ingress()
         try:
-            return CppNativeSession(
+            return CppGraphNativeSession(
                 ir.schema_version,
-                tuple(_PORTABLE_OPCODE[item.opcode] for item in ir.nodes),
+                tuple(portable_nodes),
+                tuple(portable_outputs),
                 ingress.values,
                 ingress.start_ticks,
                 ingress.end_ticks,
                 ingress.statuses,
+                ingress.resets,
                 ingress.item_count,
                 ingress.width,
                 ingress.timebase_denominator,
-                portable_rate.rate_period.numerator,
-                portable_rate.rate_period.denominator,
-                portable_frame.frame_size,
-                portable_frame.frame_hop,
-                binding.abi_version,
-                binding.process_model,
-                binding.parameter_bytes,
-                beam_count,
-                channel_count,
-                collector_kind,
-                capacity,
-                overflow_policy,
-                portable_source.node_id,
-                portable_rate.node_id,
-                portable_frame.node_id,
-                portable_map.node_id,
             )
         except (ValueError, OverflowError, RuntimeError) as error:
             raise ValueError(
                 f"CppExecutor failed to bind runtime: {error}; {self._contract_context}"
             ) from error
 
+    def _decode_native_output(
+        self,
+        native_output: tuple[Any, ...],
+        *,
+        port_id: int,
+    ) -> tuple[tuple[Emission[object], ...], int, int, bool]:
+        """C++ collector境界の可変shape itemを公開Emissionへ復元する。"""
+
+        (
+            output_bytes,
+            value_offsets,
+            shapes,
+            sequences,
+            starts,
+            ends,
+            native_statuses,
+            provenance,
+            invalid_nodes,
+            metadata_indices,
+            timebase_denominator,
+            received_count,
+            dropped_count,
+            overflowed,
+        ) = native_output
+        values = memoryview(output_bytes).cast("d")
+        emissions: list[Emission[object]] = []
+        rows = zip(
+            value_offsets[:-1],
+            value_offsets[1:],
+            shapes,
+            sequences,
+            starts,
+            ends,
+            native_statuses,
+            provenance,
+            invalid_nodes,
+            metadata_indices,
+            strict=True,
+        )
+        for (
+            value_start,
+            value_end,
+            shape,
+            sequence,
+            start,
+            end,
+            native_status,
+            source_indices,
+            skipped_nodes,
+            metadata_index,
+        ) in rows:
+            if prod(shape) != value_end - value_start:
+                raise RuntimeError(
+                    f"CppExecutor output shape no longer matches its native item; port={port_id}"
+                )
+            status = _NATIVE_TO_STATUS[native_status]
+            interval = LogicalInterval(
+                LogicalTime(start, 1, timebase_denominator),
+                LogicalTime(end, 1, timebase_denominator),
+            )
+            diagnostics = tuple(
+                diagnostic
+                for source_index in source_indices
+                for diagnostic in self._source_emissions[source_index].diagnostics
+            )
+            diagnostics += tuple(
+                Diagnostic(
+                    Severity.WARNING,
+                    "INVALID_INPUT_PROPAGATED",
+                    "Kernel was skipped because it does not accept INVALID input",
+                    node_id=node_id,
+                    port_id=self._node_ports[node_id],
+                    interval=interval,
+                )
+                for node_id in skipped_nodes
+            )
+            metadata = (
+                self._source_emissions[metadata_index].metadata if metadata_index >= 0 else {}
+            )
+            emissions.append(
+                Emission(
+                    _reshape_item(values, value_start, shape),
+                    interval,
+                    sequence,
+                    status,
+                    diagnostics,
+                    metadata,
+                )
+            )
+        return tuple(emissions), received_count, dropped_count, overflowed
+
+    def _deliver_extensions(self, native_outputs: tuple[tuple[Any, ...], ...]) -> None:
+        """C++観測境界のEmissionをpriority順のPython Extension Stageへ配送する。"""
+
+        if not self._extensions:
+            return
+        context = PlanContext(required_node_count=len(self.plan._nodes))
+        active: list[tuple[Any, ExtensionSession, Any]] = []
+        first_error: Exception | None = None
+        try:
+            for bound in self._extensions:
+                session = bound.binding.create_session()
+                if not isinstance(session, ExtensionSession):
+                    raise ExtensionExecutionError(
+                        f"extension_id {bound.observation.extension_id!r} returned invalid "
+                        "session; contract=ExtensionSession"
+                    )
+                trigger = bound.observation.trigger.create_session()
+                try:
+                    session.initialize(context)
+                except Exception as error:
+                    raise self._extension_error(bound, "initialize", error) from error
+                active.append((bound, session, trigger))
+            emissions_by_id = {
+                observation.extension_id: self._decode_native_output(
+                    native_output,
+                    port_id=observation.flow.port_id,
+                )[0]
+                for observation, native_output in zip(
+                    self.plan._observations, native_outputs, strict=True
+                )
+            }
+            for bound, session, trigger in active:
+                for emission in emissions_by_id[bound.observation.extension_id]:
+                    if not trigger.should_fire(emission):
+                        continue
+                    try:
+                        session.on_output(OutputEvent(bound.observation.flow.port_id, emission))
+                    except Exception as error:
+                        raise self._extension_error(bound, "on_output", error) from error
+        except Exception as error:
+            first_error = error
+        finally:
+            for bound, session, _ in reversed(active):
+                try:
+                    session.finalize(context)
+                except Exception as error:
+                    if first_error is None:
+                        first_error = self._extension_error(bound, "finalize", error)
+        if first_error is not None:
+            raise first_error
+
+    def _extension_error(
+        self, bound: _BoundExtension, callback: str, error: Exception
+    ) -> Exception:
+        observation = bound.observation
+        node = self.plan._graph.node_for_port(observation.flow.port_id)
+        return ExtensionExecutionError(
+            f"extension_id {observation.extension_id!r} "
+            f"slot 'extension:{observation.extension_id}' node {node.id} "
+            f"port {observation.flow.port_id} callback {callback!r} failed: {error}; "
+            f"contract=failure_policy:{observation.failure_policy.value}"
+        )
+
     def run(
         self,
         *,
-        duration: float | None = None,
+        duration: float | Fraction | None = None,
         options: RuntimeOptions | None = None,
     ) -> RunResult:
         """PortablePlanIRから構築済みのC++ state machineを一回実行する。
 
         Args:
-            duration: 最小実装ではNoneだけを受理する。
+            duration: Noneなら有限Source全体、指定時は正の排他的論理時間境界。
             options: default RuntimeOptionsだけを受理する。
 
         Returns:
@@ -250,90 +418,204 @@ class CppExecutionSession(ExecutorSession):
             NoCollectではC++出力値をPythonへcopyせず、件数とstatus summaryだけを返す。
         """
 
-        if duration is not None:
-            raise ValueError("CppExecutor requires duration=None")
         if options is not None and options != RuntimeOptions():
             raise ValueError("CppExecutor does not support RuntimeOptions overrides")
+        logical_end: Fraction | None = None
+        if duration is not None:
+            logical_end = Fraction(str(duration))
+            if logical_end <= 0:
+                raise ValueError("CppExecutor duration must be positive")
         try:
-            (
-                output_bytes,
-                output_width,
-                sequences,
-                starts,
-                ends,
-                native_statuses,
-                provenance,
-                timebase_denominator,
-                received_count,
-                dropped_count,
-                overflowed,
-                native_status_counts,
-                metrics,
-            ) = self._runtime.run()
+            native_outputs, native_status_counts, metrics = self._runtime.run(
+                None if logical_end is None else logical_end.numerator,
+                None if logical_end is None else logical_end.denominator,
+            )
         except (ValueError, OverflowError, RuntimeError) as error:
             raise RuntimeError(
                 f"CppExecutor runtime failed: {error}; {self._contract_context}"
             ) from error
-        output_descriptor = self.plan.portable_ir.outputs[0]
-        if overflowed:
-            raise BufferOverflowError(f"collector capacity {output_descriptor.max_items} exceeded")
         self._last_metrics = CppRuntimeMetrics(*metrics)
-        map_port = next(
-            port
-            for port in self.plan.portable_ir.ports
-            if port.port_id == output_descriptor.port_id
-        )
-        schema = next(
-            item
-            for item in self.plan.portable_ir.value_schemas
-            if item.value_schema_id == map_port.value_schema_id
-        )
-        if schema.shape is None or prod(schema.shape) != output_width:
-            raise RuntimeError(
-                "CppExecutor output shape no longer matches PortablePlanIR; "
-                f"{self._contract_context}"
-            )
-        values = memoryview(output_bytes).cast("d")
-        emissions: list[Emission[object]] = []
-        for retained_index, (sequence, start, end, native_status, source_indices) in enumerate(
-            zip(sequences, starts, ends, native_statuses, provenance, strict=True)
+        output_count = len(self.plan.portable_ir.outputs)
+        self._deliver_extensions(native_outputs[output_count:])
+        outputs: list[OutputResult[object]] = []
+        for output_descriptor, native_output in zip(
+            self.plan.portable_ir.outputs, native_outputs[:output_count], strict=True
         ):
-            status = _NATIVE_TO_STATUS[native_status]
-            interval = LogicalInterval(
-                LogicalTime(start, 1, timebase_denominator),
-                LogicalTime(end, 1, timebase_denominator),
+            emission_tuple, received_count, dropped_count, overflowed = self._decode_native_output(
+                native_output,
+                port_id=output_descriptor.port_id,
             )
-            diagnostics = tuple(
-                diagnostic
-                for source_index in source_indices
-                for diagnostic in self._source_emissions[source_index].diagnostics
-            )
-            emissions.append(
-                Emission(
-                    _reshape_item(values, retained_index * output_width, schema.shape),
-                    interval,
-                    sequence,
-                    status,
-                    diagnostics,
+            if overflowed:
+                raise BufferOverflowError(
+                    f"collector capacity {output_descriptor.max_items} exceeded"
+                )
+            outputs.append(
+                OutputResult(
+                    emission_tuple,
+                    output_descriptor.collector_kind,
+                    received_count,
+                    dropped_count,
+                    emission_tuple[0].interval.start if emission_tuple else None,
+                    emission_tuple[-1].interval.end if emission_tuple else None,
                 )
             )
-        emission_tuple = tuple(emissions)
-        output = OutputResult(
-            emission_tuple,
-            output_descriptor.collector_kind,
-            received_count,
-            dropped_count,
-            emission_tuple[0].interval.start if emission_tuple else None,
-            emission_tuple[-1].interval.end if emission_tuple else None,
-        )
         status_counts = {
             status: count
             for status, count in zip(_NATIVE_TO_STATUS, native_status_counts, strict=True)
             if count
         }
         return RunResult(
-            (output,),
+            tuple(outputs),
             self.plan.diagnostics,
             status_counts,
             completed=True,
         )
+
+
+class CppPlanSession:
+    """有限native Planを論理時間境界ごとにC++で継続観測するsession。
+
+    v0.4では各境界のsnapshotを同じimmutable C++ Planから決定的に再計算する。Python側は
+    lifecycleと公開RunResultだけを管理し、Scheduler、Kernel、collector選択へ介入しない。
+    """
+
+    def __init__(
+        self,
+        plan: ExecutionPlan,
+        options: RuntimeOptions | None,
+        extensions: tuple[_BoundExtension, ...] = (),
+    ) -> None:
+        if extensions:
+            raise PlanSessionError(
+                "CppExecutor continuous Extension boundary is not supported; "
+                "contract=cpp_continuous_extension"
+            )
+        if options is not None and options != RuntimeOptions():
+            raise PlanSessionError(
+                "CppExecutor PlanSession supports default RuntimeOptions only; "
+                "contract=cpp_runtime_options"
+            )
+        self._execution = CppExecutionSession(plan)
+        self._plan = plan
+        self._state = PlanSessionState.CREATED
+        self._logical_end: Fraction | None = None
+        self._last_result: RunResult | None = None
+        self._session_diagnostics: list[Diagnostic] = []
+        self._source_end = max(
+            (emission.interval.end.as_fraction() for emission in self._execution._source_emissions),
+            default=Fraction(0),
+        )
+
+    @property
+    def state(self) -> PlanSessionState:
+        """現在のC++ session lifecycle状態を返す。"""
+
+        return self._state
+
+    def start(self) -> None:
+        """run-local C++ Plan resourceを開始状態へ遷移させる。"""
+
+        if self._state is not PlanSessionState.CREATED:
+            raise PlanSessionError(
+                f"CppPlanSession.start requires state=created; actual={self._state.value}"
+            )
+        self._session_diagnostics.append(
+            Diagnostic(
+                Severity.INFO,
+                "SESSION_STARTED",
+                "CppPlanSession acquired run-local resources",
+            )
+        )
+        self._state = PlanSessionState.RUNNING
+
+    def run_until(self, logical_end: LogicalTime | Fraction | int | float) -> RunResult:
+        """指定した排他的論理時間境界までの累積snapshotを返す。"""
+
+        self._require_running("run_until")
+        target = self._logical_time_fraction(logical_end)
+        if target <= 0 or (self._logical_end is not None and target <= self._logical_end):
+            raise PlanSessionError(
+                "CppPlanSession.run_until requires a positive, strictly increasing logical_end"
+            )
+        try:
+            result = self._execution.run(duration=target)
+        except Exception:
+            self._state = PlanSessionState.FAILED
+            raise
+        self._logical_end = target
+        completed = target >= self._source_end
+        self._last_result = self._decorate(result, completed=completed)
+        return self._last_result
+
+    def flush(self) -> RunResult:
+        """有限SourceをEOFまでC++ DAGへ流して累積snapshotを返す。"""
+
+        self._require_running("flush")
+        try:
+            result = self._execution.run()
+        except Exception:
+            self._state = PlanSessionState.FAILED
+            raise
+        self._last_result = self._decorate(result, completed=True)
+        return self._last_result
+
+    def close(self) -> RunResult:
+        """有限SourceをdrainしてC++ sessionをCLOSEDへ遷移させる。"""
+
+        result = self.flush()
+        self._session_diagnostics.append(
+            Diagnostic(
+                Severity.INFO,
+                "SESSION_CLOSED",
+                "CppPlanSession drained run-local resources",
+            )
+        )
+        self._state = PlanSessionState.CLOSED
+        self._last_result = self._decorate(result, completed=True)
+        return self._last_result
+
+    def cancel(self) -> RunResult:
+        """未処理Sourceをdrainせず破棄してCANCELLEDへ遷移させる。"""
+
+        self._require_running("cancel")
+        self._session_diagnostics.append(
+            Diagnostic(
+                Severity.WARNING,
+                "SESSION_CANCELLED",
+                "CppPlanSession was cancelled without flushing pending input",
+            )
+        )
+        self._state = PlanSessionState.CANCELLED
+        base = self._last_result or RunResult(
+            tuple(
+                OutputResult((), descriptor.collector_kind, 0, 0, None, None)
+                for descriptor in self._plan.portable_ir.outputs
+            ),
+            self._plan.diagnostics,
+            {},
+            completed=False,
+        )
+        self._last_result = self._decorate(base, completed=False)
+        return self._last_result
+
+    def _decorate(self, result: RunResult, *, completed: bool) -> RunResult:
+        """session-local Diagnosticとcompletion状態を累積snapshotへ付加する。"""
+
+        compile_count = len(self._plan.diagnostics)
+        diagnostics = result.diagnostics[:compile_count] + tuple(self._session_diagnostics)
+        return replace(result, diagnostics=diagnostics, completed=completed)
+
+    def _require_running(self, operation: str) -> None:
+        if self._state is not PlanSessionState.RUNNING:
+            raise PlanSessionError(
+                f"CppPlanSession.{operation} requires state=running; actual={self._state.value}"
+            )
+
+    @staticmethod
+    def _logical_time_fraction(value: LogicalTime | Fraction | int | float) -> Fraction:
+        if isinstance(value, LogicalTime):
+            return value.as_fraction()
+        try:
+            return Fraction(str(value)) if isinstance(value, float) else Fraction(value)
+        except (TypeError, ValueError, ZeroDivisionError) as error:
+            raise PlanSessionError("logical_end must be a finite rational value") from error

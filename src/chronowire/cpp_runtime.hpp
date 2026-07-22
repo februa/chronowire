@@ -110,4 +110,102 @@ private:
     int overflow_policy_;
 };
 
+/** @brief PortablePlanIRの一NodeをC++ DAG runtimeへ渡す固定descriptor。 */
+struct GraphNodeSpec {
+    std::int64_t node_id = -1;
+    int opcode = -1;
+    std::int64_t input_port = -1;
+    std::int64_t output_port = -1;
+    std::int64_t period_numerator = 0;
+    std::int64_t period_denominator = 1;
+    std::size_t frame_size = 0;
+    std::size_t frame_hop = 0;
+    bool pad_end = false;
+    bool accepts_invalid = false;
+    std::string kernel_abi;
+    std::string process_model;
+    std::vector<double> kernel_parameters;
+    std::vector<std::size_t> parameter_shape;
+    std::vector<std::size_t> output_shape;
+};
+
+/** @brief 一つの観測Portに適用するnative collector descriptor。 */
+struct GraphOutputSpec {
+    std::int64_t port_id = -1;
+    int collector_kind = -1;
+    std::size_t collector_capacity = 0;
+    int overflow_policy = 0;
+};
+
+/**
+ * @brief DAG runtime全体の結果。outputsはGraphOutputSpecと同じ順序で所有する。
+ *
+ * 可変shape INVALID pass-throughのため、各RuntimeResultのvaluesは`value_offsets`と
+ * `shape_offsets`でitem境界を表す。provenanceとinvalid_nodesも同様にoffset列を持つ。
+ */
+struct GraphRuntimeResult {
+    std::vector<RuntimeResult> outputs;
+    std::vector<std::vector<std::size_t>> value_offsets;
+    std::vector<std::vector<std::size_t>> shapes;
+    std::vector<std::vector<std::size_t>> shape_offsets;
+    std::vector<std::vector<std::size_t>> provenance_offsets;
+    std::vector<std::vector<std::int64_t>> invalid_nodes;
+    std::vector<std::vector<std::size_t>> invalid_node_offsets;
+    std::vector<std::vector<std::int64_t>> metadata_source_indices;
+    std::vector<std::int64_t> status_counts;
+    std::uint64_t scheduler_ns = 0;
+    std::uint64_t kernel_ns = 0;
+    std::uint64_t output_select_ns = 0;
+    std::uint64_t owned_input_bytes = 0;
+    std::uint64_t output_boundary_bytes = 0;
+    std::uint64_t executed_node_count = 0;
+};
+
+/**
+ * @brief PortablePlanIRのSOURCE/RATE/FRAME/MAP DAGを自立運用するrun-local session。
+ *
+ * Source buffer、reset境界、Kernel parameter、Node/Output descriptorをconstructor中に
+ * 所有領域へcopyする。各Portは一度だけ評価し、fan-out consumerは同じimmutable batchを読む。
+ */
+class GraphRuntimeSession {
+public:
+    GraphRuntimeSession(
+        const std::string& schema_version,
+        const std::vector<GraphNodeSpec>& nodes,
+        const std::vector<GraphOutputSpec>& outputs,
+        const char* source_values,
+        std::size_t source_value_bytes,
+        const char* source_starts,
+        std::size_t source_start_bytes,
+        const char* source_ends,
+        std::size_t source_end_bytes,
+        const char* source_statuses,
+        std::size_t source_status_bytes,
+        const char* source_resets,
+        std::size_t source_reset_bytes,
+        std::size_t source_count,
+        std::size_t source_width,
+        std::int64_t source_timebase_denominator
+    );
+
+    /** @brief 全有限入力、または排他的logical_end以前の入力をDAGへ流す。 */
+    GraphRuntimeResult run(
+        bool has_logical_end,
+        std::int64_t logical_end_numerator,
+        std::int64_t logical_end_denominator
+    ) const;
+
+private:
+    std::vector<GraphNodeSpec> nodes_;
+    std::vector<GraphOutputSpec> outputs_;
+    std::vector<double> source_values_;
+    std::vector<std::int64_t> source_starts_;
+    std::vector<std::int64_t> source_ends_;
+    std::vector<std::uint8_t> source_statuses_;
+    std::vector<std::uint8_t> source_resets_;
+    std::size_t source_count_;
+    std::size_t source_width_;
+    std::int64_t source_timebase_denominator_;
+};
+
 }  // namespace chronowire::cpp_runtime

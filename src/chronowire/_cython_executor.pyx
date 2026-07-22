@@ -157,7 +157,9 @@ def run_f64_rate_frame(
         )
         starts = tuple(frame_starts[frame_index] for frame_index in range(frame_count))
         ends = tuple(frame_ends[frame_index] for frame_index in range(frame_count))
-        statuses = tuple(frame_statuses[frame_index] for frame_index in range(frame_count))
+        statuses = tuple(
+            frame_statuses[frame_index] for frame_index in range(frame_count)
+        )
         provenance = tuple(
             tuple(
                 frame_source_indices[frame_index * frame_size + item_index]
@@ -344,7 +346,9 @@ def run_f64_vector_rate_frame(
         )
         starts = tuple(frame_starts[frame_index] for frame_index in range(frame_count))
         ends = tuple(frame_ends[frame_index] for frame_index in range(frame_count))
-        statuses = tuple(frame_statuses[frame_index] for frame_index in range(frame_count))
+        statuses = tuple(
+            frame_statuses[frame_index] for frame_index in range(frame_count)
+        )
         provenance = tuple(
             tuple(
                 frame_source_indices[frame_index * frame_size + item_index]
