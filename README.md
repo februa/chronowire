@@ -133,9 +133,9 @@ RATE/FRAMEをbatch化してCython CBFへ一回で渡し、C++ ExecutorはRATE/FR
 compile時に`beams × frame_size`へ固定される。Python callbackを含む混在Planは引き続き
 Python Stage境界として明示する。CppExecutorは、all-Python Planを単一の最大Python islandとし、
 C++側の`advance()` / `resume()`状態とGIL下のadapterを通して実行できる。Python/native mixed
-Planは、単一Python islandの前後にnative prefix/suffixを置き、固定shape f64 batchを境界ごと
-一回copyする経路まで実装済みである。複数Python island、複数入力境界、fixed-schema zero-copy、
-継続PlanSessionは段階実装中である。
+Planは、Python islandの前後にnative区間を置き、固定shape f64 batchを境界ごと一回copyする。
+Sourceを含むPython prefixまたはnative prefixのどちらから始まる線形Planでも、複数Python islandを
+実行できる。複数入力境界、fixed-schema zero-copy、継続PlanSessionは段階実装中である。
 
 C++ Executor移行判断用benchmarkは、Plan全体、Source/tick packing、RATE/FRAME、CBF、collector
 復元を分離して測定し、copy byteとPython/native境界数をJSONへ保存する。

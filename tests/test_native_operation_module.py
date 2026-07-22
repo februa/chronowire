@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import chronowire as cw
+from chronowire.cpp_executor import CppMultiIslandExecutionSession
 
 _MODULE_SOURCE = r"""
 #include "native_operation_abi.h"
@@ -286,7 +287,22 @@ def test_operation_implementation_selection_is_independent_from_executor(
     module = cw.NativeOperationModule(_build_module(tmp_path))
     native_backend = cw.NativeModuleBackend(module)
     config = cw.Config(dsp={"scale": {"factor": 2.0}})
-    source = cw.Flow(cw.f64_vector_source([(1.0, 2.0)], width=2), config)
+    diagnostic = cw.Diagnostic(cw.Severity.WARNING, "MULTI_ISLAND_DEGRADED", "fallback")
+    source = cw.Flow(
+        cw.f64_vector_source(
+            [
+                cw.Emission(
+                    (1.0, 2.0),
+                    cw.LogicalInterval(cw.LogicalTime(0), cw.LogicalTime(1)),
+                    0,
+                    cw.EmissionStatus.DEGRADED,
+                    (diagnostic,),
+                )
+            ],
+            width=2,
+        ),
+        config,
+    )
     shifted = source.map(native).map(shift)
     plan = cw.compile(
         [cw.output(shifted, collector=cw.Latest())],
@@ -334,18 +350,43 @@ def test_operation_implementation_selection_is_independent_from_executor(
     assert resumed.run(executor="cpp") == resumed.run(executor="python")
 
     two_islands = source.map(native).map(shift).map(native).map(shift)
-    pending = cw.compile(
+    repeated = cw.compile(
         [cw.output(two_islands, collector=cw.Latest())],
         backend="python",
         implementations={native.operation_id: native_backend},
     )
-    with pytest.raises(ValueError, match="contract=mixed_stage_order") as captured:
-        pending.run(executor="cpp")
-    message = str(captured.value)
-    assert "stage=" in message
-    assert "node=" in message
-    assert "port=" in message
-    assert "binding=" in message
+    repeated_session = repeated.create_session(executor="cpp")
+    repeated_result = repeated_session.run()
+
+    assert isinstance(repeated_session, CppMultiIslandExecutionSession)
+    assert repeated_result == repeated.run(executor="python")
+    assert repeated_session.last_metrics is not None
+    assert repeated_session.last_metrics.execution_classification == "hybrid"
+    assert repeated_session.last_metrics.stage_python_dispatches == 2
+    assert repeated_session.last_metrics.gil_acquisitions == 2
+    assert repeated_session.last_metrics.stage_boundary_batches == 3
+    assert repeated_session.last_metrics.copied_batches == 3
+    assert repeated_result.outputs[0].emissions[0].status is cw.EmissionStatus.DEGRADED
+    assert repeated_result.outputs[0].emissions[0].diagnostics == (diagnostic,)
+
+    should_fail = True
+
+    def fail_once(value: object) -> object:
+        nonlocal should_fail
+        if should_fail:
+            should_fail = False
+            raise RuntimeError("intentional multi-island failure")
+        return value
+
+    failing = source.map(native).map(shift).map(native).map(fail_once)
+    retryable = cw.compile(
+        [cw.output(failing, collector=cw.Latest())],
+        backend="python",
+        implementations={native.operation_id: native_backend},
+    )
+    with pytest.raises(cw.KernelExecutionError, match="intentional multi-island failure"):
+        retryable.run(executor="cpp")
+    assert retryable.run(executor="cpp").outputs[0].emissions
 
 
 def test_compile_rejects_unknown_operation_implementation_selector(tmp_path: Path) -> None:
@@ -405,6 +446,34 @@ def test_cpp_python_prefix_preserves_zero_and_many_before_native_suffix(
 
     assert cpp == plan.run(executor="python")
     assert [item.value for item in cpp.outputs[0].emissions] == [(6.0, 8.0)] * 2
+
+    calls = 0
+    repeated = source.map(native).map(expand).map(native).map(lambda value: value)
+    multi_plan = cw.compile(
+        [cw.output(repeated, collector=cw.Bounded(2))],
+        backend="python",
+        implementations={native.operation_id: backend},
+    )
+
+    multi_cpp = multi_plan.run(executor="cpp")
+    calls = 0
+
+    assert multi_cpp == multi_plan.run(executor="python")
+    assert [item.value for item in multi_cpp.outputs[0].emissions] == [(12.0, 16.0)] * 2
+
+    calls = 0
+    prefix_repeated = source.map(expand).map(native).map(lambda value: value)
+    prefix_multi_plan = cw.compile(
+        [cw.output(prefix_repeated, collector=cw.Bounded(2))],
+        backend="python",
+        implementations={native.operation_id: backend},
+    )
+
+    prefix_multi_cpp = prefix_multi_plan.run(executor="cpp")
+    calls = 0
+
+    assert prefix_multi_cpp == prefix_multi_plan.run(executor="python")
+    assert [item.value for item in prefix_multi_cpp.outputs[0].emissions] == [(6.0, 8.0)] * 2
 
 
 def test_native_module_rebinds_round_tripped_plan(tmp_path: Path) -> None:

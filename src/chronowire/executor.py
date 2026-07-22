@@ -262,9 +262,15 @@ class CppExecutor:
         if any(stage.execution_domain == "python" for stage in plan.portable_ir.stages):
             from .cpp_executor import (
                 CppMixedExecutionSession,
+                CppMultiIslandExecutionSession,
                 CppPythonPrefixExecutionSession,
             )
 
+            python_stage_count = sum(
+                stage.execution_domain == "python" for stage in plan.portable_ir.stages
+            )
+            if python_stage_count > 1:
+                return CppMultiIslandExecutionSession(plan)
             if plan.portable_ir.stages[0].execution_domain == "python":
                 return CppPythonPrefixExecutionSession(plan)
             return CppMixedExecutionSession(plan)

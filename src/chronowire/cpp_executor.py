@@ -1543,6 +1543,391 @@ class CppPythonPrefixExecutionSession(ExecutorSession):
         return replace(result, status_counts=status_counts)
 
 
+class CppMultiIslandExecutionSession(ExecutorSession):
+    """複数のPython islandをnative区間間で順次yield/resumeするsession。
+
+    Args:
+        plan: 単一入出力境界で複数Python islandを結ぶ線形Plan。
+
+    Raises:
+        ValueError: 複数入力、複数境界出力、非f64固定shape境界の場合。
+
+    境界条件:
+        各Python islandはMAP Nodeだけを含み、islandごとにGILを一回取得する。native区間は
+        C++ GraphRuntimeSessionが自立実行し、境界batchだけを一回copyする。
+    """
+
+    def __init__(self, plan: ExecutionPlan) -> None:
+        if plan._observations:
+            raise ValueError(
+                "CppExecutor contract=mixed_extension_boundary_pending; "
+                "stage=None node=None port=None binding=None"
+            )
+        python_stages = tuple(
+            stage for stage in plan.portable_ir.stages if stage.execution_domain == "python"
+        )
+        if len(python_stages) < 2:
+            raise ValueError("CppExecutor contract=multiple_python_islands")
+        nodes_by_id = {node.id: node for node in plan._nodes}
+        node_positions = {node.id: index for index, node in enumerate(plan._nodes)}
+        stage_nodes: dict[int, tuple[Any, ...]] = {}
+        stage_shapes: dict[int, tuple[int, ...]] = {}
+        prefix_source: F64VectorSourceValues | None = None
+        for index, stage in enumerate(python_stages):
+            nodes = tuple(nodes_by_id[node_id] for node_id in stage.node_ids)
+            is_prefix = index == 0 and stage == plan.portable_ir.stages[0]
+            if is_prefix:
+                source_nodes = tuple(node for node in nodes if node.kind is NodeKind.SOURCE)
+                if len(source_nodes) != 1 or nodes[0] is not source_nodes[0]:
+                    raise ValueError(
+                        "CppExecutor contract=multi_island_prefix_source; "
+                        f"stage={stage.stage_id} nodes={stage.node_ids}"
+                    )
+                source = source_nodes[0].source
+                if not isinstance(source, F64VectorSourceValues):
+                    raise ValueError(
+                        "CppExecutor contract=multi_island_prefix_f64_source; "
+                        f"stage={stage.stage_id} node={source_nodes[0].id} "
+                        f"port={source_nodes[0].output_port}"
+                    )
+                available_ports = {source_nodes[0].output_port}
+                for node in nodes[1:]:
+                    if (
+                        node.kind not in {NodeKind.RATE, NodeKind.FRAME, NodeKind.MAP}
+                        or len(node.inputs) != 1
+                        or len(node.output_ports) != 1
+                        or node.inputs[0].source_port not in available_ports
+                    ):
+                        raise ValueError(
+                            "CppExecutor contract=multi_island_prefix_node; "
+                            f"stage={stage.stage_id} node={node.id} port={node.output_port}"
+                        )
+                    available_ports.add(node.output_port)
+                prefix_source = source
+            elif (
+                len(stage.input_port_ids) != 1 or stage.boundary_codec != "stream_item_v1_to_python"
+            ):
+                raise ValueError(
+                    "CppExecutor contract=single_multi_island_input; "
+                    f"stage={stage.stage_id} node={stage.node_ids[0]} "
+                    f"port={stage.input_port_ids} codec={stage.boundary_codec}"
+                )
+            available_ports = set() if is_prefix else {stage.input_port_ids[0]}
+            for node in () if is_prefix else nodes:
+                binding = next(
+                    (item.slot_id for item in plan.portable_ir.bindings if item.node_id == node.id),
+                    None,
+                )
+                if (
+                    node.kind is not NodeKind.MAP
+                    or len(node.inputs) != 1
+                    or len(node.output_ports) != 1
+                    or node.inputs[0].source_port not in available_ports
+                ):
+                    raise ValueError(
+                        "CppExecutor contract=single_input_multi_island_map; "
+                        f"stage={stage.stage_id} node={node.id} port={node.output_port} "
+                        f"binding={binding}"
+                    )
+                available_ports.add(node.output_port)
+            is_final_stage = stage == plan.portable_ir.stages[-1]
+            if not is_final_stage:
+                if len(stage.output_port_ids) != 1:
+                    raise ValueError(
+                        "CppExecutor contract=single_multi_island_output; "
+                        f"stage={stage.stage_id} node={stage.node_ids[-1]} "
+                        f"port={stage.output_port_ids} binding=None"
+                    )
+                following = plan.portable_ir.stages[stage.stage_id + 1]
+                if following.boundary_codec != "python_to_stream_item_v1":
+                    raise ValueError(
+                        "CppExecutor contract=multi_island_output_codec; "
+                        f"stage={following.stage_id} node={following.node_ids[0]} "
+                        f"port={stage.output_port_ids[0]} codec={following.boundary_codec}"
+                    )
+                boundary_port = stage.output_port_ids[0]
+                port = next(
+                    item for item in plan.portable_ir.ports if item.port_id == boundary_port
+                )
+                schema = next(
+                    item
+                    for item in plan.portable_ir.value_schemas
+                    if item.value_schema_id == port.value_schema_id
+                )
+                if schema.dtype != "float64" or schema.shape is None:
+                    raise ValueError(
+                        "CppExecutor contract=fixed_f64_multi_island_boundary; "
+                        f"stage={stage.stage_id} node={stage.node_ids[-1]} "
+                        f"port={boundary_port} dtype={schema.dtype} shape={schema.shape}"
+                    )
+                stage_shapes[stage.stage_id] = schema.shape
+            stage_nodes[stage.stage_id] = nodes
+            if index:
+                previous = python_stages[index - 1]
+                if node_positions[previous.node_ids[-1]] >= node_positions[stage.node_ids[0]]:
+                    raise ValueError("CppExecutor contract=topological_python_islands")
+
+        self.plan = plan
+        self._python_stages = python_stages
+        self._stage_nodes = stage_nodes
+        self._stage_shapes = stage_shapes
+        self._node_positions = node_positions
+        self._prefix_source = prefix_source
+        self._sessions = {
+            node.id: plan._compiled_kernels[node.id].create_session()
+            for stage in python_stages
+            for node in stage_nodes[stage.stage_id]
+            if node.kind is NodeKind.MAP
+        }
+        self._coordinator = CppCooperativeStageSession(
+            tuple(stage.stage_id for stage in python_stages)
+        )
+        self._last_metrics: CppRuntimeMetrics | None = None
+
+    @property
+    def last_metrics(self) -> CppRuntimeMetrics | None:
+        """直前の複数island実行指標を返す。"""
+
+        return self._last_metrics
+
+    @staticmethod
+    def _subtract_boundary_counts(
+        counts: dict[EmissionStatus, int],
+        boundary: tuple[Emission[object], ...],
+    ) -> None:
+        """合成SOURCEとして再計上された境界statusを一回分除く。"""
+
+        for emission in boundary:
+            remaining = counts.get(emission.status, 0) - 1
+            if remaining:
+                counts[emission.status] = remaining
+            else:
+                counts.pop(emission.status, None)
+
+    @staticmethod
+    def _merge_counts(
+        target: dict[EmissionStatus, int],
+        source: dict[EmissionStatus, int],
+    ) -> None:
+        for status, count in source.items():
+            target[status] = target.get(status, 0) + count
+
+    def run(
+        self,
+        *,
+        duration: float | Fraction | None = None,
+        options: RuntimeOptions | None = None,
+    ) -> RunResult:
+        """native区間とPython islandをStage順に一回ずつ実行する。"""
+
+        if options is not None and options != RuntimeOptions():
+            raise ValueError("CppExecutor does not support RuntimeOptions overrides")
+        logical_end = None if duration is None else Fraction(str(duration))
+        if logical_end is not None and logical_end <= 0:
+            raise ValueError("CppExecutor duration must be positive")
+
+        status_counts: dict[EmissionStatus, int] = {}
+        scheduler_ns = 0
+        kernel_ns = 0
+        output_select_ns = 0
+        owned_input_bytes = 0
+        output_boundary_bytes = 0
+        executed_node_count = 0
+        public_reconstructions = 0
+        boundary_batches = 0
+        boundary_bytes = 0
+        copied_batches = 0
+        python_stage_ns = 0
+        native_stage_ns = 0
+        cursor = 0
+        ingress_port: int | None = None
+        ingress_shape: tuple[int, ...] | None = None
+        ingress_batch: tuple[Emission[object], ...] = ()
+        final_result: RunResult | None = None
+        final_batches: dict[int, tuple[Emission[object], ...]] | None = None
+
+        try:
+            for stage_index, stage in enumerate(self._python_stages):
+                stage_start = self._node_positions[stage.node_ids[0]]
+                native_node_ids = tuple(node.id for node in self.plan._nodes[cursor:stage_start])
+                is_prefix = stage_index == 0 and stage_start == 0
+                if is_prefix:
+                    if self._prefix_source is None:
+                        raise RuntimeError("CppExecutor contract=bound_multi_island_prefix")
+                    source_batch = tuple(
+                        emission
+                        for emission in self._prefix_source.emissions()
+                        if logical_end is None or emission.interval.end.as_fraction() <= logical_end
+                    )
+                    input_port = self._stage_nodes[stage.stage_id][0].output_port
+                    boundary = source_batch
+                else:
+                    input_port = stage.input_port_ids[0]
+                    native = CppExecutionSession(
+                        self.plan,
+                        node_ids=native_node_ids,
+                        boundary_output_ports=(input_port,),
+                        ingress_port=ingress_port,
+                        ingress_emissions=ingress_batch,
+                        ingress_shape=ingress_shape,
+                    )
+                    raw_outputs, raw_counts, raw_metrics = native._runtime.run(
+                        None if cursor or logical_end is None else logical_end.numerator,
+                        None if cursor or logical_end is None else logical_end.denominator,
+                    )
+                    native_counts = {
+                        status: raw_counts[index]
+                        for index, status in enumerate(_NATIVE_TO_STATUS)
+                        if raw_counts[index]
+                    }
+                    if ingress_port is not None:
+                        self._subtract_boundary_counts(native_counts, ingress_batch)
+                        executed_node_count -= 1
+                    self._merge_counts(status_counts, native_counts)
+                    boundary, _, _, overflowed = native._decode_native_output(
+                        raw_outputs[0],
+                        port_id=input_port,
+                    )
+                    if overflowed:
+                        raise RuntimeError(
+                            "CppExecutor contract=unbounded_multi_island_boundary; "
+                            f"stage={stage.stage_id} port={input_port}"
+                        )
+                    scheduler_ns += raw_metrics[0]
+                    kernel_ns += raw_metrics[1]
+                    output_select_ns += raw_metrics[2]
+                    owned_input_bytes += raw_metrics[3]
+                    output_boundary_bytes += raw_metrics[4]
+                    executed_node_count += raw_metrics[7]
+                    native_stage_ns += raw_metrics[0] + raw_metrics[1] + raw_metrics[2]
+                    public_reconstructions += len(boundary)
+                    boundary_batches += 1
+                    boundary_bytes += raw_metrics[4]
+                    copied_batches += 1 if boundary else 0
+
+                state, stage_id = self._coordinator.advance()
+                if state != 0 or stage_id != stage.stage_id:
+                    raise RuntimeError(
+                        "CppExecutor contract=multi_island_advance; "
+                        f"stage={stage.stage_id} actual_state={state} actual_stage={stage_id}"
+                    )
+                started = perf_counter_ns()
+                if is_prefix:
+                    batches, python_counts = _run_python_prefix_stage(
+                        self._stage_nodes[stage.stage_id],
+                        self._sessions,
+                        boundary,
+                    )
+                else:
+                    batches, python_counts = _run_python_map_nodes(
+                        self._stage_nodes[stage.stage_id],
+                        self._sessions,
+                        {input_port: boundary},
+                    )
+                python_stage_ns += perf_counter_ns() - started
+                executed_node_count += len(stage.node_ids)
+                self._merge_counts(status_counts, python_counts)
+                self._coordinator.resume(stage_id)
+                cursor = self._node_positions[stage.node_ids[-1]] + 1
+
+                has_native_suffix = cursor < len(self.plan._nodes)
+                if has_native_suffix:
+                    output_port = stage.output_port_ids[0]
+                    ingress_port = output_port
+                    ingress_shape = self._stage_shapes[stage.stage_id]
+                    ingress_batch = batches[output_port]
+                    pack_bytes = len(ingress_batch) * prod(ingress_shape) * 8
+                    boundary_batches += 1
+                    boundary_bytes += pack_bytes
+                    copied_batches += 1 if ingress_batch else 0
+                else:
+                    final_batches = batches
+
+            suffix_node_ids = tuple(node.id for node in self.plan._nodes[cursor:])
+            if suffix_node_ids:
+                if ingress_port is None or ingress_shape is None:
+                    raise RuntimeError("CppExecutor contract=bound_multi_island_suffix")
+                suffix = CppExecutionSession(
+                    self.plan,
+                    node_ids=suffix_node_ids,
+                    ingress_port=ingress_port,
+                    ingress_emissions=ingress_batch,
+                    ingress_shape=ingress_shape,
+                )
+                final_result = suffix.run()
+                suffix_metrics = suffix.last_metrics
+                if suffix_metrics is None:
+                    raise RuntimeError("CppExecutor contract=multi_island_suffix_metrics")
+                suffix_counts = dict(final_result.status_counts)
+                self._subtract_boundary_counts(suffix_counts, ingress_batch)
+                self._merge_counts(status_counts, suffix_counts)
+                scheduler_ns += suffix_metrics.scheduler_ns
+                kernel_ns += suffix_metrics.kernel_ns
+                output_select_ns += suffix_metrics.output_select_ns
+                owned_input_bytes += suffix_metrics.owned_input_bytes
+                output_boundary_bytes += suffix_metrics.output_boundary_bytes
+                executed_node_count += suffix_metrics.executed_node_count - 1
+                native_stage_ns += (
+                    suffix_metrics.scheduler_ns
+                    + suffix_metrics.kernel_ns
+                    + suffix_metrics.output_select_ns
+                )
+                public_reconstructions += suffix_metrics.public_emission_reconstructions
+
+            completed, completed_stage = self._coordinator.advance()
+            if completed != 1 or completed_stage != -1:
+                raise RuntimeError(
+                    "CppExecutor contract=multi_island_complete; "
+                    f"actual_state={completed} actual_stage={completed_stage}"
+                )
+        except Exception:
+            self._coordinator.abort()
+            raise
+
+        self._last_metrics = CppRuntimeMetrics(
+            scheduler_ns=scheduler_ns,
+            kernel_ns=kernel_ns,
+            output_select_ns=output_select_ns,
+            owned_input_bytes=owned_input_bytes,
+            output_boundary_bytes=output_boundary_bytes,
+            python_native_transitions=2 * (len(self._python_stages) + 1),
+            stage_python_dispatches=len(self._python_stages),
+            executed_node_count=executed_node_count,
+            native_run_releases_gil=True,
+            public_emission_reconstructions=public_reconstructions,
+            boundary_batch_conversions=boundary_batches,
+            gil_acquisitions=len(self._python_stages),
+            stage_boundary_batches=boundary_batches,
+            stage_boundary_bytes=boundary_bytes,
+            copied_batches=copied_batches,
+            python_stage_ns=python_stage_ns,
+            native_stage_ns=native_stage_ns,
+            execution_classification="hybrid",
+        )
+        if final_result is not None:
+            return replace(final_result, status_counts=status_counts)
+        if final_batches is None:
+            raise RuntimeError("CppExecutor contract=multi_island_final_batches")
+        outputs: list[OutputResult[object]] = []
+        for output_spec in self.plan._outputs:
+            collector = output_spec.collector.create_session()
+            for emission in final_batches[output_spec.flow.port_id]:
+                collector.add(emission)
+            snapshot = collector.snapshot()
+            emissions = snapshot.emissions
+            outputs.append(
+                OutputResult(
+                    emissions,
+                    snapshot.info.kind,
+                    snapshot.received_count,
+                    snapshot.dropped_count,
+                    emissions[0].interval.start if emissions else None,
+                    emissions[-1].interval.end if emissions else None,
+                )
+            )
+        return RunResult(tuple(outputs), self.plan.diagnostics, status_counts, completed=True)
+
+
 class CppPlanSession:
     """有限native Planを論理時間境界ごとにC++で継続観測するsession。
 
