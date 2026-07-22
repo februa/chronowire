@@ -198,10 +198,22 @@ class、allocatorはIRへ含めない。C++ runtimeは次のversion付きresolve
 |---|---|---|---|
 | `chronowire.kernel.identity_f64.v1` | `identity_f64` | なし | 入力shapeを保持 |
 | `chronowire.reference.fixed_cbf_f64.v1` | `fixed_cbf_f64_frame` | read-only f64重み | beam × frame |
+| `chronowire.reference.covariance_accumulator_f64_frame.v1` | `covariance_accumulator_f64_frame` | diagonal loading | channel × channel |
+| `chronowire.reference.mvdr_weights_f64.v1` | `mvdr_weights_f64` | steering vector | channel |
+| `chronowire.reference.apply_weights_f64_latest.v1` | `apply_weights_f64_latest` | なし | frame |
+
+このidentity/固定CBF/MVDR resolver tableは、C++ Plan runtimeの意味論を先に検証するための
+過渡的実装である。最終的には外部C ABI module tableの汎用dynamic bindingへ置換し、
+新しいOperationの追加でCppExecutorやresolver tableを改修しない。既存ABIに載るDSP追加は
+DSP package側のOperationSpec、Implementation、manifest entry、conformance testで完結させる。
 
 固定CBFではCython Backendが生成したfactoryも同binding契約を提供するため、CppExecutorはPython Kernel
 sessionを呼ばずにABI IDと係数だけからC++処理を選択する。未知ABI、process model不一致、parameter
 shape不一致はNode、Port、binding slotを含む明示エラーとし、Pythonへ暗黙fallbackしない。
+
+Backend本体の改修は、新dtype、可変shape、複数出力、0/複数Emission、Config packing、workspace、
+flush/checkpoint、新ABI/process model、Implementation選択policyなど、Implementationを載せる器の
+capabilityを拡張するときに限る。個別DSPアルゴリズムの追加はBackend改修の理由にしない。
 
 ## 2.3 backend境界
 
